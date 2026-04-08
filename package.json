@@ -1,0 +1,32 @@
+{
+  "name": "@wcppm/openclaw-wechatpadpro",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "OpenClaw channel plugin for WeChatPadPro / WeChatPadProMax",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.0",
+    "typescript": "^5.7.0"
+  },
+  "openclaw": {
+    "extensions": ["./dist/index.js"],
+    "setupEntry": "./dist/setup-entry.js",
+    "channel": {
+      "id": "wechatpadpro",
+      "label": "WeChatPadPro",
+      "selectionLabel": "WeChat (via WeChatPadPro)",
+      "detailLabel": "WeChat via WeChatPadPro",
+      "blurb": "Connect OpenClaw to WeChat using WeChatPadPro/WeChatPadProMax (iPad protocol).",
+      "systemImage": "message-circle",
+      "markdownCapable": false
+    }
+  }
+}

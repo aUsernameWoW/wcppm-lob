@@ -1,0 +1,56 @@
+{
+  "id": "wechatpadpro",
+  "kind": "channel",
+  "channels": ["wechatpadpro"],
+  "name": "WeChatPadPro",
+  "description": "OpenClaw channel plugin for WeChatPadPro / WeChatPadProMax",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "wechatpadpro": {
+        "type": "object",
+        "properties": {
+          "adminKey": {
+            "type": "string",
+            "description": "WeChatPadPro admin key"
+          },
+          "host": {
+            "type": "string",
+            "description": "WeChatPadPro server host"
+          },
+          "port": {
+            "type": "number",
+            "description": "WeChatPadPro server port (default 8080)"
+          },
+          "authKey": {
+            "type": "string",
+            "description": "Pre-generated auth key (optional, will auto-generate if not set)"
+          },
+          "wxid": {
+            "type": "string",
+            "description": "WeChat ID after login (optional, persisted automatically)"
+          },
+          "allowFrom": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "List of wxid allowed to DM the bot"
+          },
+          "dmSecurity": {
+            "type": "string",
+            "enum": ["allowlist", "allow-all", "pairing"],
+            "description": "DM security policy (default: allowlist)"
+          },
+          "replyWithMention": {
+            "type": "boolean",
+            "description": "In group chats, prefix reply with @sender (default: false)"
+          },
+          "proxy": {
+            "type": "string",
+            "description": "Proxy for login QR code (e.g. socks5://user:pass@host:port)"
+          }
+        }
+      }
+    }
+  }
+}
