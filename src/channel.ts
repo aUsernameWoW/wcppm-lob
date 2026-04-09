@@ -1,7 +1,7 @@
 /**
- * WeChatPadPro channel plugin for OpenClaw.
+ * WeChatPadPro / WeChatPadProMAX channel plugin for OpenClaw.
  *
- * Translates between WeChatPadPro's WS/REST API and OpenClaw's channel interface.
+ * Supports both WS (standard WCPP) and HTTP Sync polling (WCPP MAX).
  */
 
 import {
@@ -9,7 +9,7 @@ import {
   createChannelPluginBase,
 } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
-import { WcppClient, type WcppRawMessage, type WcppCredentials } from "./client.js";
+import { WcppClient, type NormalizedMessage } from "./client.js";
 
 // ──────────────────────────────────────────────
 // Account resolution
@@ -21,11 +21,18 @@ export interface ResolvedAccount {
   host: string;
   port: number;
   authKey?: string;
+  authcode?: string;
   wxid?: string;
   allowFrom: string[];
   dmPolicy: string | undefined;
   replyWithMention: boolean;
   proxy?: string;
+  syncMode: "ws" | "sync";
+  syncInterval?: number;
+  readOnly?: boolean;
+  allowMsgTypes?: number[];
+  passRevokemsg?: boolean;
+  maxMessageAge?: number;
 }
 
 function resolveAccount(
@@ -33,96 +40,36 @@ function resolveAccount(
   accountId?: string | null,
 ): ResolvedAccount {
   const section = (cfg.channels as Record<string, any>)?.["wechatpadpro"];
-  if (!section?.adminKey || !section?.host) {
-    throw new Error(
-      "wechatpadpro: adminKey and host are required in config",
-    );
+  if (!section?.host) {
+    throw new Error("wechatpadpro: host is required in config");
   }
+
+  // Determine mode: if authcode is present, default to sync mode
+  const syncMode: "ws" | "sync" = section.syncMode ?? (section.authcode ? "sync" : "ws");
+
+  // For sync mode, adminKey isn't required (authcode is used instead)
+  if (syncMode === "ws" && !section.adminKey) {
+    throw new Error("wechatpadpro: adminKey is required for WS mode");
+  }
+
   return {
     accountId: accountId ?? null,
-    adminKey: section.adminKey,
+    adminKey: section.adminKey ?? "",
     host: section.host,
-    port: section.port ?? 8080,
+    port: section.port ?? 8062,
     authKey: section.authKey,
+    authcode: section.authcode,
     wxid: section.wxid,
     allowFrom: section.allowFrom ?? [],
     dmPolicy: section.dmSecurity,
     replyWithMention: section.replyWithMention ?? false,
     proxy: section.proxy,
-  };
-}
-
-// ──────────────────────────────────────────────
-// Inbound message → OpenClaw shape
-// ──────────────────────────────────────────────
-
-interface ParsedInbound {
-  chatType: "dm" | "group";
-  senderId: string;
-  senderNickname: string;
-  groupId?: string;
-  text: string;
-  isAtBot: boolean;
-  raw: WcppRawMessage;
-}
-
-function parseInboundMessage(
-  raw: WcppRawMessage,
-  selfWxid: string,
-): ParsedInbound | null {
-  const fromUser = raw.from_user_name?.str ?? "";
-  const content = raw.content?.str ?? "";
-  const pushContent = raw.push_content ?? "";
-  const msgSource = raw.msg_source ?? "";
-
-  // Ignore own messages
-  if (fromUser === selfWxid) return null;
-
-  // Ignore system accounts
-  if (["weixin", "newsapp", "newsapp_wechat"].includes(fromUser)) return null;
-
-  // Ignore messages older than 3 minutes
-  if (Date.now() / 1000 - raw.create_time > 180) return null;
-
-  const isGroup = fromUser.includes("@chatroom");
-  let senderId: string;
-  let senderNickname = "";
-  let groupId: string | undefined;
-  let text = content;
-  let isAtBot = false;
-
-  if (isGroup) {
-    groupId = fromUser;
-    // Group message format: "sender_wxid:\nactual message"
-    const parts = content.split(":\n", 1);
-    senderId = parts.length === 2 ? parts[0] : "";
-    text = parts.length === 2 ? parts[1] : content;
-
-    // Check @bot
-    if (
-      msgSource.includes(`<atuserlist>${selfWxid}</atuserlist>`) ||
-      msgSource.includes(`<atuserlist>${selfWxid},`) ||
-      msgSource.includes(`,${selfWxid}</atuserlist>`) ||
-      pushContent.includes("在群聊中@了你")
-    ) {
-      isAtBot = true;
-    }
-  } else {
-    senderId = fromUser;
-    // Private message nickname from push_content: "Nickname : content"
-    if (pushContent && pushContent.includes(" : ")) {
-      senderNickname = pushContent.split(" : ")[0];
-    }
-  }
-
-  return {
-    chatType: isGroup ? "group" : "dm",
-    senderId,
-    senderNickname,
-    groupId,
-    text,
-    isAtBot,
-    raw,
+    syncMode,
+    syncInterval: section.syncInterval,
+    readOnly: section.readOnly,
+    allowMsgTypes: section.allowMsgTypes,
+    passRevokemsg: section.passRevokemsg,
+    maxMessageAge: section.maxMessageAge,
   };
 }
 
@@ -130,7 +77,6 @@ function parseInboundMessage(
 // The plugin
 // ──────────────────────────────────────────────
 
-// Singleton client per process
 let client: WcppClient | null = null;
 
 export const wechatpadproPlugin = createChatChannelPlugin<ResolvedAccount>({
@@ -140,16 +86,16 @@ export const wechatpadproPlugin = createChatChannelPlugin<ResolvedAccount>({
       resolveAccount,
       inspectAccount(cfg, _accountId) {
         const section = (cfg.channels as Record<string, any>)?.["wechatpadpro"];
+        const hasAuth = section?.adminKey || section?.authcode;
         return {
-          enabled: Boolean(section?.adminKey && section?.host),
-          configured: Boolean(section?.adminKey && section?.host),
-          tokenStatus: section?.adminKey ? "available" : "missing",
+          enabled: Boolean(section?.host && hasAuth),
+          configured: Boolean(section?.host && hasAuth),
+          tokenStatus: hasAuth ? "available" : "missing",
         };
       },
     },
   }),
 
-  // DM security
   security: {
     dm: {
       channelKey: "wechatpadpro",
@@ -159,10 +105,8 @@ export const wechatpadproPlugin = createChatChannelPlugin<ResolvedAccount>({
     },
   },
 
-  // Threading
   threading: { topLevelReplyToMode: "reply" },
 
-  // Outbound
   outbound: {
     attachedResults: {
       sendText: async (params) => {
@@ -174,7 +118,6 @@ export const wechatpadproPlugin = createChatChannelPlugin<ResolvedAccount>({
     base: {
       sendMedia: async (params) => {
         if (!client) throw new Error("WeChatPadPro client not initialized");
-        // For now handle image; can extend for other media types
         const fs = await import("fs/promises");
         const buffer = await fs.readFile(params.filePath);
         const base64 = buffer.toString("base64");
@@ -185,12 +128,12 @@ export const wechatpadproPlugin = createChatChannelPlugin<ResolvedAccount>({
 });
 
 // ──────────────────────────────────────────────
-// Runtime lifecycle — called from entry point
+// Runtime lifecycle
 // ──────────────────────────────────────────────
 
 export async function startWcppRuntime(
   account: ResolvedAccount,
-  log: { info: (...args: any[]) => void; error: (...args: any[]) => void; warn: (...args: any[]) => void },
+  log: { info: (...args: any[]) => void; error: (...args: any[]) => void; warn: (...args: any[]) => void; debug: (...args: any[]) => void },
   dispatchInbound: (msg: {
     channel: string;
     chatType: "dm" | "group";
@@ -208,48 +151,77 @@ export async function startWcppRuntime(
       host: account.host,
       port: account.port,
       authKey: account.authKey,
+      authcode: account.authcode,
       wxid: account.wxid,
       proxy: account.proxy,
       replyWithMention: account.replyWithMention,
+      syncMode: account.syncMode,
+      syncInterval: account.syncInterval,
+      readOnly: account.readOnly,
+      allowMsgTypes: account.allowMsgTypes,
+      passRevokemsg: account.passRevokemsg,
+      maxMessageAge: account.maxMessageAge,
     },
     log as any,
   );
 
-  // Login
+  // Login / verify auth
   const creds = await client.login();
   if (!creds) {
-    log.error("WeChatPadPro: login failed, channel will not receive messages");
+    log.error("WeChatPadPro: login/auth failed, channel will not receive messages");
     return;
   }
+  log.info(`WeChatPadPro: authenticated, wxid=${creds.wxid}, mode=${account.syncMode}`);
 
-  // Persist credentials back to config
-  // (The entry point / gateway should handle config persistence)
+  // Wire up inbound handler (normalized messages)
+  client.onMessage = async (msg: NormalizedMessage) => {
+    // Derive sender display name
+    let senderName = "";
+    if (msg.pushContent) {
+      // PushContent format: "Nickname : text" or "Nickname sent you a..."
+      const colonIdx = msg.pushContent.indexOf(" : ");
+      if (colonIdx > 0) {
+        senderName = msg.pushContent.substring(0, colonIdx);
+      } else {
+        // Fallback: try to extract from push content before "sent you"
+        const sentIdx = msg.pushContent.indexOf(" sent ");
+        if (sentIdx > 0) {
+          senderName = msg.pushContent.substring(0, sentIdx).trim();
+        }
+      }
+    }
 
-  // Wire up inbound handler
-  client.onMessage = async (raw: WcppRawMessage) => {
-    if (!client?.wxid) return;
-    const parsed = parseInboundMessage(raw, client.wxid);
-    if (!parsed) return;
+    // For group messages, try to get nickname from contact cache
+    if (msg.isGroup && !senderName) {
+      const contact = client!.getContact(msg.senderWxid);
+      if (contact?.NickName?.string) {
+        senderName = contact.NickName.string;
+      }
+    }
 
     await dispatchInbound({
       channel: "wechatpadpro",
-      chatType: parsed.chatType,
-      senderId: parsed.senderId,
-      senderName: parsed.senderNickname,
-      text: parsed.text,
-      groupId: parsed.groupId,
-      isAtBot: parsed.isAtBot,
-      raw: parsed.raw,
+      chatType: msg.isGroup ? "group" : "dm",
+      senderId: msg.senderWxid,
+      senderName,
+      text: msg.text,
+      groupId: msg.groupId ?? undefined,
+      isAtBot: msg.isAtBot,
+      raw: msg.raw,
     });
   };
 
-  // Connect WebSocket
-  client.connectWebSocket();
+  // Connect (WS or Sync polling)
+  client.connect();
+
+  if (account.readOnly) {
+    log.info("WeChatPadPro: read-only mode ON — receiving only, no sending");
+  }
   log.info("WeChatPadPro: runtime started, listening for messages");
 }
 
 export function stopWcppRuntime(): void {
-  client?.disconnectWebSocket();
+  client?.disconnect();
   client = null;
 }
 

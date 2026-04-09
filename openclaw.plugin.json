@@ -13,23 +13,36 @@
         "properties": {
           "adminKey": {
             "type": "string",
-            "description": "WeChatPadPro admin key"
+            "description": "WeChatPadPro admin key (required for WS mode)"
           },
           "host": {
             "type": "string",
-            "description": "WeChatPadPro server host"
+            "description": "WeChatPadPro server host (e.g. 192.168.50.231)"
           },
           "port": {
             "type": "number",
-            "description": "WeChatPadPro server port (default 8080)"
+            "description": "WeChatPadPro server port (default 8062 for MAX, 8080 for standard)"
           },
           "authKey": {
             "type": "string",
-            "description": "Pre-generated auth key (optional, will auto-generate if not set)"
+            "description": "Pre-generated auth key for standard WCPP (optional, auto-generates if not set)"
+          },
+          "authcode": {
+            "type": "string",
+            "description": "WeChatPadProMAX authcode (used for /api/* endpoints, enables sync mode automatically)"
           },
           "wxid": {
             "type": "string",
             "description": "WeChat ID after login (optional, persisted automatically)"
+          },
+          "syncMode": {
+            "type": "string",
+            "enum": ["ws", "sync"],
+            "description": "Message sync mode: 'ws' = WebSocket (standard WCPP), 'sync' = HTTP polling (WCPP MAX). Auto-detected from authcode."
+          },
+          "syncInterval": {
+            "type": "number",
+            "description": "Sync polling interval in ms (default 5000)"
           },
           "allowFrom": {
             "type": "array",
@@ -48,6 +61,23 @@
           "proxy": {
             "type": "string",
             "description": "Proxy for login QR code (e.g. socks5://user:pass@host:port)"
+          },
+          "readOnly": {
+            "type": "boolean",
+            "description": "Receive-only mode — no sending, for account stability during initial period (default: false)"
+          },
+          "allowMsgTypes": {
+            "type": "array",
+            "items": { "type": "number" },
+            "description": "MsgTypes to pass through (default: [1,3,34,47,49] = text/image/voice/sticker/appmsg)"
+          },
+          "passRevokemsg": {
+            "type": "boolean",
+            "description": "Also pass through revokemsg from MsgType 10002 (default: true)"
+          },
+          "maxMessageAge": {
+            "type": "number",
+            "description": "Max message age in seconds — drop older messages (default: 180)"
           }
         }
       }
