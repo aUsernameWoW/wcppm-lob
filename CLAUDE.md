@@ -10,6 +10,11 @@ An OpenClaw channel plugin that bridges WeChatPadPro / WeChatPadProMAX into Open
 - **Login/Authentication** — QR code scanning, 62-data login, A16 login, token renewal, heartbeat management, and all `/Login/*` operations are handled externally by the WeChatPadProMax server administrator
 - **Account lifecycle** — initialization (`Newinit`), auto-heartbeat, reconnection, etc.
 
+**Hard constraints confirmed in production:**
+- **Do not call initialization** (`/Login/Newinit` or equivalent startup/init messages) for this account
+- `/Msg/Sync` works **without** initialization
+- For account nurturing / safety, prefer passive receive paths and avoid unnecessary active operations
+
 **This plugin assumes:**
 - The WeChatPadProMax server is already logged in and online
 - A valid `authcode` (for MAX) or `adminKey` + `authKey` (for standard WCPP) is provided by the server admin
@@ -55,6 +60,10 @@ src/
 - Auto-reconnect on disconnect
 - Set `syncMode: "websocket"` and optionally `wsUrl` for custom URL
 - If `wsUrl` is not set, auto-constructs from `host` as `ws://{host}:8089/ws/sync?authcode={authcode}`
+- **Do not send init payloads on connect** for this production account
+- Current observed behavior: WS handshake succeeds, then server closes immediately with code `1006`; `/Msg/Sync` remains usable without initialization
+- Server logs observed during WS attempts: `Webhook入队失败 ... 未找到Webhook配置`
+- Read-only probes of `/api/Webhook/Get` and `/api/Webhook/Business/Get` currently return `502 Bad Gateway`, which suggests webhook control path may be unavailable or fronted differently in this environment
 
 ## WeChat Message Format
 
@@ -151,17 +160,24 @@ Must split on first `:\n` to extract sender and text.
 Based on the available WeChatPadProMAX API, here are candidates for implementation in priority order:
 
 ### Implemented ✓
-| API | Use Case | Status |
+| API / Feature | Use Case | Status |
 |-----|----------|--------|
 | `POST /Msg/Quote` | Reply to/quote messages | ✅ Implemented — maps OpenClaw `reply_to` to WeChat quote |
+| inbound message normalization | Make non-text messages readable in OpenClaw | ✅ Implemented — images/voice/stickers/cards/revokes render as short human-readable text |
+| `POST /Tools/DownloadVoice` client helper | Download voice media from MsgType 34 | ✅ Implemented in client — extracts `bufid/fromUserName/length/msgId` and calls DownloadVoice |
+| image/video metadata extraction | Prepare media downloads from XML payloads | ✅ Implemented in client — extracts AES key, CDN URLs, md5, lengths |
+| `POST /Tools/DownloadImg` / `POST /Tools/DownloadVideo` helpers | Download media from image/video messages | ✅ Implemented in client as best-effort helpers with flexible payload assembly |
+| unified media resolver | Let upstream code treat voice/image/video uniformly | ✅ Implemented via `resolveMedia()` / `isMediaMessage()` |
+| channel inbound media integration | Surface media info to upper layers without extra parsing | ✅ Implemented — dispatch `raw` now includes `{ platform, normalized, media }` envelope |
+| attachment-ready media bridge | Prepare media for future OpenClaw attachment ingestion | ✅ Implemented — each resolved media object now exposes `attachment` metadata and `materialize()` |
 
 ### High Priority — Core Messaging
 | API | Use Case | Notes |
 |-----|----------|-------|
 | `POST /Msg/Revoke` | Revoke sent messages | User command `/revoke` or auto-revoke on edit |
-| `POST /Tools/DownloadVoice` | Download voice messages (MsgType 34) | Currently only receive CDN URL, need decryption |
-| `POST /Tools/DownloadImg` | Download HD images | Current images are thumbnails/CDN refs |
-| `POST /Tools/DownloadVideo` | Download video files | For video messages (MsgType 43?) |
+| `POST /Tools/DownloadVoice` | Download voice messages (MsgType 34) | Request helper implemented; response handling is best-effort because provider response shape is not fully documented |
+| `POST /Tools/DownloadImg` | Download HD images | Helper implemented, but exact provider payload contract still needs real response validation |
+| `POST /Tools/DownloadVideo` | Download video files | Helper implemented, but exact provider payload contract still needs real response validation |
 | `POST /Msg/SendVoice` | Send voice messages | File upload → voice message |
 | `POST /Msg/SendVideo` | Send video messages | File upload → video message |
 | `POST /Msg/UploadImg` | Upload and send images | Current `SendImageNewMessage` may be limited |
@@ -205,4 +221,11 @@ All `/Login/*`, `/Admin/*`, `/User/*` account management APIs.
 - Sync polling may return duplicate `PushContent` for the same message (reported by users in the WCPP community) — dedup handles this
 - WCPP MAX authcode is single-use per login session; if the server restarts, a new authcode may be needed
 - `@bot` detection in group chats relies on `<atuserlist>` in `MsgSource` XML — some clients may not include this
-- Voice messages (MsgType 34) contain CDN URLs that require decryption (`aeskey`) — downloading/playing is not implemented yet
+- Voice messages (MsgType 34) now have client-side metadata extraction (`bufid`, `fromUserName`, `length`, `msgId`, `voiceurl`, `aeskey`)
+- `downloadVoice(...)` is implemented against `/Tools/DownloadVoice`, but response payload shape is not fully documented, so JSON response decoding is best-effort
+- `downloadImage(...)` / `downloadVideo(...)` are implemented as best-effort helpers using extracted XML metadata (`aesKey`, CDN URLs, md5, lengths, msgId, fromUserName)
+- `resolveMedia(...)` returns a uniform `{ kind, info, download() }` object for voice/image/video messages so upper layers do not need per-type branching
+- Channel dispatch now wraps inbound `raw` as `{ platform, normalized, media }`, making media metadata available to upper layers without reparsing XML
+- Each resolved media object now also exposes attachment-ready metadata (`mimeType`, `fileName`, `extension`) plus `materialize(dir?)` to write a temp file for future attachment ingestion
+- Current swagger access for some media endpoints has been flaky (`502`), so payload assembly is based on extracted metadata plus flexible request fields
+- CDN-level direct media decryption/playback via raw CDN URLs + `aeskey` is still not implemented

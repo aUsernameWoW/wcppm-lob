@@ -154,6 +154,88 @@ export interface NormalizedMessage {
   raw: unknown;
 }
 
+export interface VoiceMessageInfo {
+  msgId: number | null;
+  fromUserName: string | null;
+  bufid: string | null;
+  length: number | null;
+  voiceUrl: string | null;
+  aesKey: string | null;
+  fileName: string | null;
+  rawXml: string;
+}
+
+export interface VoiceDownloadResult {
+  contentType: string | null;
+  buffer: Buffer | null;
+  outputPath?: string;
+  responseJson?: unknown;
+}
+
+export interface ImageMessageInfo {
+  msgId: number | null;
+  fromUserName: string | null;
+  aesKey: string | null;
+  cdnMidImgUrl: string | null;
+  cdnBigImgUrl: string | null;
+  cdnThumbUrl: string | null;
+  md5: string | null;
+  fileLength: number | null;
+  rawXml: string;
+}
+
+export interface VideoMessageInfo {
+  msgId: number | null;
+  fromUserName: string | null;
+  aesKey: string | null;
+  cdnVideoUrl: string | null;
+  cdnThumbUrl: string | null;
+  md5: string | null;
+  newMd5: string | null;
+  fileLength: number | null;
+  playLengthSeconds: number | null;
+  rawXml: string;
+}
+
+export interface MediaDownloadResult {
+  contentType: string | null;
+  buffer: Buffer | null;
+  outputPath?: string;
+  responseJson?: unknown;
+  requestPayload: Record<string, unknown>;
+}
+
+export interface AttachmentCandidate {
+  kind: "voice" | "image" | "video";
+  mimeType: string;
+  fileName: string;
+  extension: string;
+  msgId: string;
+}
+
+export type ResolvedMedia =
+  | {
+      kind: "voice";
+      info: VoiceMessageInfo;
+      attachment: AttachmentCandidate;
+      download: (outputPath?: string) => Promise<VoiceDownloadResult>;
+      materialize: (dir?: string) => Promise<{ filePath: string; mimeType: string; fileName: string }>;
+    }
+  | {
+      kind: "image";
+      info: ImageMessageInfo;
+      attachment: AttachmentCandidate;
+      download: (outputPath?: string) => Promise<MediaDownloadResult>;
+      materialize: (dir?: string) => Promise<{ filePath: string; mimeType: string; fileName: string }>;
+    }
+  | {
+      kind: "video";
+      info: VideoMessageInfo;
+      attachment: AttachmentCandidate;
+      download: (outputPath?: string) => Promise<MediaDownloadResult>;
+      materialize: (dir?: string) => Promise<{ filePath: string; mimeType: string; fileName: string }>;
+    };
+
 /** Raw WS message from standard WeChatPadPro */
 export interface WcppRawMessage {
   msg_id: number;
@@ -467,6 +549,177 @@ export class WcppClient {
     }
   }
 
+  private extractXmlTag(content: string, tag: string): string | null {
+    const match = content.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, "i"));
+    return match?.[1]?.trim() || null;
+  }
+
+  private formatVoiceDuration(raw: string): string | null {
+    const value =
+      raw.match(/<voicelength>(\d+)<\/voicelength>/i)?.[1] ||
+      raw.match(/voicelength="(\d+)"/i)?.[1] ||
+      raw.match(/length="(\d+)"/i)?.[1];
+    if (!value) return null;
+    const num = Number(value);
+    if (!Number.isFinite(num) || num <= 0) return null;
+    const seconds = num > 300 ? Math.round(num / 1000) : num;
+    return `${seconds}s`;
+  }
+
+  extractVoiceMessageInfo(message: SyncMessage | NormalizedMessage): VoiceMessageInfo | null {
+    const rawXml = "content" in message ? message.content : message.Content?.string ?? "";
+    const fromUserName = "fromUser" in message
+      ? message.fromUser
+      : message.FromUserName?.string ?? null;
+    const msgId = "msgId" in message
+      ? Number(message.msgId)
+      : message.MsgId ?? null;
+
+    if (!("msgType" in message ? message.msgType === 34 : message.MsgType === 34)) {
+      return null;
+    }
+
+    const bufid =
+      rawXml.match(/<bufid>([^<]+)<\/bufid>/i)?.[1] ||
+      rawXml.match(/bufid="([^"]+)"/i)?.[1] ||
+      null;
+    const lengthRaw =
+      rawXml.match(/<voicelength>(\d+)<\/voicelength>/i)?.[1] ||
+      rawXml.match(/voicelength="(\d+)"/i)?.[1] ||
+      rawXml.match(/length="(\d+)"/i)?.[1] ||
+      null;
+    const voiceUrl =
+      rawXml.match(/<voiceurl><!\[CDATA\[(.*?)\]\]><\/voiceurl>/i)?.[1] ||
+      rawXml.match(/<voiceurl>([^<]+)<\/voiceurl>/i)?.[1] ||
+      null;
+    const aesKey =
+      rawXml.match(/<aeskey><!\[CDATA\[(.*?)\]\]><\/aeskey>/i)?.[1] ||
+      rawXml.match(/<aeskey>([^<]+)<\/aeskey>/i)?.[1] ||
+      null;
+    const fileName =
+      rawXml.match(/<filename><!\[CDATA\[(.*?)\]\]><\/filename>/i)?.[1] ||
+      rawXml.match(/<filename>([^<]+)<\/filename>/i)?.[1] ||
+      null;
+
+    return {
+      msgId: Number.isFinite(msgId) ? msgId : null,
+      fromUserName,
+      bufid,
+      length: lengthRaw ? Number(lengthRaw) : null,
+      voiceUrl,
+      aesKey,
+      fileName,
+      rawXml,
+    };
+  }
+
+  extractImageMessageInfo(message: SyncMessage | NormalizedMessage): ImageMessageInfo | null {
+    const rawXml = "content" in message ? message.content : message.Content?.string ?? "";
+    const fromUserName = "fromUser" in message
+      ? message.fromUser
+      : message.FromUserName?.string ?? null;
+    const msgId = "msgId" in message
+      ? Number(message.msgId)
+      : message.MsgId ?? null;
+
+    if (!("msgType" in message ? message.msgType === 3 : message.MsgType === 3)) {
+      return null;
+    }
+
+    const pick = (...patterns: RegExp[]) => {
+      for (const pattern of patterns) {
+        const m = rawXml.match(pattern)?.[1];
+        if (m) return m;
+      }
+      return null;
+    };
+
+    const fileLengthRaw = pick(/<length>(\d+)<\/length>/i, /length="(\d+)"/i, /hdlength="(\d+)"/i);
+
+    return {
+      msgId: Number.isFinite(msgId) ? msgId : null,
+      fromUserName,
+      aesKey: pick(/<aeskey><!\[CDATA\[(.*?)\]\]><\/aeskey>/i, /<aeskey>([^<]+)<\/aeskey>/i),
+      cdnMidImgUrl: pick(/<cdnmidimgurl><!\[CDATA\[(.*?)\]\]><\/cdnmidimgurl>/i, /<cdnmidimgurl>([^<]+)<\/cdnmidimgurl>/i),
+      cdnBigImgUrl: pick(/<cdnbigimgurl><!\[CDATA\[(.*?)\]\]><\/cdnbigimgurl>/i, /<cdnbigimgurl>([^<]+)<\/cdnbigimgurl>/i),
+      cdnThumbUrl: pick(/<cdnthumburl><!\[CDATA\[(.*?)\]\]><\/cdnthumburl>/i, /<cdnthumburl>([^<]+)<\/cdnthumburl>/i),
+      md5: pick(/<md5>([^<]+)<\/md5>/i, /md5="([^"]+)"/i),
+      fileLength: fileLengthRaw ? Number(fileLengthRaw) : null,
+      rawXml,
+    };
+  }
+
+  extractVideoMessageInfo(message: SyncMessage | NormalizedMessage): VideoMessageInfo | null {
+    const rawXml = "content" in message ? message.content : message.Content?.string ?? "";
+    const fromUserName = "fromUser" in message
+      ? message.fromUser
+      : message.FromUserName?.string ?? null;
+    const msgId = "msgId" in message
+      ? Number(message.msgId)
+      : message.MsgId ?? null;
+
+    const msgType = "msgType" in message ? message.msgType : message.MsgType;
+    if (msgType !== 43 && msgType !== 62) {
+      return null;
+    }
+
+    const pick = (...patterns: RegExp[]) => {
+      for (const pattern of patterns) {
+        const m = rawXml.match(pattern)?.[1];
+        if (m) return m;
+      }
+      return null;
+    };
+
+    const fileLengthRaw = pick(/<length>(\d+)<\/length>/i, /length="(\d+)"/i);
+    const playLengthRaw = pick(/<playlength>(\d+)<\/playlength>/i, /playlength="(\d+)"/i);
+
+    return {
+      msgId: Number.isFinite(msgId) ? msgId : null,
+      fromUserName,
+      aesKey: pick(/<aeskey><!\[CDATA\[(.*?)\]\]><\/aeskey>/i, /<aeskey>([^<]+)<\/aeskey>/i),
+      cdnVideoUrl: pick(/<cdnvideourl><!\[CDATA\[(.*?)\]\]><\/cdnvideourl>/i, /<cdnvideourl>([^<]+)<\/cdnvideourl>/i),
+      cdnThumbUrl: pick(/<cdnthumburl><!\[CDATA\[(.*?)\]\]><\/cdnthumburl>/i, /<cdnthumburl>([^<]+)<\/cdnthumburl>/i),
+      md5: pick(/<md5>([^<]+)<\/md5>/i, /md5="([^"]+)"/i),
+      newMd5: pick(/<newmd5>([^<]+)<\/newmd5>/i, /newmd5="([^"]+)"/i),
+      fileLength: fileLengthRaw ? Number(fileLengthRaw) : null,
+      playLengthSeconds: playLengthRaw ? Number(playLengthRaw) : null,
+      rawXml,
+    };
+  }
+
+  private formatInboundDisplayText(msgType: number, content: string): string {
+    if (msgType === 3) return "[图片]";
+
+    if (msgType === 34) {
+      const duration = this.formatVoiceDuration(content);
+      return duration ? `[语音] ${duration}` : "[语音]";
+    }
+
+    if (msgType === 47) {
+      const name = this.extractXmlTag(content, "emoji") || this.extractXmlTag(content, "des");
+      return name ? `[表情] ${name}` : "[表情]";
+    }
+
+    if (msgType === 49) {
+      const title = this.extractXmlTag(content, "title");
+      const appType = this.extractXmlTag(content, "type");
+      const url = this.extractXmlTag(content, "url");
+      if (appType === "57") return `[引用] ${title ?? "消息"}`;
+      if (appType === "5") return title ? `[链接] ${title}` : (url ? `[链接] ${url}` : "[链接]");
+      if (title) return `[卡片] ${title}`;
+      return "[卡片消息]";
+    }
+
+    if (msgType === 10002) {
+      const revokeMatch = content.match(/replacemsg><!\[CDATA\[(.*?)\]\]>/);
+      if (revokeMatch) return `[撤回] ${revokeMatch[1]}`;
+      return "[系统消息]";
+    }
+
+    return content;
+  }
+
   /**
    * Normalize a Sync message into our unified format.
    */
@@ -506,26 +759,7 @@ export class WcppClient {
       }
     }
 
-    // For MsgType 49 (app/xml), extract the <title> as the display text
-    if (msg.MsgType === 49) {
-      const titleMatch = content.match(/<title>([^<]+)<\/title>/);
-      if (titleMatch) {
-        const referType = content.match(/<refermsg>[\s\S]*?<type>(\d+)<\/type>/);
-        if (referType) {
-          text = `[引用] ${titleMatch[1]}`;
-        } else {
-          text = titleMatch[1];
-        }
-      }
-    }
-
-    // For MsgType 10002 revokemsg
-    if (msg.MsgType === 10002) {
-      const revokeMatch = content.match(/replacemsg><!\[CDATA\[(.*?)\]\]>/);
-      if (revokeMatch) {
-        text = `[撤回] ${revokeMatch[1]}`;
-      }
-    }
+    text = this.formatInboundDisplayText(msg.MsgType, text);
 
     return {
       msgId: String(msg.NewMsgId),
@@ -662,6 +896,8 @@ export class WcppClient {
           msgSource.includes(`,${this.wxid}</atuserlist>`);
       }
     }
+
+    text = this.formatInboundDisplayText(msg.msg_type, text);
 
     return {
       msgId: String(msg.new_msg_id ?? msg.msg_id),
@@ -901,6 +1137,233 @@ export class WcppClient {
       this.log.error("WCPP: error sending image", e);
       return false;
     }
+  }
+
+  private buildAttachmentCandidate(
+    kind: "voice" | "image" | "video",
+    msgId: string,
+  ): AttachmentCandidate {
+    if (kind === "voice") {
+      return {
+        kind,
+        mimeType: "audio/ogg",
+        extension: ".ogg",
+        fileName: `wechat-voice-${msgId}.ogg`,
+        msgId,
+      };
+    }
+    if (kind === "image") {
+      return {
+        kind,
+        mimeType: "image/jpeg",
+        extension: ".jpg",
+        fileName: `wechat-image-${msgId}.jpg`,
+        msgId,
+      };
+    }
+    return {
+      kind,
+      mimeType: "video/mp4",
+      extension: ".mp4",
+      fileName: `wechat-video-${msgId}.mp4`,
+      msgId,
+    };
+  }
+
+  private async materializeMedia(
+    download: (outputPath?: string) => Promise<{ buffer: Buffer | null; outputPath?: string; contentType: string | null }>,
+    attachment: AttachmentCandidate,
+    dir?: string,
+  ): Promise<{ filePath: string; mimeType: string; fileName: string }> {
+    const path = await import("path");
+    const os = await import("os");
+    const fs = await import("fs/promises");
+
+    const baseDir = dir ?? path.join(os.tmpdir(), "wcppm-lob-media");
+    await fs.mkdir(baseDir, { recursive: true });
+    const filePath = path.join(baseDir, attachment.fileName);
+    const result = await download(filePath);
+
+    if (!result.outputPath && result.buffer) {
+      await fs.writeFile(filePath, result.buffer);
+    }
+
+    return {
+      filePath,
+      mimeType: result.contentType ?? attachment.mimeType,
+      fileName: attachment.fileName,
+    };
+  }
+
+  private async downloadMediaEndpoint(
+    endpoint: string,
+    payload: Record<string, unknown>,
+    outputPath?: string,
+  ): Promise<MediaDownloadResult> {
+    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket")
+      ? `authcode=${this.config.authcode}`
+      : `key=${this.authKey}`;
+    const url = `${this.baseUrl}${endpoint}?${authParam}`;
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "*/*" },
+      body: JSON.stringify(payload),
+    });
+
+    const contentType = res.headers.get("content-type");
+    if (!res.ok) {
+      throw new Error(`WCPP: ${endpoint} HTTP ${res.status}`);
+    }
+
+    let buffer: Buffer | null = null;
+    let responseJson: unknown;
+
+    if (contentType?.includes("application/json")) {
+      const data = await res.json() as any;
+      responseJson = data;
+
+      const candidates = [
+        data?.Data,
+        data?.data,
+        data?.Data?.buffer,
+        data?.Data?.base64,
+        data?.Data?.Base64,
+        data?.buffer,
+        data?.base64,
+        data?.Base64,
+      ].filter(Boolean);
+
+      const base64Candidate = candidates.find((v: unknown) => typeof v === "string" && /^[A-Za-z0-9+/=\r\n]+$/.test(v as string));
+      if (typeof base64Candidate === "string") {
+        buffer = Buffer.from(base64Candidate.replace(/\s+/g, ""), "base64");
+      }
+    } else {
+      buffer = Buffer.from(await res.arrayBuffer());
+    }
+
+    if (outputPath && buffer) {
+      const fs = await import("fs/promises");
+      await fs.writeFile(outputPath, buffer);
+      return { contentType, buffer, outputPath, responseJson, requestPayload: payload };
+    }
+
+    return { contentType, buffer, responseJson, requestPayload: payload };
+  }
+
+  async downloadVoice(message: SyncMessage | NormalizedMessage, outputPath?: string): Promise<VoiceDownloadResult> {
+    const info = this.extractVoiceMessageInfo(message);
+    if (!info) {
+      throw new Error("WCPP: message is not a voice message (MsgType 34)");
+    }
+    if (!info.bufid || !info.fromUserName || info.length == null || info.msgId == null) {
+      throw new Error("WCPP: voice message is missing required download fields (bufid/fromUserName/length/msgId)");
+    }
+
+    const result = await this.downloadMediaEndpoint("/Tools/DownloadVoice", {
+      bufid: info.bufid,
+      fromUserName: info.fromUserName,
+      length: info.length,
+      msgId: info.msgId,
+    }, outputPath);
+
+    return {
+      contentType: result.contentType,
+      buffer: result.buffer,
+      outputPath: result.outputPath,
+      responseJson: result.responseJson,
+    };
+  }
+
+  async downloadImage(message: SyncMessage | NormalizedMessage, outputPath?: string): Promise<MediaDownloadResult> {
+    const info = this.extractImageMessageInfo(message);
+    if (!info) {
+      throw new Error("WCPP: message is not an image message (MsgType 3)");
+    }
+    if (!info.fromUserName || info.msgId == null) {
+      throw new Error("WCPP: image message is missing required fields (fromUserName/msgId)");
+    }
+
+    const payload: Record<string, unknown> = {
+      fromUserName: info.fromUserName,
+      msgId: info.msgId,
+    };
+    if (info.aesKey) payload.aesKey = info.aesKey;
+    if (info.cdnMidImgUrl) payload.cdnMidImgUrl = info.cdnMidImgUrl;
+    if (info.cdnBigImgUrl) payload.cdnBigImgUrl = info.cdnBigImgUrl;
+    if (info.cdnThumbUrl) payload.cdnThumbUrl = info.cdnThumbUrl;
+    if (info.md5) payload.md5 = info.md5;
+    if (info.fileLength != null) payload.length = info.fileLength;
+
+    return this.downloadMediaEndpoint("/Tools/DownloadImg", payload, outputPath);
+  }
+
+  async downloadVideo(message: SyncMessage | NormalizedMessage, outputPath?: string): Promise<MediaDownloadResult> {
+    const info = this.extractVideoMessageInfo(message);
+    if (!info) {
+      throw new Error("WCPP: message is not a video message (MsgType 43/62)");
+    }
+    if (!info.fromUserName || info.msgId == null) {
+      throw new Error("WCPP: video message is missing required fields (fromUserName/msgId)");
+    }
+
+    const payload: Record<string, unknown> = {
+      fromUserName: info.fromUserName,
+      msgId: info.msgId,
+    };
+    if (info.aesKey) payload.aesKey = info.aesKey;
+    if (info.cdnVideoUrl) payload.cdnVideoUrl = info.cdnVideoUrl;
+    if (info.cdnThumbUrl) payload.cdnThumbUrl = info.cdnThumbUrl;
+    if (info.md5) payload.md5 = info.md5;
+    if (info.newMd5) payload.newMd5 = info.newMd5;
+    if (info.fileLength != null) payload.length = info.fileLength;
+    if (info.playLengthSeconds != null) payload.playLength = info.playLengthSeconds;
+
+    return this.downloadMediaEndpoint("/Tools/DownloadVideo", payload, outputPath);
+  }
+
+  resolveMedia(message: SyncMessage | NormalizedMessage): ResolvedMedia | null {
+    const voice = this.extractVoiceMessageInfo(message);
+    if (voice) {
+      const attachment = this.buildAttachmentCandidate("voice", String(voice.msgId ?? "unknown"));
+      return {
+        kind: "voice",
+        info: voice,
+        attachment,
+        download: (outputPath?: string) => this.downloadVoice(message, outputPath),
+        materialize: (dir?: string) => this.materializeMedia((outputPath?: string) => this.downloadVoice(message, outputPath), attachment, dir),
+      };
+    }
+
+    const image = this.extractImageMessageInfo(message);
+    if (image) {
+      const attachment = this.buildAttachmentCandidate("image", String(image.msgId ?? "unknown"));
+      return {
+        kind: "image",
+        info: image,
+        attachment,
+        download: (outputPath?: string) => this.downloadImage(message, outputPath),
+        materialize: (dir?: string) => this.materializeMedia((outputPath?: string) => this.downloadImage(message, outputPath), attachment, dir),
+      };
+    }
+
+    const video = this.extractVideoMessageInfo(message);
+    if (video) {
+      const attachment = this.buildAttachmentCandidate("video", String(video.msgId ?? "unknown"));
+      return {
+        kind: "video",
+        info: video,
+        attachment,
+        download: (outputPath?: string) => this.downloadVideo(message, outputPath),
+        materialize: (dir?: string) => this.materializeMedia((outputPath?: string) => this.downloadVideo(message, outputPath), attachment, dir),
+      };
+    }
+
+    return null;
+  }
+
+  isMediaMessage(message: SyncMessage | NormalizedMessage): boolean {
+    return this.resolveMedia(message) !== null;
   }
 
   /**

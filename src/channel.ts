@@ -188,6 +188,8 @@ export async function startWcppRuntime(
 
   // Wire up inbound handler (normalized messages)
   client.onMessage = async (msg: NormalizedMessage) => {
+    const resolvedMedia = client!.resolveMedia(msg);
+
     // Derive sender display name
     let senderName = "";
     if (msg.pushContent) {
@@ -212,6 +214,32 @@ export async function startWcppRuntime(
       }
     }
 
+    const rawEnvelope = {
+      platform: msg.raw,
+      normalized: {
+        msgId: msg.msgId,
+        fromUser: msg.fromUser,
+        toUser: msg.toUser,
+        msgType: msg.msgType,
+        content: msg.content,
+        pushContent: msg.pushContent,
+        msgSource: msg.msgSource,
+        createTime: msg.createTime,
+        senderWxid: msg.senderWxid,
+        text: msg.text,
+        isGroup: msg.isGroup,
+        groupId: msg.groupId,
+        isAtBot: msg.isAtBot,
+      },
+      media: resolvedMedia
+        ? {
+            kind: resolvedMedia.kind,
+            info: resolvedMedia.info,
+            attachment: resolvedMedia.attachment,
+          }
+        : null,
+    };
+
     await dispatchInbound({
       channel: "wechatpadpro",
       chatType: msg.isGroup ? "group" : "dm",
@@ -220,7 +248,7 @@ export async function startWcppRuntime(
       text: msg.text,
       groupId: msg.groupId ?? undefined,
       isAtBot: msg.isAtBot,
-      raw: msg.raw,
+      raw: rawEnvelope,
     });
   };
 
