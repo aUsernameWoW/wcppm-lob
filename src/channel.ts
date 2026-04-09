@@ -27,7 +27,8 @@ export interface ResolvedAccount {
   dmPolicy: string | undefined;
   replyWithMention: boolean;
   proxy?: string;
-  syncMode: "ws" | "sync";
+  syncMode: "ws" | "sync" | "websocket";
+  wsUrl?: string;
   syncInterval?: number;
   readOnly?: boolean;
   allowMsgTypes?: number[];
@@ -44,12 +45,15 @@ function resolveAccount(
     throw new Error("wechatpadpro: host is required in config");
   }
 
-  // Determine mode: if authcode is present, default to sync mode
-  const syncMode: "ws" | "sync" = section.syncMode ?? (section.authcode ? "sync" : "ws");
+  // Determine mode: explicit > authcode implies sync > ws fallback
+  const syncMode: "ws" | "sync" | "websocket" = section.syncMode ?? (section.authcode ? "sync" : "ws");
 
-  // For sync mode, adminKey isn't required (authcode is used instead)
+  // For sync/websocket mode, authcode is used instead of adminKey
   if (syncMode === "ws" && !section.adminKey) {
     throw new Error("wechatpadpro: adminKey is required for WS mode");
+  }
+  if ((syncMode === "sync" || syncMode === "websocket") && !section.authcode) {
+    throw new Error("wechatpadpro: authcode is required for sync/websocket mode");
   }
 
   return {
@@ -65,6 +69,7 @@ function resolveAccount(
     replyWithMention: section.replyWithMention ?? false,
     proxy: section.proxy,
     syncMode,
+    wsUrl: section.wsUrl,
     syncInterval: section.syncInterval,
     readOnly: section.readOnly,
     allowMsgTypes: section.allowMsgTypes,
@@ -111,6 +116,13 @@ export const wechatpadproPlugin = createChatChannelPlugin<ResolvedAccount>({
     attachedResults: {
       sendText: async (params) => {
         if (!client) throw new Error("WeChatPadPro client not initialized");
+        
+        // Handle reply/quote messages
+        if (params.reply_to) {
+          const ok = await client.sendQuote(params.to, params.text, params.reply_to);
+          return { messageId: ok ? `wcpp-${Date.now()}` : undefined };
+        }
+        
         const ok = await client.sendText(params.to, params.text);
         return { messageId: ok ? `wcpp-${Date.now()}` : undefined };
       },
@@ -156,6 +168,7 @@ export async function startWcppRuntime(
       proxy: account.proxy,
       replyWithMention: account.replyWithMention,
       syncMode: account.syncMode,
+      wsUrl: account.wsUrl,
       syncInterval: account.syncInterval,
       readOnly: account.readOnly,
       allowMsgTypes: account.allowMsgTypes,

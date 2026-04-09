@@ -37,8 +37,12 @@
           },
           "syncMode": {
             "type": "string",
-            "enum": ["ws", "sync"],
-            "description": "Message sync mode: 'ws' = WebSocket (standard WCPP), 'sync' = HTTP polling (WCPP MAX). Auto-detected from authcode."
+            "enum": ["ws", "sync", "websocket"],
+            "description": "Message sync mode: 'ws' = WebSocket (standard WCPP), 'sync' = HTTP polling (WCPP MAX), 'websocket' = WebSocket push (WCPP MAX). Auto-detected from authcode."
+          },
+          "wsUrl": {
+            "type": "string",
+            "description": "Custom WebSocket URL for websocket mode (default: ws://{host}:8089/ws/sync)"
           },
           "syncInterval": {
             "type": "number",

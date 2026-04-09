@@ -23,10 +23,16 @@ export interface WcppConfig {
   wxid?: string;
   proxy?: string;
   replyWithMention?: boolean;
-  /** "ws" = WebSocket (standard WCPP), "sync" = HTTP polling (WCPP MAX) */
-  syncMode?: "ws" | "sync";
+  /** 
+   * "ws" = WebSocket (standard WCPP /ws/GetSyncMsg)
+   * "sync" = HTTP polling (WCPP MAX /api/Msg/Sync)
+   * "websocket" = WebSocket push (WCPP MAX /ws/sync)
+   */
+  syncMode?: "ws" | "sync" | "websocket";
   /** WCPP MAX authcode (used instead of key for /api/* endpoints) */
   authcode?: string;
+  /** Custom WebSocket URL (optional, for WCPP MAX websocket mode) */
+  wsUrl?: string;
   /** Sync polling interval in ms (default 5000) */
   syncInterval?: number;
   /** Nurturing mode: receive-only, no sending (default false for safety during initial period) */
@@ -170,7 +176,7 @@ type MessageHandler = (msg: NormalizedMessage) => void;
 export class WcppClient {
   public authKey: string | null;
   public wxid: string | null;
-  public syncMode: "ws" | "sync";
+  public syncMode: "ws" | "sync" | "websocket";
   private baseUrl: string;
 
   // WS state
@@ -312,8 +318,8 @@ export class WcppClient {
    * Full login orchestration. Returns credentials on success.
    */
   async login(): Promise<WcppCredentials | null> {
-    // For sync mode with authcode, we might already be "logged in"
-    if (this.syncMode === "sync" && this.config.authcode) {
+    // For sync/websocket mode with authcode, verify via a test Sync request
+    if ((this.syncMode === "sync" || this.syncMode === "websocket") && this.config.authcode) {
       // Try a test Sync to verify the authcode works
       const testResult = await this.doSyncRequest();
       if (testResult && testResult.Success) {
@@ -696,12 +702,117 @@ export class WcppClient {
   }
 
   // ──────────────────────────────────────────────
+  // WebSocket for WCPP MAX (push mode)
+  // ──────────────────────────────────────────────
+
+  private maxWs: WebSocket | null = null;
+  private maxWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+  connectMaxWebSocket(): void {
+    const authcode = this.config.authcode;
+    if (!authcode) {
+      this.log.error("WCPP MAX: cannot connect WS without authcode");
+      return;
+    }
+
+    // Use custom wsUrl if provided, otherwise construct from host
+    const wsUrl = this.config.wsUrl ?? `ws://${this.config.host}:8089/ws/sync?authcode=${authcode}`;
+    this.log.info(`WCPP MAX: connecting WebSocket to ${wsUrl.replace(/authcode=[^&]+/, "authcode=***")}`);
+
+    this.maxWs = new WebSocket(wsUrl);
+
+    this.maxWs.on("open", () => this.log.info("WCPP MAX: WebSocket connected"));
+
+    this.maxWs.on("message", (raw: WebSocket.Data) => {
+      try {
+        const parsed = JSON.parse(raw.toString()) as SyncResponse;
+        if (parsed.Success && parsed.Data) {
+          // Process similar to sync response
+          this.ingestContacts(parsed);
+          if (!this.wxid && parsed.Data.ModUserInfos?.[0]) {
+            this.wxid = parsed.Data.ModUserInfos[0].UserName.string;
+            this.log.info(`WCPP MAX: detected wxid=${this.wxid} from WS`);
+          }
+          // Process messages
+          const allowTypes = this.config.allowMsgTypes ?? [1, 3, 34, 47, 49];
+          const passRevoke = this.config.passRevokemsg ?? true;
+          const maxAge = this.config.maxMessageAge ?? 180;
+
+          for (const msg of parsed.Data.AddMsgs ?? []) {
+            const msgIdStr = String(msg.NewMsgId);
+            if (this.seenMsgIds.has(msgIdStr)) continue;
+            if (msg.MsgType === 51) continue;
+            if (msg.MsgType === 10002) {
+              if (!passRevoke) continue;
+              if (!msg.Content.string.includes("revokemsg")) continue;
+            } else if (!allowTypes.includes(msg.MsgType)) {
+              continue;
+            }
+            if (Date.now() / 1000 - msg.CreateTime > maxAge) continue;
+
+            this.seenMsgIds.add(msgIdStr);
+            if (this.seenMsgIds.size > this.SEEN_MSG_ID_MAX) {
+              const entries = [...this.seenMsgIds];
+              this.seenMsgIds = new Set(entries.slice(entries.length / 2));
+            }
+
+            const normalized = this.normalizeSyncMessage(msg);
+            if (normalized && normalized.senderWxid !== this.wxid) {
+              this._onMessage?.(normalized);
+            }
+          }
+        }
+      } catch (e) {
+        this.log.debug("WCPP MAX: WS message parse error", e);
+      }
+    });
+
+    this.maxWs.on("close", (code) => {
+      this.log.warn(`WCPP MAX: WebSocket closed (code=${code}), reconnecting in 5s...`);
+      this.scheduleMaxWsReconnect();
+    });
+
+    this.maxWs.on("error", (err) => this.log.error("WCPP MAX: WebSocket error", err));
+
+    // Keepalive
+    const pingInterval = setInterval(() => {
+      if (this.maxWs?.readyState === WebSocket.OPEN) {
+        this.maxWs.ping();
+      } else {
+        clearInterval(pingInterval);
+      }
+    }, 30_000);
+  }
+
+  private scheduleMaxWsReconnect(): void {
+    if (this.maxWsReconnectTimer) return;
+    this.maxWsReconnectTimer = setTimeout(() => {
+      this.maxWsReconnectTimer = null;
+      this.connectMaxWebSocket();
+    }, 5000);
+  }
+
+  disconnectMaxWebSocket(): void {
+    if (this.maxWsReconnectTimer) {
+      clearTimeout(this.maxWsReconnectTimer);
+      this.maxWsReconnectTimer = null;
+    }
+    if (this.maxWs) {
+      this.maxWs.removeAllListeners();
+      this.maxWs.close();
+      this.maxWs = null;
+    }
+  }
+
+  // ──────────────────────────────────────────────
   // Unified connect/disconnect
   // ──────────────────────────────────────────────
 
   connect(): void {
     if (this.syncMode === "sync") {
       this.startSyncPolling();
+    } else if (this.syncMode === "websocket") {
+      this.connectMaxWebSocket();
     } else {
       this.connectWebSocket();
     }
@@ -710,6 +821,7 @@ export class WcppClient {
   disconnect(): void {
     this.stopSyncPolling();
     this.disconnectWebSocket();
+    this.disconnectMaxWebSocket();
   }
 
   // ──────────────────────────────────────────────
@@ -722,7 +834,7 @@ export class WcppClient {
       return false;
     }
 
-    const authParam = this.syncMode === "sync"
+    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket")
       ? `authcode=${this.config.authcode}`
       : `key=${this.authKey}`;
 
@@ -770,7 +882,7 @@ export class WcppClient {
       return false;
     }
 
-    const authParam = this.syncMode === "sync"
+    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket")
       ? `authcode=${this.config.authcode}`
       : `key=${this.authKey}`;
     const url = `${this.baseUrl}/message/SendImageNewMessage?${authParam}`;
@@ -791,6 +903,49 @@ export class WcppClient {
     }
   }
 
+  /**
+   * Send a quoted/reply message (引用回复).
+   * Requires WCPP MAX API.
+   */
+  async sendQuote(to: string, text: string, referMsgId: string, referToUserName?: string): Promise<boolean> {
+    if (this.config.readOnly) {
+      this.log.warn("WCPP: read-only mode active, not sending quote");
+      return false;
+    }
+
+    // Quote API is only available in MAX mode via /api/Msg/Quote
+    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket")
+      ? `authcode=${this.config.authcode}`
+      : `key=${this.authKey}`;
+    
+    const url = `${this.baseUrl}/api/Msg/Quote?${authParam}`;
+    const payload: Record<string, unknown> = {
+      ToUserName: to,
+      Content: text,
+      ReferMsgId: referMsgId,
+    };
+    
+    // ReferToUserName may be required for group quotes
+    if (referToUserName) {
+      payload.ReferToUserName = referToUserName;
+    }
+
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = (await res.json()) as any;
+      if (data.Code === 0 || data.Code === 200) return true;
+      this.log.warn("WCPP: Quote API returned non-success", data);
+      return false;
+    } catch (e) {
+      this.log.error("WCPP: error sending quote", e);
+      return false;
+    }
+  }
+
   // ──────────────────────────────────────────────
   // Contact helpers
   // ──────────────────────────────────────────────
@@ -800,7 +955,7 @@ export class WcppClient {
     const cached = this.contactCache.get(memberWxid);
     if (cached?.NickName?.string) return cached.NickName.string;
 
-    const authParam = this.syncMode === "sync"
+    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket")
       ? `authcode=${this.config.authcode}`
       : `key=${this.authKey}`;
 
@@ -822,7 +977,7 @@ export class WcppClient {
   }
 
   async getContactList(): Promise<string[] | null> {
-    const authParam = this.syncMode === "sync"
+    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket")
       ? `authcode=${this.config.authcode}`
       : `key=${this.authKey}`;
 
