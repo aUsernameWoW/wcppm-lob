@@ -2,3 +2,8 @@ node_modules/
 dist/
 *.tgz
 src/shims/
+
+# Local secrets (never commit)
+.env
+.env.*
+local-config.*

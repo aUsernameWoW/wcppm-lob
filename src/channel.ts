@@ -9,7 +9,7 @@ import {
   createChannelPluginBase,
 } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
-import { WcppClient, type NormalizedMessage } from "./client.js";
+import { WcppClient, type NormalizedMessage, type QuoteInfo } from "./client.js";
 
 // ──────────────────────────────────────────────
 // Account resolution
@@ -154,6 +154,9 @@ export async function startWcppRuntime(
     text: string;
     groupId?: string;
     isAtBot: boolean;
+    replyToId?: string;
+    replyToBody?: string;
+    replyToSender?: string;
     raw: any;
   }) => Promise<void>,
 ): Promise<void> {
@@ -230,6 +233,7 @@ export async function startWcppRuntime(
         isGroup: msg.isGroup,
         groupId: msg.groupId,
         isAtBot: msg.isAtBot,
+        quote: msg.quote,
       },
       media: resolvedMedia
         ? {
@@ -240,14 +244,27 @@ export async function startWcppRuntime(
         : null,
     };
 
+    // Build body text — append reply context suffix if this is a quote message
+    // Following the QQ/Telegram convention: [Replying to SenderName]\nContent\n[/Replying]
+    let bodyText = msg.text;
+    if (msg.quote) {
+      const replyLabel = msg.quote.referDisplayName || msg.quote.referSenderWxid || "unknown";
+      bodyText += `\n\n[Replying to ${replyLabel}]\n${msg.quote.referSummary}\n[/Replying]`;
+    }
+
     await dispatchInbound({
       channel: "wechatpadpro",
       chatType: msg.isGroup ? "group" : "dm",
       senderId: msg.senderWxid,
       senderName,
-      text: msg.text,
+      text: bodyText,
       groupId: msg.groupId ?? undefined,
       isAtBot: msg.isAtBot,
+      ...(msg.quote && {
+        replyToId: msg.quote.referMsgId,
+        replyToBody: msg.quote.referSummary,
+        replyToSender: msg.quote.referDisplayName || msg.quote.referSenderWxid,
+      }),
       raw: rawEnvelope,
     });
   };

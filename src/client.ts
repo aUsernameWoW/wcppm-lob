@@ -153,6 +153,22 @@ export interface SyncUserInfo {
 // Normalized message type (unified for WS & Sync)
 // ──────────────────────────────────────────────
 
+/** Metadata extracted from a quote/reply message's `<refermsg>` XML. */
+export interface QuoteInfo {
+  /** Server-side message ID of the quoted message (`<svrid>`) */
+  referMsgId: string;
+  /** wxid of the original message sender (`<chatusr>`) */
+  referSenderWxid: string;
+  /** Display name of the original sender (`<displayname>`) */
+  referDisplayName: string;
+  /** Content of the quoted message (`<content>`) — raw text or XML depending on type */
+  referContent: string;
+  /** MsgType of the quoted message (`<type>`) */
+  referType: number;
+  /** Human-readable summary of the quoted content */
+  referSummary: string;
+}
+
 export interface NormalizedMessage {
   msgId: string;
   fromUser: string;
@@ -172,6 +188,8 @@ export interface NormalizedMessage {
   groupId: string | null;
   /** Is the bot @mentioned? */
   isAtBot: boolean;
+  /** Quote/reply metadata if this message quotes another */
+  quote: QuoteInfo | null;
   /** Raw underlying message (WS or Sync format) */
   raw: unknown;
 }
@@ -577,6 +595,73 @@ export class WcppClient {
     return match?.[1]?.trim() || null;
   }
 
+  /**
+   * Parse a quote/reply message (MsgType 49, appType 57) and extract
+   * the `<refermsg>` metadata.  Returns null if not a quote message.
+   */
+  parseQuoteMessage(xml: string): QuoteInfo | null {
+    const appType = this.extractXmlTag(xml, "type");
+    if (appType !== "57") return null;
+
+    const referBlock = xml.match(/<refermsg>([\s\S]*?)<\/refermsg>/i)?.[1];
+    if (!referBlock) return null;
+
+    const referMsgId = this.extractXmlTag(referBlock, "svrid") ?? "";
+    const referSenderWxid = this.extractXmlTag(referBlock, "chatusr") ?? "";
+    const referDisplayName = this.extractXmlTag(referBlock, "displayname") ?? "";
+    const referTypeStr = this.extractXmlTag(referBlock, "type") ?? "1";
+    const referType = Number(referTypeStr) || 1;
+
+    // <content> in refermsg is HTML-entity-escaped for non-text types (images,
+    // locations, cards etc.) and may have a leading \n — unescape and trim.
+    let referContent = this.extractXmlTag(referBlock, "content") ?? "";
+    referContent = this.unescapeXmlEntities(referContent).replace(/^\n+/, "");
+
+    const referSummary = this.summarizeQuotedContent(referType, referContent);
+
+    return {
+      referMsgId,
+      referSenderWxid,
+      referDisplayName,
+      referContent,
+      referType,
+      referSummary,
+    };
+  }
+
+  /**
+   * Produce a short human-readable summary of quoted message content,
+   * reusing the same logic as formatInboundDisplayText where applicable.
+   */
+  private summarizeQuotedContent(msgType: number, content: string): string {
+    if (msgType === 1) return content.length > 80 ? content.slice(0, 80) + "…" : content;
+    if (msgType === 3) return "[图片]";
+    if (msgType === 34) return "[语音]";
+    if (msgType === 47) return "[表情]";
+    if (msgType === 48) {
+      const poiname = this.extractXmlAttr(content, "location", "poiname");
+      return poiname ? `[位置] ${poiname}` : "[位置]";
+    }
+    if (msgType === 49) {
+      const title = this.extractXmlTag(content, "title");
+      if (title) return `[卡片] ${title}`;
+      return "[卡片消息]";
+    }
+    // Fallback: truncate raw content
+    return content.length > 60 ? content.slice(0, 60) + "…" : content || "[消息]";
+  }
+
+  private unescapeXmlEntities(s: string): string {
+    return s
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&amp;/g, "&")
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'")
+      .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+      .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(Number(dec)));
+  }
+
   private extractXmlAttr(content: string, tag: string, attr: string): string | null {
     const tagMatch = content.match(new RegExp(`<${tag}\\s[^>]*${attr}="([^"]*)"`, "i"));
     return tagMatch?.[1] || null;
@@ -740,7 +825,9 @@ export class WcppClient {
       const title = this.extractXmlTag(content, "title");
       const appType = this.extractXmlTag(content, "type");
       const url = this.extractXmlTag(content, "url");
-      if (appType === "57") return `[引用] ${title ?? "消息"}`;
+      // Quote/reply: <title> is the user's actual reply text — return it as-is.
+      // The quoted context is attached separately via NormalizedMessage.quote.
+      if (appType === "57") return title ?? "";
       if (appType === "5") return title ? `[链接] ${title}` : (url ? `[链接] ${url}` : "[链接]");
       if (title) return `[卡片] ${title}`;
       return "[卡片消息]";
@@ -794,6 +881,9 @@ export class WcppClient {
       }
     }
 
+    // Parse quote/reply metadata for MsgType 49
+    const quote = msg.MsgType === 49 ? this.parseQuoteMessage(text) : null;
+
     text = this.formatInboundDisplayText(msg.MsgType, text);
 
     // Prefer NewMsgId for global uniqueness, but fall back to MsgId if
@@ -818,6 +908,7 @@ export class WcppClient {
       isGroup,
       groupId,
       isAtBot,
+      quote,
       raw: msg,
     };
   }
@@ -940,6 +1031,8 @@ export class WcppClient {
       }
     }
 
+    const quote = msg.msg_type === 49 ? this.parseQuoteMessage(text) : null;
+
     text = this.formatInboundDisplayText(msg.msg_type, text);
 
     return {
@@ -956,6 +1049,7 @@ export class WcppClient {
       isGroup,
       groupId,
       isAtBot,
+      quote,
       raw: msg,
     };
   }
