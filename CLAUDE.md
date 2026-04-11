@@ -55,15 +55,15 @@ src/
 
 ### WebSocket Mode (WeChatPadProMAX — push)
 - WebSocket at `ws://host:8089/ws/sync?authcode=AUTHCODE`
-- Real-time push of SyncResponse messages (same format as HTTP Sync)
+- Real-time push of messages wrapped in an outer envelope (since WCPP MAX 20260411)
+- Two envelope formats observed: `Data.syncData` and `Data.data` — both contain the same inner SyncResponse
+- Server pushes each message **twice** (once per format); dedup by `MsgId` handles this
+- `Data.wxid` in the `syncData` envelope provides self-wxid without needing ModUserInfos
 - Uses same message processing pipeline as Sync mode
 - Auto-reconnect on disconnect
 - Set `syncMode: "websocket"` and optionally `wsUrl` for custom URL
 - If `wsUrl` is not set, auto-constructs from `host` as `ws://{host}:8089/ws/sync?authcode={authcode}`
 - **Do not send init payloads on connect** for this production account
-- Current observed behavior: WS handshake succeeds, then server closes immediately with code `1006`; `/Msg/Sync` remains usable without initialization
-- Server logs observed during WS attempts: `Webhook入队失败 ... 未找到Webhook配置`
-- Read-only probes of `/api/Webhook/Get` and `/api/Webhook/Business/Get` currently return `502 Bad Gateway`, which suggests webhook control path may be unavailable or fronted differently in this environment
 
 ## WeChat Message Format
 
@@ -81,14 +81,17 @@ Must split on first `:\n` to extract sender and text.
 | 3 | Image (XML with CDN URL) | Pass through |
 | 34 | Voice (XML with voiceurl) | Pass through |
 | 47 | Sticker/emoji (XML with CDN URL) | Pass through |
+| 48 | Location (XML with lat/lng/poiname/label) | Pass through |
 | 49 | App/XML message (sub-types via `<type>` tag) | Parse `<title>`, pass through |
 | 51 | Internal status sync (`<op id=2/5/7/9/11>`) | **Always drop** |
 | 10002 | System message (dynacfg, revokemsg, etc.) | Drop except `revokemsg` |
 
 ### MsgType 49 Sub-types (check XML `<type>`)
 - `57` = Quote/reply message
-- `5` = Link card (URL in `<url>`)
-- `3` = Image (sometimes uses MsgType 3 instead)
+- `5` = Link card (URL in `<url>`) — includes 公众号文章分享
+- `3` = Music share (QQ Music, etc. — `<dataurl>` has audio stream, `<url>` has web link)
+- `8` = GIF/emoticon (sticker sent as app message)
+- Image sometimes uses MsgType 3 instead of 49 sub-type
 
 ### MsgType 51 Op IDs (all noise, always filter)
 - `2`/`5` = lastMessage read status sync
@@ -100,6 +103,7 @@ Must split on first `:\n` to extract sender and text.
 - `dynacfg` = Dynamic config push (huge key-value blob) → drop
 - `gog_wcs_plugin_config` = Risk control/strike → drop
 - `ClientCheckGetExtInfo` = Device info collection → drop
+- `EmotionBackup` = Sticker backup sync → drop
 - `revokemsg` = Message recall notification → **keep** (if `passRevokemsg: true`)
 
 ## Sync Response Structure
@@ -147,7 +151,7 @@ Must split on first `:\n` to extract sender and text.
       "readOnly": true,           // Receive-only, no sending
       "dmSecurity": "allow-all",  // "allowlist" | "allow-all" | "pairing"
       "allowFrom": ["wxid_xxx"],  // DM allowlist
-      "allowMsgTypes": [1,3,34,47,49],
+      "allowMsgTypes": [1,3,34,47,48,49],
       "passRevokemsg": true,
       "maxMessageAge": 180
     }

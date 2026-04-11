@@ -99,6 +99,28 @@ export interface SyncMessage {
   MsgSeq: number;
 }
 
+/**
+ * WCPP MAX 20260411+ WebSocket envelope.
+ * The server wraps SyncResponse in an outer envelope with two known shapes:
+ *   - { Data: { syncData: SyncResponse, wxid, time } }
+ *   - { Data: { data: SyncResponse, type: "sync_message", timestamp } }
+ */
+interface MaxWsEnvelope {
+  Code: number;
+  Success: boolean;
+  Message?: string;
+  Data?: {
+    syncData?: SyncResponse;
+    data?: SyncResponse;
+    wxid?: string;
+    time?: string;
+    type?: string;
+    timestamp?: number;
+  };
+  Data62?: string;
+  Debug?: string;
+}
+
 export interface SyncContact {
   UserName: { string: string };
   NickName: { string: string };
@@ -499,15 +521,16 @@ export class WcppClient {
     }
 
     // Process messages
-    const allowTypes = this.config.allowMsgTypes ?? [1, 3, 34, 47, 49];
+    const allowTypes = this.config.allowMsgTypes ?? [1, 3, 34, 47, 48, 49];
     const passRevoke = this.config.passRevokemsg ?? true;
     const maxAge = this.config.maxMessageAge ?? 180;
 
     for (const msg of resp.Data.AddMsgs ?? []) {
-      const msgIdStr = String(msg.NewMsgId);
+      // Use MsgId as dedup key — NewMsgId can lose precision via JSON.parse
+      const dedupKey = `${msg.MsgId}`;
 
       // Dedup
-      if (this.seenMsgIds.has(msgIdStr)) continue;
+      if (this.seenMsgIds.has(dedupKey)) continue;
 
       // Filter by MsgType
       if (msg.MsgType === 51) continue; // Always drop status sync
@@ -524,7 +547,7 @@ export class WcppClient {
       if (Date.now() / 1000 - msg.CreateTime > maxAge) continue;
 
       // Mark seen
-      this.seenMsgIds.add(msgIdStr);
+      this.seenMsgIds.add(dedupKey);
       if (this.seenMsgIds.size > this.SEEN_MSG_ID_MAX) {
         // Evict oldest entries (simple approach: clear half)
         const entries = [...this.seenMsgIds];
@@ -552,6 +575,11 @@ export class WcppClient {
   private extractXmlTag(content: string, tag: string): string | null {
     const match = content.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, "i"));
     return match?.[1]?.trim() || null;
+  }
+
+  private extractXmlAttr(content: string, tag: string, attr: string): string | null {
+    const tagMatch = content.match(new RegExp(`<${tag}\\s[^>]*${attr}="([^"]*)"`, "i"));
+    return tagMatch?.[1] || null;
   }
 
   private formatVoiceDuration(raw: string): string | null {
@@ -701,6 +729,13 @@ export class WcppClient {
       return name ? `[表情] ${name}` : "[表情]";
     }
 
+    if (msgType === 48) {
+      const poiname = this.extractXmlAttr(content, "location", "poiname");
+      const label = this.extractXmlAttr(content, "location", "label");
+      const display = poiname || label;
+      return display ? `[位置] ${display}` : "[位置]";
+    }
+
     if (msgType === 49) {
       const title = this.extractXmlTag(content, "title");
       const appType = this.extractXmlTag(content, "type");
@@ -761,8 +796,16 @@ export class WcppClient {
 
     text = this.formatInboundDisplayText(msg.MsgType, text);
 
+    // Prefer NewMsgId for global uniqueness, but fall back to MsgId if
+    // NewMsgId looks like it suffered JS precision loss (ends in 000+).
+    const rawNewId = String(msg.NewMsgId);
+    const stableId =
+      rawNewId.length > 15 && rawNewId.endsWith("000")
+        ? String(msg.MsgId)
+        : rawNewId;
+
     return {
-      msgId: String(msg.NewMsgId),
+      msgId: stableId,
       fromUser,
       toUser: msg.ToUserName?.string ?? "",
       msgType: msg.MsgType,
@@ -961,41 +1004,59 @@ export class WcppClient {
 
     this.maxWs.on("message", (raw: WebSocket.Data) => {
       try {
-        const parsed = JSON.parse(raw.toString()) as SyncResponse;
-        if (parsed.Success && parsed.Data) {
-          // Process similar to sync response
-          this.ingestContacts(parsed);
-          if (!this.wxid && parsed.Data.ModUserInfos?.[0]) {
-            this.wxid = parsed.Data.ModUserInfos[0].UserName.string;
-            this.log.info(`WCPP MAX: detected wxid=${this.wxid} from WS`);
+        const envelope = JSON.parse(raw.toString()) as MaxWsEnvelope;
+        if (!envelope.Success || !envelope.Data) return;
+
+        // Unwrap: 20260411+ wraps SyncResponse inside Data.syncData or Data.data
+        const inner: SyncResponse | undefined =
+          envelope.Data.syncData ?? envelope.Data.data ?? undefined;
+
+        if (!inner?.Success || !inner?.Data) {
+          this.log.debug("WCPP MAX: WS envelope has no recognizable inner SyncResponse");
+          return;
+        }
+
+        // Extract wxid from envelope-level field (available in syncData variant)
+        if (!this.wxid && envelope.Data.wxid) {
+          this.wxid = envelope.Data.wxid;
+          this.log.info(`WCPP MAX: detected wxid=${this.wxid} from WS envelope`);
+        }
+
+        // Process the unwrapped SyncResponse
+        this.ingestContacts(inner);
+        if (!this.wxid && inner.Data.ModUserInfos?.[0]) {
+          this.wxid = inner.Data.ModUserInfos[0].UserName.string;
+          this.log.info(`WCPP MAX: detected wxid=${this.wxid} from WS ModUserInfos`);
+        }
+
+        const allowTypes = this.config.allowMsgTypes ?? [1, 3, 34, 47, 48, 49];
+        const passRevoke = this.config.passRevokemsg ?? true;
+        const maxAge = this.config.maxMessageAge ?? 180;
+
+        for (const msg of inner.Data.AddMsgs ?? []) {
+          // Use MsgId as primary dedup key — NewMsgId suffers from JS number
+          // precision loss for values > Number.MAX_SAFE_INTEGER, and the server
+          // may push the same message in multiple envelope formats.
+          const dedupKey = `${msg.MsgId}`;
+          if (this.seenMsgIds.has(dedupKey)) continue;
+          if (msg.MsgType === 51) continue;
+          if (msg.MsgType === 10002) {
+            if (!passRevoke) continue;
+            if (!msg.Content.string.includes("revokemsg")) continue;
+          } else if (!allowTypes.includes(msg.MsgType)) {
+            continue;
           }
-          // Process messages
-          const allowTypes = this.config.allowMsgTypes ?? [1, 3, 34, 47, 49];
-          const passRevoke = this.config.passRevokemsg ?? true;
-          const maxAge = this.config.maxMessageAge ?? 180;
+          if (Date.now() / 1000 - msg.CreateTime > maxAge) continue;
 
-          for (const msg of parsed.Data.AddMsgs ?? []) {
-            const msgIdStr = String(msg.NewMsgId);
-            if (this.seenMsgIds.has(msgIdStr)) continue;
-            if (msg.MsgType === 51) continue;
-            if (msg.MsgType === 10002) {
-              if (!passRevoke) continue;
-              if (!msg.Content.string.includes("revokemsg")) continue;
-            } else if (!allowTypes.includes(msg.MsgType)) {
-              continue;
-            }
-            if (Date.now() / 1000 - msg.CreateTime > maxAge) continue;
+          this.seenMsgIds.add(dedupKey);
+          if (this.seenMsgIds.size > this.SEEN_MSG_ID_MAX) {
+            const entries = [...this.seenMsgIds];
+            this.seenMsgIds = new Set(entries.slice(entries.length / 2));
+          }
 
-            this.seenMsgIds.add(msgIdStr);
-            if (this.seenMsgIds.size > this.SEEN_MSG_ID_MAX) {
-              const entries = [...this.seenMsgIds];
-              this.seenMsgIds = new Set(entries.slice(entries.length / 2));
-            }
-
-            const normalized = this.normalizeSyncMessage(msg);
-            if (normalized && normalized.senderWxid !== this.wxid) {
-              this._onMessage?.(normalized);
-            }
+          const normalized = this.normalizeSyncMessage(msg);
+          if (normalized && normalized.senderWxid !== this.wxid) {
+            this._onMessage?.(normalized);
           }
         }
       } catch (e) {
