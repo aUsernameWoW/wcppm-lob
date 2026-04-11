@@ -39,7 +39,7 @@ Add to your `openclaw.json`:
 {
   "channels": {
     "wechatpadpro": {
-      "host": "192.168.50.231",
+      "host": "your-wcpp-server",
       "port": 8062,
       "authcode": "your-authcode",
       "syncMode": "websocket",
