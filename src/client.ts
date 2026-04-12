@@ -23,7 +23,7 @@ export interface WcppConfig {
   wxid?: string;
   proxy?: string;
   replyWithMention?: boolean;
-  /** 
+  /**
    * "ws" = WebSocket (standard WCPP /ws/GetSyncMsg)
    * "sync" = HTTP polling (WCPP MAX /api/Msg/Sync)
    * "websocket" = WebSocket push (WCPP MAX /ws/sync)
@@ -43,6 +43,10 @@ export interface WcppConfig {
   passRevokemsg?: boolean;
   /** Max age for messages in seconds — drop older (default 180) */
   maxMessageAge?: number;
+  /** Call Newinit on startup to establish longlink (required for WCPP MAX 0412+) */
+  newinitOnStart?: boolean;
+  /** How many consecutive WS failures before falling back to sync polling (default 3) */
+  wsFallbackThreshold?: number;
 }
 
 export interface WcppCredentials {
@@ -331,6 +335,7 @@ export class WcppClient {
     this.baseUrl = `http://${config.host}:${config.port}`;
     this.synckey = "string"; // initial value for first Sync call
     this.continueFlag = 0;
+    this.MAX_WS_FAILURES_BEFORE_FALLBACK = config.wsFallbackThreshold ?? 3;
   }
 
   // ──────────────────────────────────────────────
@@ -440,18 +445,27 @@ export class WcppClient {
    * Full login orchestration. Returns credentials on success.
    */
   async login(): Promise<WcppCredentials | null> {
-    // For sync/websocket mode with authcode, verify via a test Sync request
+    // For sync/websocket mode with authcode
     if ((this.syncMode === "sync" || this.syncMode === "websocket") && this.config.authcode) {
-      // Try a test Sync to verify the authcode works
+      // Call Newinit first if configured (required for WCPP MAX 0412+ longlink)
+      if (this.config.newinitOnStart !== false) {
+        const initResult = await this.newinit();
+        if (initResult) {
+          if (initResult.wxid) this.wxid = initResult.wxid;
+          // Use the Newinit synckey as initial cursor
+          if (initResult.currentSynckey) this.synckey = initResult.currentSynckey;
+        } else {
+          this.log.warn("WCPP MAX: Newinit failed, falling back to Sync test");
+        }
+      }
+
+      // Verify via a test Sync request
       const testResult = await this.doSyncRequest();
       if (testResult && testResult.Success) {
-        // Extract wxid from ModUserInfos
         if (testResult.Data?.ModUserInfos?.[0]) {
           this.wxid = testResult.Data.ModUserInfos[0].UserName.string;
           this.log.info(`WCPP MAX: sync test OK, wxid=${this.wxid}`);
-          // Seed the contact cache
           this.ingestContacts(testResult);
-          // Seed synckey from response
           if (testResult.Data.KeyBuf?.buffer) {
             this.synckey = testResult.Data.KeyBuf.buffer;
           }
@@ -485,6 +499,60 @@ export class WcppClient {
     if (!qrUrl) return null;
     this.log.info(`WCPP: scan QR code to login: ${qrUrl}`);
     return this.checkLoginStatus();
+  }
+
+  // ──────────────────────────────────────────────
+  // Newinit (WCPP MAX 0412+ longlink establishment)
+  // ──────────────────────────────────────────────
+
+  /**
+   * Call /Login/Newinit to initialize the longlink connection.
+   * Required on WCPP MAX 0412+ to enable the unified dispatch pipeline.
+   * Returns the initial Synckey pair, or null on failure.
+   */
+  async newinit(maxSynckey?: string, currentSynckey?: string): Promise<{
+    currentSynckey: string;
+    maxSynckey: string;
+    wxid: string | null;
+  } | null> {
+    const authcode = this.config.authcode;
+    if (!authcode) {
+      this.log.error("WCPP MAX: cannot call Newinit without authcode");
+      return null;
+    }
+
+    let url = `${this.baseUrl}/api/Login/Newinit?authcode=${authcode}`;
+    if (maxSynckey) url += `&MaxSynckey=${encodeURIComponent(maxSynckey)}`;
+    if (currentSynckey) url += `&CurrentSynckey=${encodeURIComponent(currentSynckey)}`;
+
+    try {
+      const res = await fetch(url, { method: "POST" });
+      if (!res.ok) {
+        this.log.error(`WCPP MAX: Newinit HTTP ${res.status}`);
+        return null;
+      }
+      const data = (await res.json()) as any;
+      if (!data.Success) {
+        this.log.error(`WCPP MAX: Newinit failed: ${data.Message}`);
+        return null;
+      }
+
+      const d = data.Data;
+      const curKey = d?.CurrentSynckey?.buffer ?? "";
+      const maxKey = d?.MaxSynckey?.buffer ?? "";
+
+      // Extract wxid from ModUserInfos
+      let wxid: string | null = null;
+      if (d?.ModUserInfos?.[0]?.UserName?.string) {
+        wxid = d.ModUserInfos[0].UserName.string;
+      }
+
+      this.log.info(`WCPP MAX: Newinit OK${wxid ? ` (wxid=${wxid})` : ""}, longlink established`);
+      return { currentSynckey: curKey, maxSynckey: maxKey, wxid };
+    } catch (e) {
+      this.log.error("WCPP MAX: Newinit request error", e);
+      return null;
+    }
   }
 
   // ──────────────────────────────────────────────
@@ -1080,6 +1148,8 @@ export class WcppClient {
 
   private maxWs: WebSocket | null = null;
   private maxWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private maxWsConsecutiveFailures = 0;
+  private MAX_WS_FAILURES_BEFORE_FALLBACK = 3;
 
   connectMaxWebSocket(): void {
     const authcode = this.config.authcode;
@@ -1094,7 +1164,10 @@ export class WcppClient {
 
     this.maxWs = new WebSocket(wsUrl);
 
-    this.maxWs.on("open", () => this.log.info("WCPP MAX: WebSocket connected"));
+    this.maxWs.on("open", () => {
+      this.log.info("WCPP MAX: WebSocket connected");
+      this.maxWsConsecutiveFailures = 0;
+    });
 
     this.maxWs.on("message", (raw: WebSocket.Data) => {
       try {
@@ -1159,6 +1232,17 @@ export class WcppClient {
     });
 
     this.maxWs.on("close", (code) => {
+      this.maxWsConsecutiveFailures++;
+      if (this.maxWsConsecutiveFailures >= this.MAX_WS_FAILURES_BEFORE_FALLBACK) {
+        this.log.warn(
+          `WCPP MAX: WebSocket failed ${this.maxWsConsecutiveFailures} times consecutively, ` +
+          `falling back to Sync polling mode`
+        );
+        this.disconnectMaxWebSocket();
+        this.syncMode = "sync";
+        this.startSyncPolling();
+        return;
+      }
       this.log.warn(`WCPP MAX: WebSocket closed (code=${code}), reconnecting in 5s...`);
       this.scheduleMaxWsReconnect();
     });
@@ -1229,11 +1313,12 @@ export class WcppClient {
       ? `authcode=${this.config.authcode}`
       : `key=${this.authKey}`;
 
-    // Try MAX endpoint first
+    // Try MAX endpoint first (0412 API uses ToWxid + Type: 1)
     const maxUrl = `${this.baseUrl}/api/Msg/SendTxt?${authParam}`;
     const maxPayload = {
-      ToUserName: to,
+      ToWxid: to,
       Content: text,
+      Type: 1,
     };
 
     try {
@@ -1531,21 +1616,21 @@ export class WcppClient {
       return false;
     }
 
-    // Quote API is only available in MAX mode via /api/Msg/Quote
+    // Quote API (WCPP MAX /api/Msg/Quote)
+    // Fields: ToWxid, Fromusr (quoted sender), Displayname, NewMsgId, QuoteContent, MsgContent
     const authParam = (this.syncMode === "sync" || this.syncMode === "websocket")
       ? `authcode=${this.config.authcode}`
       : `key=${this.authKey}`;
-    
+
     const url = `${this.baseUrl}/api/Msg/Quote?${authParam}`;
     const payload: Record<string, unknown> = {
-      ToUserName: to,
-      Content: text,
-      ReferMsgId: referMsgId,
+      ToWxid: to,
+      MsgContent: text,
+      NewMsgId: referMsgId,
     };
-    
-    // ReferToUserName may be required for group quotes
+
     if (referToUserName) {
-      payload.ReferToUserName = referToUserName;
+      payload.Fromusr = referToUserName;
     }
 
     try {

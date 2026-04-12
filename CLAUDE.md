@@ -8,12 +8,15 @@ An OpenClaw channel plugin that bridges WeChatPadPro / WeChatPadProMAX into Open
 
 **This plugin does NOT handle:**
 - **Login/Authentication** — QR code scanning, 62-data login, A16 login, token renewal, heartbeat management, and all `/Login/*` operations are handled externally by the WeChatPadProMax server administrator
-- **Account lifecycle** — initialization (`Newinit`), auto-heartbeat, reconnection, etc.
 
 **Hard constraints confirmed in production:**
-- **Do not call initialization** (`/Login/Newinit` or equivalent startup/init messages) for this account
-- `/Msg/Sync` works **without** initialization
 - For account nurturing / safety, prefer passive receive paths and avoid unnecessary active operations
+
+**Newinit behavior (updated for WCPP MAX 0412+):**
+- `Newinit` is now called on startup by default (`newinitOnStart` config, defaults to true)
+- On WCPP MAX 0412+, Newinit establishes the longlink connection required for the unified dispatch pipeline
+- Without Newinit, the server will not push messages through any channel (WS, Webhook, etc.)
+- Newinit also returns initial Synckeys and self wxid
 
 **This plugin assumes:**
 - The WeChatPadProMax server is already logged in and online
@@ -37,9 +40,11 @@ src/
 └── shims/
     └── openclaw/
         └── channel-core.ts  — Type shims for standalone compilation
+tools/
+└── debug.ts          — Standalone CLI for testing WCPP MAX API (npx tsx tools/debug.ts)
 ```
 
-## Two Sync Modes
+## Three Sync Modes
 
 ### WS Mode (standard WeChatPadPro)
 - WebSocket at `ws://host:port/ws/GetSyncMsg?key=AUTHKEY`
@@ -60,10 +65,10 @@ src/
 - Server pushes each message **twice** (once per format); dedup by `MsgId` handles this
 - `Data.wxid` in the `syncData` envelope provides self-wxid without needing ModUserInfos
 - Uses same message processing pipeline as Sync mode
-- Auto-reconnect on disconnect
+- Auto-reconnect on disconnect; falls back to Sync polling after `wsFallbackThreshold` consecutive failures (default 3)
 - Set `syncMode: "websocket"` and optionally `wsUrl` for custom URL
 - If `wsUrl` is not set, auto-constructs from `host` as `ws://{host}:8089/ws/sync?authcode={authcode}`
-- **Do not send init payloads on connect** for this production account
+- **Known issue (WCPP MAX 0412):** WS push is broken — connections are accepted then immediately dropped (0 bytes, code 1006). The server's unified dispatch pipeline logs data pushes, but no WS client can stay connected. Auto-fallback to Sync polling handles this transparently.
 
 ## WeChat Message Format
 
@@ -146,9 +151,11 @@ Must split on first `:\n` to extract sender and text.
       "authcode": "...",           // Required for sync/websocket mode
       "adminKey": "...",           // Required for WS mode only
       "syncMode": "websocket",    // "ws" | "sync" | "websocket" (auto-detected from authcode → sync)
-      "wsUrl": "ws://172.24.16.104:8089/ws/sync",  // Optional: custom WS URL for websocket mode
+      "wsUrl": "ws://HOST:8089/ws/sync",  // Optional: custom WS URL for websocket mode
       "syncInterval": 5000,       // Poll interval in ms (sync mode only)
       "readOnly": true,           // Receive-only, no sending
+      "newinitOnStart": true,     // Call Newinit on startup for longlink (default true, required for 0412+)
+      "wsFallbackThreshold": 3,   // Consecutive WS failures before falling back to sync (default 3)
       "dmSecurity": "allow-all",  // "allowlist" | "allow-all" | "pairing"
       "allowFrom": ["wxid_xxx"],  // DM allowlist
       "allowMsgTypes": [1,3,34,47,48,49],
@@ -233,3 +240,24 @@ All `/Login/*`, `/Admin/*`, `/User/*` account management APIs.
 - Each resolved media object now also exposes attachment-ready metadata (`mimeType`, `fileName`, `extension`) plus `materialize(dir?)` to write a temp file for future attachment ingestion
 - Current swagger access for some media endpoints has been flaky (`502`), so payload assembly is based on extracted metadata plus flexible request fields
 - CDN-level direct media decryption/playback via raw CDN URLs + `aeskey` is still not implemented
+- **SendTxt API uses `ToWxid` not `ToUserName`** — for users with custom WeChat IDs (e.g. "gxnnycz"), `ToWxid` must be the `UserName` string from search results, not the underlying `wxid_xxx`. Using the wxid returns `Ret: -2`
+- **WCPP MAX 0412 WebSocket regression** — WS connections on port 8089 are accepted then immediately dropped (0 bytes, close code 1006). The unified dispatch pipeline logs data pushes internally but no WS client can stay connected. Plugin auto-falls back to Sync polling after `wsFallbackThreshold` failures
+- **`Newinit` required on 0412+** — without calling `/Login/Newinit`, the server's longlink and unified dispatch pipeline remain inactive. The plugin now calls Newinit on startup by default
+
+## Debug Toolset
+
+Standalone CLI for testing WCPP MAX API without running OpenClaw:
+
+```bash
+npm run debug status        # Check server + authcode validity
+npm run debug newinit       # Establish longlink via /Login/Newinit
+npm run debug heartbeat     # Send longlink heartbeat
+npm run debug sync 5        # Poll /Msg/Sync 5 rounds
+npm run debug ws 30         # Listen on WebSocket for 30s
+npm run debug send gxnnycz "hello"  # Send text message
+npm run debug search gxnnycz        # Search contact
+npm run debug contacts      # List all contacts
+npm run debug recv 120      # Newinit + live sync poll for 2 minutes
+```
+
+Reads config from `local-config.json`. Requires `npx tsx`.

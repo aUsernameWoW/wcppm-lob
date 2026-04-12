@@ -34,6 +34,8 @@ export interface ResolvedAccount {
   allowMsgTypes?: number[];
   passRevokemsg?: boolean;
   maxMessageAge?: number;
+  newinitOnStart?: boolean;
+  wsFallbackThreshold?: number;
 }
 
 function resolveAccount(
@@ -75,6 +77,8 @@ function resolveAccount(
     allowMsgTypes: section.allowMsgTypes,
     passRevokemsg: section.passRevokemsg,
     maxMessageAge: section.maxMessageAge,
+    newinitOnStart: section.newinitOnStart,
+    wsFallbackThreshold: section.wsFallbackThreshold,
   };
 }
 
@@ -177,6 +181,8 @@ export async function startWcppRuntime(
       allowMsgTypes: account.allowMsgTypes,
       passRevokemsg: account.passRevokemsg,
       maxMessageAge: account.maxMessageAge,
+      newinitOnStart: account.newinitOnStart,
+      wsFallbackThreshold: account.wsFallbackThreshold,
     },
     log as any,
   );
