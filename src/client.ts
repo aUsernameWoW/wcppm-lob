@@ -9,6 +9,8 @@
  */
 
 import WebSocket from "ws";
+import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Logger } from "openclaw/plugin-sdk/channel-core";
 
 // ──────────────────────────────────────────────
@@ -27,14 +29,23 @@ export interface WcppConfig {
    * "ws" = WebSocket (standard WCPP /ws/GetSyncMsg)
    * "sync" = HTTP polling (WCPP MAX /api/Msg/Sync)
    * "websocket" = WebSocket push (WCPP MAX /ws/sync)
+   * "webhook" = HTTP push from WCPP MAX to our local server
    */
-  syncMode?: "ws" | "sync" | "websocket";
+  syncMode?: "ws" | "sync" | "websocket" | "webhook";
   /** WCPP MAX authcode (used instead of key for /api/* endpoints) */
   authcode?: string;
   /** Custom WebSocket URL (optional, for WCPP MAX websocket mode) */
   wsUrl?: string;
   /** Sync polling interval in ms (default 5000) */
   syncInterval?: number;
+  /** Port for local webhook HTTP server (default 8000) */
+  webhookPort?: number;
+  /** URL path for webhook endpoint (default "/webhook") */
+  webhookPath?: string;
+  /** HMAC-SHA256 secret for webhook signature verification */
+  webhookSecret?: string;
+  /** External URL to register with WCPP MAX (required for webhook mode) */
+  webhookUrl?: string;
   /** Nurturing mode: receive-only, no sending (default false for safety during initial period) */
   readOnly?: boolean;
   /** Allow these MsgTypes through (default: [1, 3, 34, 47, 49]) */
@@ -123,6 +134,37 @@ interface MaxWsEnvelope {
   };
   Data62?: string;
   Debug?: string;
+}
+
+/**
+ * Webhook push envelope from WCPP MAX.
+ * POST'd to our local HTTP server when webhook mode is active.
+ */
+interface WebhookEnvelope {
+  MessageType: string;
+  Signature: string;
+  Timestamp: number;
+  Wxid: string;
+  IsSelf: boolean;
+  Data: {
+    messages: WebhookMessage[];
+  };
+}
+
+interface WebhookMessage {
+  createTime: number;
+  fromUser: string;
+  fromNick?: string;
+  toUser: string;
+  isSelf: boolean;
+  msgId: number;
+  newMsgId: number;
+  msgType: number;
+  text?: string;
+  pushContent?: string;
+  rawContent?: string;
+  voice?: Record<string, unknown>;
+  image?: Record<string, unknown>;
 }
 
 export interface SyncContact {
@@ -302,7 +344,7 @@ type MessageHandler = (msg: NormalizedMessage) => void;
 export class WcppClient {
   public authKey: string | null;
   public wxid: string | null;
-  public syncMode: "ws" | "sync" | "websocket";
+  public syncMode: "ws" | "sync" | "websocket" | "webhook";
   private baseUrl: string;
 
   // WS state
@@ -316,6 +358,9 @@ export class WcppClient {
   private seenMsgIds: Set<string> = new Set();
   private readonly SEEN_MSG_ID_MAX = 10000;
   private syncRunning = false;
+
+  // Webhook state
+  private webhookServer: HttpServer | null = null;
 
   // Contact cache (from Sync responses)
   private contactCache: Map<string, SyncContact> = new Map();
@@ -445,8 +490,8 @@ export class WcppClient {
    * Full login orchestration. Returns credentials on success.
    */
   async login(): Promise<WcppCredentials | null> {
-    // For sync/websocket mode with authcode
-    if ((this.syncMode === "sync" || this.syncMode === "websocket") && this.config.authcode) {
+    // For sync/websocket/webhook mode with authcode
+    if ((this.syncMode === "sync" || this.syncMode === "websocket" || this.syncMode === "webhook") && this.config.authcode) {
       // Call Newinit first if configured (required for WCPP MAX 0412+ longlink)
       if (this.config.newinitOnStart !== false) {
         const initResult = await this.newinit();
@@ -1280,11 +1325,213 @@ export class WcppClient {
   }
 
   // ──────────────────────────────────────────────
+  // Webhook receive mode (WCPP MAX pushes to us)
+  // ──────────────────────────────────────────────
+
+  startWebhookServer(): void {
+    const port = this.config.webhookPort ?? 8000;
+    const basePath = this.config.webhookPath ?? "/webhook";
+
+    this.webhookServer = createServer((req: IncomingMessage, res: ServerResponse) => {
+      // Health check
+      if (req.method === "GET" && req.url === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok" }));
+        return;
+      }
+
+      // Only accept POST on webhook path
+      if (req.method !== "POST" || !req.url?.startsWith(basePath)) {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+
+      let body = "";
+      req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+      req.on("end", () => {
+        try {
+          const envelope = JSON.parse(body) as WebhookEnvelope;
+
+          // Signature verification
+          if (this.config.webhookSecret) {
+            if (!this.verifyWebhookSignature(envelope, this.config.webhookSecret)) {
+              this.log.warn("WCPP MAX: webhook signature verification failed");
+              res.writeHead(401, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ ok: false, error: "invalid signature" }));
+              return;
+            }
+          }
+
+          // Timestamp anti-replay check (15 minute window)
+          if (Math.abs(Date.now() / 1000 - envelope.Timestamp) > 900) {
+            this.log.warn("WCPP MAX: webhook timestamp skew too large");
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: false, warning: "timestamp skew" }));
+            return;
+          }
+
+          // Learn wxid from envelope
+          if (!this.wxid && envelope.Wxid) {
+            this.wxid = envelope.Wxid;
+            this.log.info(`WCPP MAX: detected wxid=${this.wxid} from webhook`);
+          }
+
+          // Process messages through the standard pipeline
+          this.processWebhookMessages(envelope);
+
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+        } catch (e) {
+          this.log.debug("WCPP MAX: webhook parse error", e);
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "invalid JSON" }));
+        }
+      });
+    });
+
+    this.webhookServer.listen(port, () => {
+      this.log.info(`WCPP MAX: webhook server listening on 0.0.0.0:${port}${basePath}`);
+    });
+  }
+
+  stopWebhookServer(): void {
+    if (this.webhookServer) {
+      this.webhookServer.close();
+      this.webhookServer = null;
+      this.log.info("WCPP MAX: webhook server stopped");
+    }
+  }
+
+  private verifyWebhookSignature(envelope: WebhookEnvelope, secret: string): boolean {
+    const data = `${envelope.Wxid}:${envelope.MessageType}:${envelope.Timestamp}`;
+    const expected = createHmac("sha256", secret).update(data).digest("hex");
+    const got = (envelope.Signature || "").toLowerCase();
+    try {
+      return timingSafeEqual(Buffer.from(expected, "utf8"), Buffer.from(got, "utf8"));
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Convert webhook messages to SyncMessage format and feed through
+   * the existing processSyncResponse pipeline. This reuses all dedup,
+   * filtering, normalization, quote parsing, and media extraction logic.
+   */
+  private processWebhookMessages(envelope: WebhookEnvelope): void {
+    const messages = envelope.Data?.messages;
+    if (!Array.isArray(messages) || messages.length === 0) return;
+
+    const syncMessages: SyncMessage[] = messages
+      .filter(msg => !msg.isSelf)
+      .map(msg => ({
+        MsgId: msg.msgId,
+        NewMsgId: msg.newMsgId,
+        MsgType: msg.msgType,
+        FromUserName: { string: msg.fromUser },
+        ToUserName: { string: msg.toUser },
+        // Prefer rawContent (full XML for non-text types) over text
+        Content: { string: msg.rawContent || msg.text || "" },
+        CreateTime: msg.createTime,
+        PushContent: msg.pushContent || "",
+        MsgSource: "",  // Not available in webhook format
+        MsgSeq: 0,
+      }));
+
+    if (syncMessages.length === 0) return;
+
+    // Wrap in a minimal SyncResponse to reuse the full pipeline
+    const resp: SyncResponse = {
+      Code: 0,
+      Success: true,
+      Message: "webhook",
+      Data: {
+        AddMsgs: syncMessages,
+        ModContacts: [],
+        ModUserInfos: [],
+        ModUserImgs: [],
+        DelContacts: null,
+        FunctionSwitchs: [],
+        Remarks: [],
+        UserInfoExts: [],
+        KeyBuf: { iLen: 0, buffer: this.synckey },
+        Continue: null,
+        ContinueFlag: null,
+        Status: null,
+        Time: null,
+        UnknownCmdId: null,
+      },
+    };
+
+    this.processSyncResponse(resp);
+  }
+
+  /**
+   * Register our webhook URL with WCPP MAX via /Webhook/Set.
+   */
+  async registerWebhook(): Promise<boolean> {
+    const authcode = this.config.authcode;
+    if (!authcode) return false;
+
+    const url = this.config.webhookUrl;
+    if (!url) {
+      this.log.error("WCPP MAX: webhookUrl is required to register webhook");
+      return false;
+    }
+
+    const payload = {
+      url,
+      secret: this.config.webhookSecret || "",
+      enabled: true,
+      messageTypes: ["*"],
+      includeSelfMessage: false,
+      timeout: 5,
+      retryCount: 3,
+    };
+
+    try {
+      const res = await fetch(`${this.baseUrl}/api/Webhook/Set?authcode=${authcode}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = (await res.json()) as any;
+      if (data.Success) {
+        this.log.info(`WCPP MAX: webhook registered → ${url}`);
+        return true;
+      }
+      this.log.error(`WCPP MAX: failed to register webhook: ${data.Message}`);
+      return false;
+    } catch (e) {
+      this.log.error("WCPP MAX: error registering webhook", e);
+      return false;
+    }
+  }
+
+  /**
+   * Remove webhook from WCPP MAX via /Webhook/Remove.
+   */
+  async removeWebhook(): Promise<void> {
+    const authcode = this.config.authcode;
+    if (!authcode) return;
+    try {
+      await fetch(`${this.baseUrl}/api/Webhook/Remove?authcode=${authcode}`, { method: "POST" });
+      this.log.info("WCPP MAX: webhook removed");
+    } catch {
+      // Best-effort cleanup
+    }
+  }
+
+  // ──────────────────────────────────────────────
   // Unified connect/disconnect
   // ──────────────────────────────────────────────
 
   connect(): void {
-    if (this.syncMode === "sync") {
+    if (this.syncMode === "webhook") {
+      this.startWebhookServer();
+      this.registerWebhook();
+    } else if (this.syncMode === "sync") {
       this.startSyncPolling();
     } else if (this.syncMode === "websocket") {
       this.connectMaxWebSocket();
@@ -1297,6 +1544,8 @@ export class WcppClient {
     this.stopSyncPolling();
     this.disconnectWebSocket();
     this.disconnectMaxWebSocket();
+    this.removeWebhook();
+    this.stopWebhookServer();
   }
 
   // ──────────────────────────────────────────────
@@ -1309,7 +1558,7 @@ export class WcppClient {
       return false;
     }
 
-    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket")
+    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket" || this.syncMode === "webhook")
       ? `authcode=${this.config.authcode}`
       : `key=${this.authKey}`;
 
@@ -1358,7 +1607,7 @@ export class WcppClient {
       return false;
     }
 
-    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket")
+    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket" || this.syncMode === "webhook")
       ? `authcode=${this.config.authcode}`
       : `key=${this.authKey}`;
     const url = `${this.baseUrl}/message/SendImageNewMessage?${authParam}`;
@@ -1440,7 +1689,7 @@ export class WcppClient {
     payload: Record<string, unknown>,
     outputPath?: string,
   ): Promise<MediaDownloadResult> {
-    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket")
+    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket" || this.syncMode === "webhook")
       ? `authcode=${this.config.authcode}`
       : `key=${this.authKey}`;
     const url = `${this.baseUrl}${endpoint}?${authParam}`;
@@ -1618,7 +1867,7 @@ export class WcppClient {
 
     // Quote API (WCPP MAX /api/Msg/Quote)
     // Fields: ToWxid, Fromusr (quoted sender), Displayname, NewMsgId, QuoteContent, MsgContent
-    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket")
+    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket" || this.syncMode === "webhook")
       ? `authcode=${this.config.authcode}`
       : `key=${this.authKey}`;
 
@@ -1658,7 +1907,7 @@ export class WcppClient {
     const cached = this.contactCache.get(memberWxid);
     if (cached?.NickName?.string) return cached.NickName.string;
 
-    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket")
+    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket" || this.syncMode === "webhook")
       ? `authcode=${this.config.authcode}`
       : `key=${this.authKey}`;
 
@@ -1680,7 +1929,7 @@ export class WcppClient {
   }
 
   async getContactList(): Promise<string[] | null> {
-    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket")
+    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket" || this.syncMode === "webhook")
       ? `authcode=${this.config.authcode}`
       : `key=${this.authKey}`;
 

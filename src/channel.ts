@@ -27,7 +27,7 @@ export interface ResolvedAccount {
   dmPolicy: string | undefined;
   replyWithMention: boolean;
   proxy?: string;
-  syncMode: "ws" | "sync" | "websocket";
+  syncMode: "ws" | "sync" | "websocket" | "webhook";
   wsUrl?: string;
   syncInterval?: number;
   readOnly?: boolean;
@@ -36,6 +36,10 @@ export interface ResolvedAccount {
   maxMessageAge?: number;
   newinitOnStart?: boolean;
   wsFallbackThreshold?: number;
+  webhookPort?: number;
+  webhookPath?: string;
+  webhookSecret?: string;
+  webhookUrl?: string;
 }
 
 function resolveAccount(
@@ -48,14 +52,17 @@ function resolveAccount(
   }
 
   // Determine mode: explicit > authcode implies sync > ws fallback
-  const syncMode: "ws" | "sync" | "websocket" = section.syncMode ?? (section.authcode ? "sync" : "ws");
+  const syncMode: "ws" | "sync" | "websocket" | "webhook" = section.syncMode ?? (section.authcode ? "sync" : "ws");
 
   // For sync/websocket mode, authcode is used instead of adminKey
   if (syncMode === "ws" && !section.adminKey) {
     throw new Error("wechatpadpro: adminKey is required for WS mode");
   }
-  if ((syncMode === "sync" || syncMode === "websocket") && !section.authcode) {
-    throw new Error("wechatpadpro: authcode is required for sync/websocket mode");
+  if ((syncMode === "sync" || syncMode === "websocket" || syncMode === "webhook") && !section.authcode) {
+    throw new Error("wechatpadpro: authcode is required for sync/websocket/webhook mode");
+  }
+  if (syncMode === "webhook" && !section.webhookUrl) {
+    throw new Error("wechatpadpro: webhookUrl is required for webhook mode (the URL WCPP MAX will POST to)");
   }
 
   return {
@@ -79,6 +86,10 @@ function resolveAccount(
     maxMessageAge: section.maxMessageAge,
     newinitOnStart: section.newinitOnStart,
     wsFallbackThreshold: section.wsFallbackThreshold,
+    webhookPort: section.webhookPort,
+    webhookPath: section.webhookPath,
+    webhookSecret: section.webhookSecret,
+    webhookUrl: section.webhookUrl,
   };
 }
 
@@ -183,6 +194,10 @@ export async function startWcppRuntime(
       maxMessageAge: account.maxMessageAge,
       newinitOnStart: account.newinitOnStart,
       wsFallbackThreshold: account.wsFallbackThreshold,
+      webhookPort: account.webhookPort,
+      webhookPath: account.webhookPath,
+      webhookSecret: account.webhookSecret,
+      webhookUrl: account.webhookUrl,
     },
     log as any,
   );

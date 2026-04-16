@@ -7,3 +7,10 @@ src/shims/
 .env
 .env.*
 local-config.*
+.mcp.json
+
+# Closed-source WCPP MAX binaries
+wechatpadpromax*/
+
+# Offline API docs mirror (closed-source, not redistributable)
+docs/api-reference/

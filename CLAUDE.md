@@ -24,7 +24,7 @@ An OpenClaw channel plugin that bridges WeChatPadPro / WeChatPadProMAX into Open
 - The WeChat account is stable and ready to send/receive messages
 
 **This plugin focuses on:**
-- Message synchronization (receiving via WebSocket or HTTP Sync polling)
+- Message synchronization (receiving via WebSocket, HTTP Sync polling, or Webhook push)
 - Message sending (text, image, voice, etc.)
 - Contact/group metadata caching
 - OpenClaw channel protocol compliance
@@ -35,16 +35,31 @@ An OpenClaw channel plugin that bridges WeChatPadPro / WeChatPadProMAX into Open
 src/
 ├── index.ts          — Plugin entry point (defineChannelPluginEntry)
 ├── channel.ts        — OpenClaw channel plugin definition + runtime lifecycle
-├── client.ts         — Core API client: auth, WebSocket, Sync polling, send
+├── client.ts         — Core API client: auth, WebSocket, Sync polling, Webhook receive, send
 ├── setup-entry.ts    — Lightweight setup entry for onboarding
 └── shims/
     └── openclaw/
         └── channel-core.ts  — Type shims for standalone compilation
 tools/
 └── debug.ts          — Standalone CLI for testing WCPP MAX API (npx tsx tools/debug.ts)
+docs/
+└── api-reference/    — Full offline mirror of WeChatPadProMAX API docs
+    ├── INDEX.md      — Master index: category → local file mapping
+    ├── llms.txt      — Original index from wx.knowhub.cloud
+    ├── docs/         — 6 guide docs (quickstart, webhook spec, etc.)
+    ├── api/          — 211 endpoint docs (Msg, Friend, Group, Tools, etc.)
+    └── schemas/      — 173 request/response schema docs
 ```
 
-## Three Sync Modes
+## API Reference
+
+Full WeChatPadProMAX API documentation is mirrored locally in `docs/api-reference/`.
+- **Start with** `docs/api-reference/INDEX.md` to find any endpoint by category
+- Files are named by their upstream ID (e.g. `356821064e0.md` for SendTxt)
+- Covers all modules: Admin, Login, Msg, Friend, Group, FriendCircle, Finder, Tools, Webhook, User, TenPay, Wxapp, OfficialAccounts, Label, etc.
+- Sourced from `https://wx.knowhub.cloud/llms.txt` (Apifox-hosted, can be flaky)
+
+## Four Sync Modes
 
 ### WS Mode (standard WeChatPadPro)
 - WebSocket at `ws://host:port/ws/GetSyncMsg?key=AUTHKEY`
@@ -68,7 +83,19 @@ tools/
 - Auto-reconnect on disconnect; falls back to Sync polling after `wsFallbackThreshold` consecutive failures (default 3)
 - Set `syncMode: "websocket"` and optionally `wsUrl` for custom URL
 - If `wsUrl` is not set, auto-constructs from `host` as `ws://{host}:8089/ws/sync?authcode={authcode}`
-- **Known issue (WCPP MAX 0412):** WS push is broken — connections are accepted then immediately dropped (0 bytes, code 1006). The server's unified dispatch pipeline logs data pushes, but no WS client can stay connected. Auto-fallback to Sync polling handles this transparently.
+- **WS confirmed working on WCPP MAX 0416** — the 0412 regression (immediate disconnect, code 1006) is fixed. Connections are stable and authenticated.
+
+### Webhook Mode (WeChatPadProMAX — HTTP push to us)
+- WCPP MAX pushes messages to our local HTTP server instead of us polling or connecting WS
+- Set `syncMode: "webhook"`, `webhookUrl` (required), optionally `webhookPort` (default 8000) and `webhookSecret`
+- Our plugin starts an HTTP server on `webhookPort` and registers the URL with WCPP MAX via `/Webhook/Set`
+- Webhook payload envelope: `{ MessageType, Signature, Timestamp, Wxid, IsSelf, Data: { messages: [...] } }`
+- Signature verification: `HMAC-SHA256(secret, "{Wxid}:{MessageType}:{Timestamp}")`, anti-replay with 15-minute window
+- Each message has: `fromUser`, `toUser`, `msgType`, `msgId`, `newMsgId`, `createTime`, `text`, `rawContent`, `pushContent`
+- Messages are converted to `SyncMessage` format and fed through the same processing pipeline (dedup, filter, normalize, quote parse, media extract)
+- Limitation: `MsgSource` (used for `<atuserlist>` @bot detection) is not available in webhook format; @bot still works via `pushContent` fallback
+- On disconnect, webhook is automatically removed via `/Webhook/Remove`
+- Tested and confirmed working on WCPP MAX 0416: webhook registration, test delivery, and real message push all functional
 
 ## WeChat Message Format
 
@@ -134,7 +161,7 @@ Must split on first `:\n` to extract sender and text.
 
 ## Key Design Decisions
 
-- **NormalizedMessage** unifies WS and Sync message formats so `channel.ts` doesn't care about transport
+- **NormalizedMessage** unifies WS, Sync, and Webhook message formats so `channel.ts` doesn't care about transport
 - **Contact cache** built from `ModContacts` in Sync responses; used for sender name resolution
 - **Dedup by `NewMsgId`** (not `MsgId` — `MsgId` can repeat across sessions, `NewMsgId` is globally unique)
 - **`readOnly` mode** blocks all outbound sends — for account stability during initial period
@@ -146,13 +173,16 @@ Must split on first `:\n` to extract sender and text.
 {
   "channels": {
     "wechatpadpro": {
-      "host": "192.168.50.231",
+      "host": "YOUR_HOST",
       "port": 8062,
-      "authcode": "...",           // Required for sync/websocket mode
+      "authcode": "...",           // Required for sync/websocket/webhook mode
       "adminKey": "...",           // Required for WS mode only
-      "syncMode": "websocket",    // "ws" | "sync" | "websocket" (auto-detected from authcode → sync)
+      "syncMode": "webhook",      // "ws" | "sync" | "websocket" | "webhook" (auto-detected from authcode → sync)
       "wsUrl": "ws://HOST:8089/ws/sync",  // Optional: custom WS URL for websocket mode
       "syncInterval": 5000,       // Poll interval in ms (sync mode only)
+      "webhookPort": 8000,        // Port for local webhook HTTP server (webhook mode)
+      "webhookUrl": "http://OUR_IP:8000/webhook",  // URL to register with WCPP MAX (required for webhook mode)
+      "webhookSecret": "...",     // HMAC secret for webhook signature verification (optional)
       "readOnly": true,           // Receive-only, no sending
       "newinitOnStart": true,     // Call Newinit on startup for longlink (default true, required for 0412+)
       "wsFallbackThreshold": 3,   // Consecutive WS failures before falling back to sync (default 3)
@@ -181,6 +211,8 @@ Based on the available WeChatPadProMAX API, here are candidates for implementati
 | unified media resolver | Let upstream code treat voice/image/video uniformly | ✅ Implemented via `resolveMedia()` / `isMediaMessage()` |
 | channel inbound media integration | Surface media info to upper layers without extra parsing | ✅ Implemented — dispatch `raw` now includes `{ platform, normalized, media }` envelope |
 | attachment-ready media bridge | Prepare media for future OpenClaw attachment ingestion | ✅ Implemented — each resolved media object now exposes `attachment` metadata and `materialize()` |
+| Webhook receive mode | WCPP MAX pushes messages to our HTTP server | ✅ Implemented — `syncMode: "webhook"`, auto-registers via `/Webhook/Set`, HMAC-SHA256 signature verification, converts to SyncMessage and reuses full pipeline |
+| `/Webhook/Set` / `/Webhook/Get` / `/Webhook/Remove` / `/Webhook/Test` | Manage webhook config on WCPP MAX | ✅ Implemented in client + debug CLI (`webhook-set`, `webhook-get`, `webhook-remove`, `webhook-test`, `webhook-listen`) |
 
 ### High Priority — Core Messaging
 | API | Use Case | Notes |
@@ -190,7 +222,7 @@ Based on the available WeChatPadProMAX API, here are candidates for implementati
 | `POST /Tools/DownloadImg` | Download HD images | Helper implemented, but exact provider payload contract still needs real response validation |
 | `POST /Tools/DownloadVideo` | Download video files | Helper implemented, but exact provider payload contract still needs real response validation |
 | `POST /Msg/SendVoice` | Send voice messages | File upload → voice message |
-| `POST /Msg/SendVideo` | Send video messages | File upload → video message |
+| `POST /Msg/SendVideo` | Send video messages | Payload confirmed from author's script: `ToWxid`, `PlayLength`, `Base64` (with `data:video/mp4;base64,` prefix), `ImageBase64` (with `data:image/jpeg;base64,` prefix). `thumbBase64` removed in 0416 |
 | `POST /Msg/UploadImg` | Upload and send images | Current `SendImageNewMessage` may be limited |
 
 ### Medium Priority — Group & Contact Features
@@ -206,23 +238,20 @@ Based on the available WeChatPadProMAX API, here are candidates for implementati
 | API | Use Case |
 |-----|----------|
 | `POST /Msg/SendApp` | Forward app/card messages |
-| `POST /Msg/SendXCX` | Mini program messages |
+| `POST /Msg/SendXCX` | Mini program messages | Author's script extracts `<appmsg>` from rawContent XML; swagger says `ToWxid`/`Content` (uppercase) but script uses lowercase `toWxid`/`content` |
 | `POST /Msg/ShareCard` | Share contact cards |
 | `POST /Msg/ShareLink` | Rich link previews |
 | `POST /TenPay/*` | Red envelopes (probably not needed) |
 | `POST /FriendCircle/*` | Moments/朋友圈 (read-only might be interesting) |
 
-### Webhook Integration
+### Webhook Integration (Implemented ✓)
+Core webhook APIs (`/Webhook/Set`, `/Get`, `/Remove`, `/Test`) are fully implemented. See "Implemented ✓" table above.
+
+Remaining webhook APIs (low priority):
 | API | Use Case |
 |-----|----------|
-| `GET /Webhook/Get` | Get current webhook config |
-| `POST /Webhook/Set` | Configure webhook callback URL |
-| `POST /Webhook/Remove` | Remove webhook config |
-| `POST /Webhook/Test` | Test webhook delivery |
 | `GET /Webhook/Business/Get` | Get business callback URL |
 | `POST /Webhook/Business/Set` | Set business callback URL |
-
-**Note:** These are server-side webhook configurations. The plugin can optionally expose a local HTTP endpoint for WCPP MAX to push messages to, instead of polling `/Msg/Sync`.
 
 ### Out of Scope (server admin responsibility)
 All `/Login/*`, `/Admin/*`, `/User/*` account management APIs.
@@ -231,7 +260,7 @@ All `/Login/*`, `/Admin/*`, `/User/*` account management APIs.
 
 - Sync polling may return duplicate `PushContent` for the same message (reported by users in the WCPP community) — dedup handles this
 - WCPP MAX authcode is single-use per login session; if the server restarts, a new authcode may be needed
-- `@bot` detection in group chats relies on `<atuserlist>` in `MsgSource` XML — some clients may not include this
+- `@bot` detection in group chats relies on `<atuserlist>` in `MsgSource` XML — some clients may not include this; webhook mode lacks `MsgSource` entirely, so @bot detection falls back to `pushContent` ("在群聊中@了你") only
 - Voice messages (MsgType 34) now have client-side metadata extraction (`bufid`, `fromUserName`, `length`, `msgId`, `voiceurl`, `aeskey`)
 - `downloadVoice(...)` is implemented against `/Tools/DownloadVoice`, but response payload shape is not fully documented, so JSON response decoding is best-effort
 - `downloadImage(...)` / `downloadVideo(...)` are implemented as best-effort helpers using extracted XML metadata (`aesKey`, CDN URLs, md5, lengths, msgId, fromUserName)
@@ -241,8 +270,21 @@ All `/Login/*`, `/Admin/*`, `/User/*` account management APIs.
 - Current swagger access for some media endpoints has been flaky (`502`), so payload assembly is based on extracted metadata plus flexible request fields
 - CDN-level direct media decryption/playback via raw CDN URLs + `aeskey` is still not implemented
 - **SendTxt API uses `ToWxid` not `ToUserName`** — for users with custom WeChat IDs (e.g. "gxnnycz"), `ToWxid` must be the `UserName` string from search results, not the underlying `wxid_xxx`. Using the wxid returns `Ret: -2`
-- **WCPP MAX 0412 WebSocket regression** — WS connections on port 8089 are accepted then immediately dropped (0 bytes, close code 1006). The unified dispatch pipeline logs data pushes internally but no WS client can stay connected. Plugin auto-falls back to Sync polling after `wsFallbackThreshold` failures
 - **`Newinit` required on 0412+** — without calling `/Login/Newinit`, the server's longlink and unified dispatch pipeline remain inactive. The plugin now calls Newinit on startup by default
+- **WCPP MAX 0416 fixes WS** — the 0412 WebSocket regression (immediate disconnect, code 1006) is resolved. WS connections are now stable and authenticated. The server also now supports RabbitMQ as a third downstream channel alongside WS and Webhook
+
+## Account Safety Incident (2026-04-12)
+
+**What happened:** Account was temporarily banned at 22:15 (UTC+8) after a debug session.
+
+**Root cause:** Calling `Newinit` + `StartAutoSync` activated the server's unified dispatch pipeline, but all downstream channels were broken (WS: 0412 regression — fixed in 0416, Webhook: not configured). The server entered a tight loop — receiving data via longlink every few seconds, attempting to push to WS (fail) and Webhook (fail), repeating indefinitely. Tencent's risk detection flagged this abnormal high-frequency sync pattern over ~20 minutes and banned the account.
+
+**Lessons / hard rules:**
+1. **Never activate server-side auto-sync (`StartAutoSync`, `Newinit`) unless at least one downstream channel (WS, Webhook, or our Sync polling) is actively consuming data.** An active pipeline with no consumers creates a server-side retry storm that looks like abuse to Tencent.
+2. **Rate-limit debug operations** — minimum 3-5 seconds between API calls; never probe multiple endpoints in rapid succession.
+3. **Prefer reading server logs (via SSH + tmux) over hammering the API** when debugging connectivity issues.
+4. **Do not call `Friend/Search` + `SendTxt` + `Newinit` + `StartAutoSync` in the same short session** — the combination of active operations across multiple API surfaces amplifies risk.
+5. **Do not keep reconnecting WS in a tight loop** — the connect/disconnect pattern itself is suspicious (the 0412 WS regression that triggered this rule is fixed in 0416, but the principle stands).
 
 ## Debug Toolset
 
@@ -258,6 +300,13 @@ npm run debug send gxnnycz "hello"  # Send text message
 npm run debug search gxnnycz        # Search contact
 npm run debug contacts      # List all contacts
 npm run debug recv 120      # Newinit + live sync poll for 2 minutes
+
+# Webhook commands
+npm run debug webhook-set "http://OUR_IP:8000/webhook" [secret]  # Register webhook
+npm run debug webhook-get          # Show current webhook config
+npm run debug webhook-remove       # Remove webhook
+npm run debug webhook-test         # Send test POST to webhook
+npm run debug webhook-listen 8000 60  # Start local listener (port, seconds)
 ```
 
 Reads config from `local-config.json`. Requires `npx tsx`.

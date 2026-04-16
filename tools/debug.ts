@@ -395,6 +395,107 @@ async function cmdRecv(cfg: DebugConfig, seconds: number = 60) {
   console.log(`\nDone. Total messages: ${totalMsgs}`);
 }
 
+async function cmdWebhookSet(cfg: DebugConfig, callbackUrl: string, secret?: string) {
+  console.log(`Setting webhook → ${callbackUrl}`);
+  try {
+    const data = await api(cfg, "POST", "/Webhook/Set", {
+      url: callbackUrl,
+      secret: secret || "",
+      enabled: true,
+      messageTypes: ["*"],
+      includeSelfMessage: false,
+      timeout: 5,
+      retryCount: 3,
+    });
+    console.log(`Success: ${data.Success} (Message: ${data.Message})`);
+  } catch (e: any) {
+    console.error(`Webhook set failed: ${e.message}`);
+  }
+}
+
+async function cmdWebhookGet(cfg: DebugConfig) {
+  try {
+    const data = await api(cfg, "GET", "/Webhook/Get");
+    console.log(`Webhook config:\n${pretty(data.Data ?? data)}`);
+  } catch (e: any) {
+    console.error(`Webhook get failed: ${e.message}`);
+  }
+}
+
+async function cmdWebhookRemove(cfg: DebugConfig) {
+  try {
+    const data = await api(cfg, "POST", "/Webhook/Remove");
+    console.log(`Success: ${data.Success}`);
+  } catch (e: any) {
+    console.error(`Webhook remove failed: ${e.message}`);
+  }
+}
+
+async function cmdWebhookTest(cfg: DebugConfig) {
+  try {
+    const data = await api(cfg, "POST", "/Webhook/Test", {
+      MessageType: "sync_message",
+      TestData: {},
+    });
+    console.log(`Test result:\n${pretty(data)}`);
+  } catch (e: any) {
+    console.error(`Webhook test failed: ${e.message}`);
+  }
+}
+
+async function cmdWebhookListen(_cfg: DebugConfig, port: number = 8000, seconds: number = 60) {
+  const { createServer } = await import("node:http");
+
+  let msgCount = 0;
+  const server = createServer((req, res) => {
+    if (req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok", messages: msgCount }));
+      return;
+    }
+
+    let body = "";
+    req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+    req.on("end", () => {
+      try {
+        const envelope = JSON.parse(body);
+        const msgs = envelope.Data?.messages ?? [];
+        msgCount += msgs.length;
+        console.log(`\n[${timestamp()}] Webhook POST — type=${envelope.MessageType}, wxid=${envelope.Wxid}, ${msgs.length} msg(s)`);
+
+        for (const m of msgs) {
+          const from = m.fromUser ?? "?";
+          const type = m.msgType;
+          let content = m.text || m.rawContent || "";
+          if (content.length > 150) content = content.substring(0, 150) + "...";
+          content = content.replace(/\n/g, "\\n");
+          const nick = m.fromNick ? ` (${m.fromNick})` : "";
+          console.log(`  msgType=${type} from=${from}${nick} → ${m.toUser}: ${content}`);
+        }
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch {
+        res.writeHead(400);
+        res.end(JSON.stringify({ ok: false }));
+      }
+    });
+  });
+
+  server.listen(port, () => {
+    console.log(`Webhook listener started on 0.0.0.0:${port}/webhook`);
+    console.log(`Listening for ${seconds}s... Press Ctrl+C to stop.\n`);
+  });
+
+  await new Promise<void>(resolve => {
+    setTimeout(() => {
+      server.close();
+      console.log(`\nDone. Received ${msgCount} messages total.`);
+      resolve();
+    }, seconds * 1000);
+  });
+}
+
 // ── Main ────────────────────────────────────────
 
 const [cmd, ...args] = process.argv.slice(2);
@@ -419,6 +520,14 @@ const commands: Record<string, () => Promise<void>> = {
   },
   contacts: () => cmdContacts(cfg),
   recv: () => cmdRecv(cfg, Number(args[0]) || 60),
+  "webhook-set": () => {
+    if (!args[0]) { console.error("Usage: webhook-set <url> [secret]"); process.exit(1); }
+    return cmdWebhookSet(cfg, args[0], args[1]);
+  },
+  "webhook-get": () => cmdWebhookGet(cfg),
+  "webhook-remove": () => cmdWebhookRemove(cfg),
+  "webhook-test": () => cmdWebhookTest(cfg),
+  "webhook-listen": () => cmdWebhookListen(cfg, Number(args[0]) || 8000, Number(args[1]) || 60),
 };
 
 if (!cmd || !commands[cmd]) {
@@ -436,6 +545,13 @@ Commands:
   search <keyword>    Search contacts by WeChat ID / phone
   contacts            List all contacts
   recv [seconds]      Newinit + live sync polling (default: 60s)
+
+Webhook:
+  webhook-set <url> [secret]   Register webhook with WCPP MAX
+  webhook-get                  Show current webhook config
+  webhook-remove               Remove webhook
+  webhook-test                 Send test POST to webhook
+  webhook-listen [port] [sec]  Start local server to receive webhooks
 
 Config: reads from local-config.json
   { "host": "...", "authcode": "...", "wsUrl": "ws://..." }
