@@ -7,192 +7,238 @@
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
-    "properties": {
-      "wechatpadpro": {
+    "properties": {}
+  },
+  "channelConfigs": {
+    "wechatpadpro": {
+      "label": "WeChatPadPro",
+      "description": "Connect OpenClaw to WeChat via WeChatPadPro / WeChatPadProMax (iPad protocol).",
+      "schema": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
           "host": {
             "type": "string",
-            "description": "WeChatPadPro server host (e.g. 192.168.1.100)",
-            "x-openclaw-order": 1,
-            "x-openclaw-group": "Server Connection",
-            "x-openclaw-placeholder": "192.168.1.100"
+            "description": "WeChatPadPro server host (IP or hostname)"
           },
           "port": {
             "type": "number",
             "description": "WeChatPadPro server port",
-            "default": 8062,
-            "x-openclaw-order": 2,
-            "x-openclaw-group": "Server Connection"
+            "default": 8062
           },
           "adminKey": {
             "type": "string",
-            "description": "WeChatPadPro admin key (required for WS mode only)",
-            "x-openclaw-order": 3,
-            "x-openclaw-group": "Authentication",
-            "x-openclaw-secret": true
+            "description": "WeChatPadPro admin key (required for WS mode only)"
           },
           "authKey": {
             "type": "string",
-            "description": "Pre-generated auth key for standard WCPP (optional, auto-generates if not set)",
-            "x-openclaw-order": 4,
-            "x-openclaw-group": "Authentication",
-            "x-openclaw-secret": true
+            "description": "Pre-generated auth key for standard WCPP (optional, auto-generated if omitted)"
           },
           "authcode": {
             "type": "string",
-            "description": "WeChatPadProMAX authcode (required for sync/websocket/webhook mode)",
-            "x-openclaw-order": 5,
-            "x-openclaw-group": "Authentication",
-            "x-openclaw-secret": true
+            "description": "WeChatPadProMAX authcode (required for sync / websocket / webhook modes)"
           },
           "wxid": {
             "type": "string",
-            "description": "WeChat ID (optional, auto-detected from Newinit response)",
-            "x-openclaw-order": 6,
-            "x-openclaw-group": "Authentication"
+            "description": "WeChat ID (optional; auto-detected from Newinit response)"
           },
           "syncMode": {
             "type": "string",
             "enum": ["ws", "sync", "websocket", "webhook"],
-            "description": "Message sync mode: 'ws' = WebSocket (standard WCPP), 'sync' = HTTP polling (WCPP MAX), 'websocket' = WebSocket push (WCPP MAX), 'webhook' = HTTP push from WCPP MAX. Auto-detected from authcode if not set.",
-            "x-openclaw-order": 10,
-            "x-openclaw-group": "Sync Mode",
-            "x-openclaw-enumLabels": {
-              "ws": "WebSocket (standard WCPP)",
-              "sync": "HTTP Polling (WCPP MAX)",
-              "websocket": "WebSocket Push (WCPP MAX)",
-              "webhook": "Webhook Push (WCPP MAX)"
-            }
+            "description": "Message sync mode. Auto-detected from authcode if not set."
           },
           "syncInterval": {
             "type": "number",
-            "description": "Poll interval in ms for sync mode",
-            "default": 5000,
-            "x-openclaw-order": 11,
-            "x-openclaw-group": "Sync Mode",
-            "x-openclaw-showWhen": { "syncMode": "sync" }
+            "description": "Poll interval in ms (sync mode only)",
+            "default": 5000
           },
           "wsUrl": {
             "type": "string",
-            "description": "Custom WebSocket URL for websocket mode (default: ws://{host}:8089/ws/sync)",
-            "x-openclaw-order": 12,
-            "x-openclaw-group": "Sync Mode",
-            "x-openclaw-placeholder": "ws://host:8089/ws/sync",
-            "x-openclaw-showWhen": { "syncMode": "websocket" }
+            "description": "Custom WebSocket URL for websocket mode (auto-constructed from host when empty)"
           },
           "wsFallbackThreshold": {
             "type": "number",
             "description": "Consecutive WebSocket failures before falling back to HTTP polling",
-            "default": 3,
-            "x-openclaw-order": 13,
-            "x-openclaw-group": "Sync Mode",
-            "x-openclaw-showWhen": { "syncMode": "websocket" }
+            "default": 3
           },
           "webhookUrl": {
             "type": "string",
-            "description": "URL for WCPP MAX to POST messages to (required for webhook mode)",
-            "x-openclaw-order": 14,
-            "x-openclaw-group": "Webhook",
-            "x-openclaw-placeholder": "http://YOUR_IP:8000/webhook",
-            "x-openclaw-showWhen": { "syncMode": "webhook" }
+            "description": "URL WCPP MAX will POST messages to (required for webhook mode)"
+          },
+          "webhookHost": {
+            "type": "string",
+            "description": "Bind address for the local webhook HTTP server (default 127.0.0.1; set to 0.0.0.0 to expose directly without a reverse proxy)",
+            "default": "127.0.0.1"
           },
           "webhookPort": {
             "type": "number",
             "description": "Local HTTP server port for receiving webhook pushes",
-            "default": 8000,
-            "x-openclaw-order": 15,
-            "x-openclaw-group": "Webhook",
-            "x-openclaw-showWhen": { "syncMode": "webhook" }
+            "default": 8000
           },
           "webhookPath": {
             "type": "string",
-            "description": "Path for webhook endpoint (default: /webhook)",
-            "x-openclaw-order": 16,
-            "x-openclaw-group": "Webhook",
-            "x-openclaw-showWhen": { "syncMode": "webhook" }
+            "description": "Path for the webhook endpoint (default /webhook)"
           },
           "webhookSecret": {
             "type": "string",
-            "description": "HMAC-SHA256 secret for webhook signature verification (optional but recommended)",
-            "x-openclaw-order": 17,
-            "x-openclaw-group": "Webhook",
-            "x-openclaw-secret": true,
-            "x-openclaw-showWhen": { "syncMode": "webhook" }
+            "description": "HMAC-SHA256 secret for webhook signature verification (recommended)"
           },
           "newinitOnStart": {
             "type": "boolean",
             "description": "Call Newinit on startup to establish longlink (required for WCPP MAX 0412+)",
-            "default": true,
-            "x-openclaw-order": 20,
-            "x-openclaw-group": "Advanced"
+            "default": true
           },
           "readOnly": {
             "type": "boolean",
             "description": "Receive-only mode — blocks all outbound sends for account safety",
-            "default": false,
-            "x-openclaw-order": 21,
-            "x-openclaw-group": "Advanced"
+            "default": false
           },
           "maxMessageAge": {
             "type": "number",
             "description": "Drop messages older than this many seconds (avoids replaying stale history)",
-            "default": 180,
-            "x-openclaw-order": 22,
-            "x-openclaw-group": "Advanced"
+            "default": 180
           },
           "dmSecurity": {
             "type": "string",
             "enum": ["allowlist", "allow-all", "pairing"],
             "description": "DM security policy",
-            "default": "allowlist",
-            "x-openclaw-order": 30,
-            "x-openclaw-group": "Security",
-            "x-openclaw-enumLabels": {
-              "allowlist": "Allowlist Only",
-              "allow-all": "Allow All",
-              "pairing": "Pairing Required"
-            }
+            "default": "allowlist"
           },
           "allowFrom": {
             "type": "array",
             "items": { "type": "string" },
-            "description": "List of wxid allowed to DM the bot (used when dmSecurity = allowlist)",
-            "x-openclaw-order": 31,
-            "x-openclaw-group": "Security",
-            "x-openclaw-showWhen": { "dmSecurity": "allowlist" }
+            "description": "List of wxid allowed to DM the bot (used when dmSecurity = allowlist)"
           },
           "allowMsgTypes": {
             "type": "array",
             "items": { "type": "number" },
-            "description": "Message types to pass through (default: 1=text, 3=image, 34=voice, 47=sticker, 48=location, 49=app)",
-            "default": [1, 3, 34, 47, 48, 49],
-            "x-openclaw-order": 32,
-            "x-openclaw-group": "Security"
+            "description": "Message types to pass through (1=text, 3=image, 34=voice, 47=sticker, 48=location, 49=app)",
+            "default": [1, 3, 34, 47, 48, 49]
           },
           "passRevokemsg": {
             "type": "boolean",
             "description": "Pass through message recall notifications (MsgType 10002 revokemsg)",
-            "default": true,
-            "x-openclaw-order": 33,
-            "x-openclaw-group": "Security"
+            "default": true
           },
           "replyWithMention": {
             "type": "boolean",
-            "description": "In group chats, prefix reply with @sender mention",
-            "default": false,
-            "x-openclaw-order": 40,
-            "x-openclaw-group": "Behavior"
+            "description": "In group chats, prefix replies with @sender mention",
+            "default": false
           },
           "proxy": {
             "type": "string",
-            "description": "Proxy URL (e.g. socks5://user:pass@host:port)",
-            "x-openclaw-order": 50,
-            "x-openclaw-group": "Advanced",
-            "x-openclaw-placeholder": "socks5://user:pass@host:port"
+            "description": "Proxy URL for outbound HTTP/WS (e.g. socks5://user:pass@host:port)"
           }
         },
         "required": ["host"]
+      },
+      "uiHints": {
+        "host": {
+          "label": "Server Host",
+          "placeholder": "192.168.1.100",
+          "help": "WeChatPadPro server IP or hostname"
+        },
+        "port": {
+          "label": "Server Port",
+          "help": "Default 8062"
+        },
+        "adminKey": {
+          "label": "Admin Key",
+          "sensitive": true,
+          "help": "Required only for WS mode (standard WCPP)"
+        },
+        "authKey": {
+          "label": "Auth Key",
+          "sensitive": true,
+          "help": "Pre-generated auth key (optional; auto-generated from adminKey if omitted)"
+        },
+        "authcode": {
+          "label": "Authcode",
+          "sensitive": true,
+          "help": "Required for sync / websocket / webhook modes (WCPP MAX)"
+        },
+        "wxid": {
+          "label": "WeChat ID",
+          "help": "Auto-detected from Newinit response when left empty"
+        },
+        "syncMode": {
+          "label": "Sync Mode",
+          "help": "ws = WebSocket (standard WCPP) · sync = HTTP polling · websocket = WS push (MAX) · webhook = HTTP push (MAX)"
+        },
+        "syncInterval": {
+          "label": "Sync Interval (ms)",
+          "help": "Used only when syncMode = sync"
+        },
+        "wsUrl": {
+          "label": "WebSocket URL",
+          "placeholder": "ws://host:8089/ws/sync",
+          "help": "Optional override; auto-constructed from host when empty"
+        },
+        "wsFallbackThreshold": {
+          "label": "WS Fallback Threshold",
+          "advanced": true,
+          "help": "Consecutive WS failures before falling back to HTTP polling"
+        },
+        "webhookUrl": {
+          "label": "Webhook URL",
+          "placeholder": "http://YOUR_IP:8000/webhook",
+          "help": "URL WCPP MAX will POST to (required for webhook mode)"
+        },
+        "webhookHost": {
+          "label": "Webhook Bind Address",
+          "advanced": true,
+          "help": "Default 127.0.0.1 (loopback, behind reverse proxy). Set 0.0.0.0 to expose the webhook server directly on all interfaces."
+        },
+        "webhookPort": {
+          "label": "Webhook Port",
+          "help": "Local HTTP listener port"
+        },
+        "webhookPath": {
+          "label": "Webhook Path",
+          "help": "Endpoint path (default /webhook)"
+        },
+        "webhookSecret": {
+          "label": "Webhook Secret",
+          "sensitive": true,
+          "help": "HMAC-SHA256 shared secret for signature verification"
+        },
+        "newinitOnStart": {
+          "label": "Newinit on Start",
+          "help": "Activates the longlink dispatch pipeline; required for WCPP MAX 0412+"
+        },
+        "readOnly": {
+          "label": "Read-Only Mode",
+          "help": "Receive only; blocks all outbound sends (account safety)"
+        },
+        "maxMessageAge": {
+          "label": "Max Message Age (s)",
+          "advanced": true,
+          "help": "Drop messages older than this to avoid replaying stale history on reconnect"
+        },
+        "dmSecurity": {
+          "label": "DM Security Policy"
+        },
+        "allowFrom": {
+          "label": "DM Allowlist",
+          "help": "wxids permitted to DM the bot (used when dmSecurity = allowlist)"
+        },
+        "allowMsgTypes": {
+          "label": "Allowed Message Types",
+          "advanced": true,
+          "help": "1=text, 3=image, 34=voice, 47=sticker, 48=location, 49=app"
+        },
+        "passRevokemsg": {
+          "label": "Pass Revoke Notifications"
+        },
+        "replyWithMention": {
+          "label": "Reply With @Mention",
+          "help": "In group chats, prefix replies with @sender"
+        },
+        "proxy": {
+          "label": "Proxy URL",
+          "placeholder": "socks5://user:pass@host:port",
+          "advanced": true
+        }
       }
     }
   }

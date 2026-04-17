@@ -33,10 +33,18 @@ This plugin does **not** handle login or authentication. The WeChatPadProMAX ser
 
 ## Configuration
 
-Add to your `openclaw.json`:
+The plugin is discovered automatically from `~/.openclaw/extensions/`. Enable it in `plugins.entries` and configure the channel in `channels`:
 
 ```json
 {
+  "plugins": {
+    "entries": {
+      "wechatpadpro": {
+        "enabled": true,
+        "config": {}
+      }
+    }
+  },
   "channels": {
     "wechatpadpro": {
       "host": "your-wcpp-server",
@@ -55,6 +63,8 @@ Add to your `openclaw.json`:
 }
 ```
 
+> **Note:** Do not add `source` or `path` to the plugin entry — OpenClaw discovers local plugins by scanning the extensions directory.
+
 ### Config Options
 
 | Field | Type | Required | Default | Description |
@@ -63,9 +73,16 @@ Add to your `openclaw.json`:
 | `port` | number | | `8062` | Server port |
 | `adminKey` | string | WS mode | | Admin key for standard WCPP WS mode |
 | `authcode` | string | sync/websocket mode | | Auth code for WCPP MAX |
-| `syncMode` | string | | auto | `"ws"`, `"sync"`, or `"websocket"` (auto-detected from authcode) |
+| `syncMode` | string | | auto | `"ws"`, `"sync"`, `"websocket"`, or `"webhook"` (auto-detected from authcode) |
 | `wsUrl` | string | | auto | Custom WebSocket URL for websocket mode |
 | `syncInterval` | number | | `5000` | Poll interval in ms (sync mode only) |
+| `webhookHost` | string | | `127.0.0.1` | Bind address for local webhook server (use `0.0.0.0` to expose directly, default binds loopback for reverse-proxy deployments) |
+| `webhookPort` | number | | `8000` | Port for local webhook HTTP server (webhook mode) |
+| `webhookPath` | string | | `/webhook` | Path for the webhook endpoint |
+| `webhookUrl` | string | webhook mode | | URL to register with WCPP MAX (public URL reaching the local webhook server, e.g. via Caddy/nginx) |
+| `webhookSecret` | string | | | HMAC-SHA256 secret for webhook signature verification (strongly recommended when `webhookUrl` is public) |
+| `newinitOnStart` | boolean | | `true` | Call Newinit on startup to establish longlink (required for 0412+) |
+| `wsFallbackThreshold` | number | | `3` | Consecutive WS failures before falling back to sync polling |
 | `readOnly` | boolean | | `false` | Receive-only, block all outbound sends |
 | `dmSecurity` | string | | `"allowlist"` | `"allowlist"`, `"allow-all"`, or `"pairing"` |
 | `allowFrom` | string[] | | `[]` | wxid allowlist for DMs |
@@ -83,6 +100,7 @@ Add to your `openclaw.json`:
 | `ws` | WebSocket | Standard WeChatPadPro (requires `adminKey`) |
 | `sync` | HTTP polling | WeChatPadProMAX (requires `authcode`) |
 | `websocket` | WebSocket push | WeChatPadProMAX (requires `authcode`, recommended) |
+| `webhook` | HTTP push (inbound) | WeChatPadProMAX pushes to our HTTP server (requires `authcode`, `webhookUrl`) |
 
 ## Message Types
 

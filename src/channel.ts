@@ -36,6 +36,7 @@ export interface ResolvedAccount {
   maxMessageAge?: number;
   newinitOnStart?: boolean;
   wsFallbackThreshold?: number;
+  webhookHost?: string;
   webhookPort?: number;
   webhookPath?: string;
   webhookSecret?: string;
@@ -86,6 +87,7 @@ function resolveAccount(
     maxMessageAge: section.maxMessageAge,
     newinitOnStart: section.newinitOnStart,
     wsFallbackThreshold: section.wsFallbackThreshold,
+    webhookHost: section.webhookHost,
     webhookPort: section.webhookPort,
     webhookPath: section.webhookPath,
     webhookSecret: section.webhookSecret,
@@ -194,6 +196,7 @@ export async function startWcppRuntime(
       maxMessageAge: account.maxMessageAge,
       newinitOnStart: account.newinitOnStart,
       wsFallbackThreshold: account.wsFallbackThreshold,
+      webhookHost: account.webhookHost,
       webhookPort: account.webhookPort,
       webhookPath: account.webhookPath,
       webhookSecret: account.webhookSecret,

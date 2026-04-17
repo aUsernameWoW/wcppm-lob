@@ -39,6 +39,7 @@ export interface WcppConfig {
   /** Sync polling interval in ms (default 5000) */
   syncInterval?: number;
   /** Port for local webhook HTTP server (default 8000) */
+  webhookHost?: string;
   webhookPort?: number;
   /** URL path for webhook endpoint (default "/webhook") */
   webhookPath?: string;
@@ -1329,6 +1330,7 @@ export class WcppClient {
   // ──────────────────────────────────────────────
 
   startWebhookServer(): void {
+    const host = this.config.webhookHost ?? "127.0.0.1";
     const port = this.config.webhookPort ?? 8000;
     const basePath = this.config.webhookPath ?? "/webhook";
 
@@ -1390,8 +1392,8 @@ export class WcppClient {
       });
     });
 
-    this.webhookServer.listen(port, () => {
-      this.log.info(`WCPP MAX: webhook server listening on 0.0.0.0:${port}${basePath}`);
+    this.webhookServer.listen(port, host, () => {
+      this.log.info(`WCPP MAX: webhook server listening on ${host}:${port}${basePath}`);
     });
   }
 

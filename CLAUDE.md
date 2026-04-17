@@ -51,6 +51,14 @@ docs/
     └── schemas/      — 173 request/response schema docs
 ```
 
+## Manifest (`openclaw.plugin.json`)
+
+The OpenClaw gateway web UI renders channel settings from `channelConfigs[channelId].schema` + `channelConfigs[channelId].uiHints`, **not** from the top-level `configSchema` (which is plugin-scope, not channel-scope). Put all wechatpadpro fields under `channelConfigs.wechatpadpro.schema`; leave top-level `configSchema` as an empty `{ "type": "object", "properties": {} }`.
+
+- `uiHints` keys must match schema property names; supported hint fields are `label`, `help`, `placeholder`, `sensitive`, `advanced`, `tags`, `itemTemplate` (defined in `openclaw/plugin-sdk` → `channels/plugins/types.config.ts`)
+- OpenClaw does **not** recognize custom `x-openclaw-*` JSON Schema keys — don't put `x-openclaw-order`, `x-openclaw-showWhen`, etc., they're silently ignored
+- Reference: `src/config/channel-config-metadata.ts:69-82` in the OpenClaw source (at `/home/radxa/openclaw-source-codes`)
+
 ## API Reference
 
 Full WeChatPadProMAX API documentation is mirrored locally in `docs/api-reference/`.
@@ -87,8 +95,9 @@ Full WeChatPadProMAX API documentation is mirrored locally in `docs/api-referenc
 
 ### Webhook Mode (WeChatPadProMAX — HTTP push to us)
 - WCPP MAX pushes messages to our local HTTP server instead of us polling or connecting WS
-- Set `syncMode: "webhook"`, `webhookUrl` (required), optionally `webhookPort` (default 8000) and `webhookSecret`
-- Our plugin starts an HTTP server on `webhookPort` and registers the URL with WCPP MAX via `/Webhook/Set`
+- Set `syncMode: "webhook"`, `webhookUrl` (required), optionally `webhookHost` (default `127.0.0.1`), `webhookPort` (default 8000), `webhookPath` (default `/webhook`) and `webhookSecret`
+- Our plugin starts an HTTP server on `webhookHost:webhookPort` and registers `webhookUrl` with WCPP MAX via `/Webhook/Set`
+- **Default bind is loopback (`127.0.0.1`)** to match OpenClaw gateway's own default and force a reverse proxy (e.g. Caddy) as the public entry; set `webhookHost: "0.0.0.0"` to expose directly
 - Webhook payload envelope: `{ MessageType, Signature, Timestamp, Wxid, IsSelf, Data: { messages: [...] } }`
 - Signature verification: `HMAC-SHA256(secret, "{Wxid}:{MessageType}:{Timestamp}")`, anti-replay with 15-minute window
 - Each message has: `fromUser`, `toUser`, `msgType`, `msgId`, `newMsgId`, `createTime`, `text`, `rawContent`, `pushContent`
@@ -180,9 +189,11 @@ Must split on first `:\n` to extract sender and text.
       "syncMode": "webhook",      // "ws" | "sync" | "websocket" | "webhook" (auto-detected from authcode → sync)
       "wsUrl": "ws://HOST:8089/ws/sync",  // Optional: custom WS URL for websocket mode
       "syncInterval": 5000,       // Poll interval in ms (sync mode only)
+      "webhookHost": "127.0.0.1", // Bind address for local webhook server (default 127.0.0.1; use 0.0.0.0 to expose directly)
       "webhookPort": 8000,        // Port for local webhook HTTP server (webhook mode)
-      "webhookUrl": "http://OUR_IP:8000/webhook",  // URL to register with WCPP MAX (required for webhook mode)
-      "webhookSecret": "...",     // HMAC secret for webhook signature verification (optional)
+      "webhookPath": "/webhook",  // Path for webhook endpoint (default /webhook)
+      "webhookUrl": "https://your.public.domain:8443/webhook",  // URL to register with WCPP MAX (required for webhook mode)
+      "webhookSecret": "...",     // HMAC-SHA256 secret for webhook signature verification (strongly recommended)
       "readOnly": true,           // Receive-only, no sending
       "newinitOnStart": true,     // Call Newinit on startup for longlink (default true, required for 0412+)
       "wsFallbackThreshold": 3,   // Consecutive WS failures before falling back to sync (default 3)

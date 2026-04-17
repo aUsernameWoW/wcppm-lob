@@ -1,7 +1,7 @@
 node_modules/
 dist/
 *.tgz
-src/shims/
+# src/shims/ — kept in repo, required for standalone compilation
 
 # Local secrets (never commit)
 .env
