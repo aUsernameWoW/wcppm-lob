@@ -19,19 +19,15 @@ export interface Logger {
 
 export interface ChannelPluginBase {
   id: string;
-  setup: {
-    resolveAccount: (cfg: OpenClawConfig, accountId?: string | null) => any;
-    inspectAccount: (cfg: OpenClawConfig, accountId?: string | null) => {
-      enabled: boolean;
-      configured: boolean;
-      tokenStatus: string;
-    };
-  };
+  setup: any;
+  config?: any;
+  configSchema?: any;
+  meta?: any;
+  capabilities?: any;
+  gateway?: any;
 }
 
-export interface ChannelPlugin {
-  id: string;
-  setup: ChannelPluginBase["setup"];
+export interface ChannelPlugin extends ChannelPluginBase {
   security?: any;
   threading?: any;
   outbound?: any;
@@ -40,17 +36,25 @@ export interface ChannelPlugin {
 export function createChannelPluginBase(opts: {
   id: string;
   setup: ChannelPluginBase["setup"];
+  config?: any;
+  configSchema?: any;
+  meta?: any;
+  capabilities?: any;
+  gateway?: any;
 }): ChannelPluginBase {
   return opts as any;
 }
 
-export function createChatChannelPlugin<TAccount>(opts: {
+export function createChatChannelPlugin<_TAccount>(opts: {
   base: ChannelPluginBase;
   security?: any;
   threading?: any;
   outbound?: any;
 }): ChannelPlugin {
-  return opts as any;
+  // The real openclaw runtime spreads `base` onto the returned plugin so
+  // top-level lookups like `plugin.config.listAccountIds` work. Mirror that here.
+  const { base, ...rest } = opts;
+  return { ...base, ...rest } as any;
 }
 
 export function defineChannelPluginEntry(opts: any): any {

@@ -43,28 +43,22 @@ export interface ResolvedAccount {
   webhookUrl?: string;
 }
 
+const DEFAULT_ACCOUNT_ID = "default";
+
+function readSection(cfg: OpenClawConfig): Record<string, any> | undefined {
+  return (cfg.channels as Record<string, any>)?.["wechatpadpro"];
+}
+
 function resolveAccount(
   cfg: OpenClawConfig,
   accountId?: string | null,
 ): ResolvedAccount {
-  const section = (cfg.channels as Record<string, any>)?.["wechatpadpro"];
-  if (!section?.host) {
-    throw new Error("wechatpadpro: host is required in config");
-  }
+  const section = readSection(cfg) ?? {};
 
-  // Determine mode: explicit > authcode implies sync > ws fallback
-  const syncMode: "ws" | "sync" | "websocket" | "webhook" = section.syncMode ?? (section.authcode ? "sync" : "ws");
-
-  // For sync/websocket mode, authcode is used instead of adminKey
-  if (syncMode === "ws" && !section.adminKey) {
-    throw new Error("wechatpadpro: adminKey is required for WS mode");
-  }
-  if ((syncMode === "sync" || syncMode === "websocket" || syncMode === "webhook") && !section.authcode) {
-    throw new Error("wechatpadpro: authcode is required for sync/websocket/webhook mode");
-  }
-  if (syncMode === "webhook" && !section.webhookUrl) {
-    throw new Error("wechatpadpro: webhookUrl is required for webhook mode (the URL WCPP MAX will POST to)");
-  }
+  // Mode + validation are best-effort here so the gateway can still introspect
+  // the channel before the user has finished filling in the web UI form.
+  const syncMode: "ws" | "sync" | "websocket" | "webhook" =
+    section.syncMode ?? (section.authcode ? "sync" : "ws");
 
   return {
     accountId: accountId ?? null,
@@ -101,19 +95,127 @@ function resolveAccount(
 
 let client: WcppClient | null = null;
 
+function inspectAccount(cfg: OpenClawConfig, _accountId?: string | null) {
+  const section = readSection(cfg);
+  const hasAuth = section?.adminKey || section?.authcode;
+  return {
+    enabled: Boolean(section?.host && hasAuth) && section?.enabled !== false,
+    configured: Boolean(section?.host && hasAuth),
+    tokenStatus: hasAuth ? "available" : "missing",
+  };
+}
+
+function isConfigured(account: ResolvedAccount | undefined): boolean {
+  if (!account?.host) return false;
+  if (account.syncMode === "ws") return Boolean(account.adminKey);
+  if (account.syncMode === "webhook") return Boolean(account.authcode && account.webhookUrl);
+  return Boolean(account.authcode);
+}
+
+const wechatpadproConfigAdapter = {
+  listAccountIds(cfg: OpenClawConfig): string[] {
+    return readSection(cfg) ? [DEFAULT_ACCOUNT_ID] : [];
+  },
+  resolveAccount(cfg: OpenClawConfig, accountId?: string | null): ResolvedAccount {
+    return resolveAccount(cfg, accountId ?? DEFAULT_ACCOUNT_ID);
+  },
+  defaultAccountId(_cfg: OpenClawConfig): string {
+    return DEFAULT_ACCOUNT_ID;
+  },
+  inspectAccount,
+  isConfigured(account: ResolvedAccount): boolean {
+    return isConfigured(account);
+  },
+  isEnabled(account: ResolvedAccount, cfg: OpenClawConfig): boolean {
+    const section = readSection(cfg);
+    if (section?.enabled === false) return false;
+    return isConfigured(account);
+  },
+  describeAccount(account: ResolvedAccount) {
+    return {
+      accountId: account.accountId ?? DEFAULT_ACCOUNT_ID,
+      enabled: isConfigured(account),
+      configured: isConfigured(account),
+    };
+  },
+  setAccountEnabled({ cfg, enabled }: { cfg: OpenClawConfig; accountId: string; enabled: boolean }) {
+    const section = (cfg.channels as Record<string, any>)?.["wechatpadpro"];
+    return {
+      ...cfg,
+      channels: {
+        ...cfg.channels,
+        wechatpadpro: { ...section, enabled },
+      },
+    } as OpenClawConfig;
+  },
+  deleteAccount({ cfg }: { cfg: OpenClawConfig; accountId: string }) {
+    const next = { ...(cfg.channels as Record<string, any>) };
+    delete next.wechatpadpro;
+    return { ...cfg, channels: next } as OpenClawConfig;
+  },
+  resolveAllowFrom({ cfg }: { cfg: OpenClawConfig; accountId?: string | null }): string[] {
+    const section = readSection(cfg);
+    return (section?.allowFrom ?? []).map((v: unknown) => String(v));
+  },
+  formatAllowFrom({ allowFrom }: { allowFrom: Array<string | number> }): string[] {
+    return allowFrom.map((v) => String(v).trim()).filter(Boolean);
+  },
+};
+
 export const wechatpadproPlugin = createChatChannelPlugin<ResolvedAccount>({
   base: createChannelPluginBase({
     id: "wechatpadpro",
+    meta: {
+      id: "wechatpadpro",
+      label: "WeChatPadPro",
+      selectionLabel: "WeChat (via WeChatPadPro)",
+      blurb: "Connect OpenClaw to WeChat using WeChatPadPro / WeChatPadProMax (iPad protocol).",
+    },
+    capabilities: { chatTypes: ["dm", "group"] },
+    config: wechatpadproConfigAdapter,
     setup: {
-      resolveAccount,
-      inspectAccount(cfg, _accountId) {
+      resolveAccountId: ({ accountId }: { accountId?: string | null }) =>
+        accountId?.trim() || DEFAULT_ACCOUNT_ID,
+      applyAccountConfig: ({ cfg }: { cfg: OpenClawConfig }) => {
         const section = (cfg.channels as Record<string, any>)?.["wechatpadpro"];
-        const hasAuth = section?.adminKey || section?.authcode;
         return {
-          enabled: Boolean(section?.host && hasAuth),
-          configured: Boolean(section?.host && hasAuth),
-          tokenStatus: hasAuth ? "available" : "missing",
-        };
+          ...cfg,
+          channels: {
+            ...cfg.channels,
+            wechatpadpro: { ...section, enabled: true },
+          },
+        } as OpenClawConfig;
+      },
+    },
+    gateway: {
+      startAccount: async (ctx: any) => {
+        const account = ctx.account as ResolvedAccount;
+        if (!isConfigured(account)) {
+          ctx.log?.warn?.(
+            "wechatpadpro: account not fully configured, skipping start (need host + adminKey or authcode)",
+          );
+          return;
+        }
+        ctx.setStatus?.({
+          accountId: ctx.accountId,
+          running: true,
+          lastStartAt: Date.now(),
+          lastError: null,
+        });
+        await startWcppRuntime(account, ctx.log ?? console as any, async (msg) => {
+          // Best-effort dispatch: forward to any inbound bridge OpenClaw injects
+          // via runtime, otherwise just log. Wiring full reply-runtime dispatch
+          // is a separate task — see TODO.md.
+          ctx.runtime?.dispatchInbound?.(msg);
+        });
+      },
+      stopAccount: async (ctx: any) => {
+        stopWcppRuntime();
+        ctx.setStatus?.({
+          accountId: ctx.accountId,
+          running: false,
+          lastStopAt: Date.now(),
+        });
       },
     },
   }),
