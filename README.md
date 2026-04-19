@@ -69,7 +69,7 @@ The plugin is discovered automatically from `~/.openclaw/extensions/`. Enable it
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `host` | string | Yes | | WeChatPadPro server host |
+| `host` | string | Yes (except passive webhook) | | WeChatPadPro server host. Optional in webhook mode — when omitted, the plugin runs as a passive receiver and the operator manages `/Webhook/Set` + `/Login/Newinit` out-of-band |
 | `port` | number | | `8062` | Server port |
 | `adminKey` | string | WS mode | | Admin key for standard WCPP WS mode |
 | `authcode` | string | sync/websocket mode | | Auth code for WCPP MAX |
@@ -79,9 +79,9 @@ The plugin is discovered automatically from `~/.openclaw/extensions/`. Enable it
 | `webhookHost` | string | | `127.0.0.1` | Bind address for local webhook server (use `0.0.0.0` to expose directly, default binds loopback for reverse-proxy deployments) |
 | `webhookPort` | number | | `8000` | Port for local webhook HTTP server (webhook mode) |
 | `webhookPath` | string | | `/webhook` | Path for the webhook endpoint |
-| `webhookUrl` | string | webhook mode | | URL to register with WCPP MAX (public URL reaching the local webhook server, e.g. via Caddy/nginx) |
-| `webhookSecret` | string | | | HMAC-SHA256 secret for webhook signature verification (strongly recommended when `webhookUrl` is public) |
-| `newinitOnStart` | boolean | | `true` | Call Newinit on startup to establish longlink (required for 0412+) |
+| `webhookUrl` | string | webhook mode w/ host | | URL to register with WCPP MAX (public URL reaching the local webhook server, e.g. via Caddy/nginx). Only used by the auto-registration path; in passive webhook mode (no `host`) it is ignored |
+| `webhookSecret` | string | | | HMAC-SHA256 secret for webhook signature verification (strongly recommended when `webhookUrl` is public). In passive mode, must match what the operator set in `/Webhook/Set` |
+| `newinitOnStart` | boolean | | `true` | Call `/Login/Newinit` on startup to establish longlink (required for 0412+). Ignored in passive webhook mode — the operator runs Newinit out-of-band |
 | `wsFallbackThreshold` | number | | `3` | Consecutive WS failures before falling back to sync polling |
 | `readOnly` | boolean | | `false` | Receive-only, block all outbound sends |
 | `dmSecurity` | string | | `"allowlist"` | `"allowlist"`, `"allow-all"`, or `"pairing"` |

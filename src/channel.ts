@@ -99,17 +99,22 @@ let client: WcppClient | null = null;
 function inspectAccount(cfg: OpenClawConfig, _accountId?: string | null) {
   const section = readSection(cfg);
   const hasAuth = section?.adminKey || section?.authcode;
+  const isWebhook = section?.syncMode === "webhook";
+  // Webhook is a passive receiver — even without host/authcode it can listen
+  // and process pushes (registration + Newinit are the operator's responsibility).
+  const configured = isWebhook ? true : Boolean(section?.host && hasAuth);
   return {
-    enabled: Boolean(section?.host && hasAuth) && section?.enabled !== false,
-    configured: Boolean(section?.host && hasAuth),
+    enabled: configured && section?.enabled !== false,
+    configured,
     tokenStatus: hasAuth ? "available" : "missing",
   };
 }
 
 function isConfigured(account: ResolvedAccount | undefined): boolean {
-  if (!account?.host) return false;
+  if (!account) return false;
+  if (account.syncMode === "webhook") return true;
+  if (!account.host) return false;
   if (account.syncMode === "ws") return Boolean(account.adminKey);
-  if (account.syncMode === "webhook") return Boolean(account.authcode && account.webhookUrl);
   return Boolean(account.authcode);
 }
 

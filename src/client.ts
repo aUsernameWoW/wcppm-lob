@@ -378,7 +378,7 @@ export class WcppClient {
     this.authKey = config.authKey ?? null;
     this.wxid = config.wxid ?? null;
     this.syncMode = config.syncMode ?? "ws";
-    this.baseUrl = `http://${config.host}:${config.port}`;
+    this.baseUrl = config.host ? `http://${config.host}:${config.port}` : "";
     this.synckey = "string"; // initial value for first Sync call
     this.continueFlag = 0;
     this.MAX_WS_FAILURES_BEFORE_FALLBACK = config.wsFallbackThreshold ?? 3;
@@ -491,6 +491,14 @@ export class WcppClient {
    * Full login orchestration. Returns credentials on success.
    */
   async login(): Promise<WcppCredentials | null> {
+    // Webhook mode is a passive receiver. If host is not provided we cannot (and must not)
+    // talk to the WCPP MAX server at all — registration, Newinit, contact lookup, etc.
+    // are entirely the operator's responsibility (out-of-band Swagger/curl).
+    if (this.syncMode === "webhook" && !this.config.host) {
+      this.log.info("WCPP MAX: webhook passive mode (no host configured); skipping login/Newinit");
+      return { authKey: this.config.authcode ?? "", wxid: this.wxid ?? "unknown" };
+    }
+
     // For sync/websocket/webhook mode with authcode
     if ((this.syncMode === "sync" || this.syncMode === "websocket" || this.syncMode === "webhook") && this.config.authcode) {
       // Call Newinit first if configured (required for WCPP MAX 0412+ longlink)
@@ -1532,7 +1540,13 @@ export class WcppClient {
   connect(): void {
     if (this.syncMode === "webhook") {
       this.startWebhookServer();
-      this.registerWebhook();
+      // Auto-register only if host is configured. In passive mode (no host) the operator
+      // is expected to call /Webhook/Set + /Login/Newinit out-of-band.
+      if (this.config.host) {
+        this.registerWebhook();
+      } else {
+        this.log.info("WCPP MAX: webhook passive mode; skipping /Webhook/Set (operator-managed)");
+      }
     } else if (this.syncMode === "sync") {
       this.startSyncPolling();
     } else if (this.syncMode === "websocket") {
@@ -1546,7 +1560,9 @@ export class WcppClient {
     this.stopSyncPolling();
     this.disconnectWebSocket();
     this.disconnectMaxWebSocket();
-    this.removeWebhook();
+    if (this.config.host) {
+      this.removeWebhook();
+    }
     this.stopWebhookServer();
   }
 

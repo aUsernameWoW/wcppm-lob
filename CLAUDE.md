@@ -6,21 +6,24 @@ An OpenClaw channel plugin that bridges WeChatPadPro / WeChatPadProMAX into Open
 
 ## Scope & Responsibilities
 
-**This plugin does NOT handle:**
-- **Login/Authentication** — QR code scanning, 62-data login, A16 login, token renewal, heartbeat management, and all `/Login/*` operations are handled externally by the WeChatPadProMax server administrator
+**This plugin does NOT handle (firm boundary, do not expand):**
+- **All `/Login/*` operations** — QR code scanning, 62-data login, A16 login, token renewal, heartbeat management, **and `/Login/Newinit`**
+- **All `/User/*` operations** — account info edits, profile, device management, etc.
+
+These are the WeChatPadProMax server administrator's responsibility, configured out-of-band (Swagger UI / curl). If no messages arrive because the operator forgot to run `/Login/Newinit` or `/Webhook/Set`, **that's an operator config issue, not ours** — we don't paper over it by re-introducing auto-calls into those surfaces.
 
 **Hard constraints confirmed in production:**
 - For account nurturing / safety, prefer passive receive paths and avoid unnecessary active operations
 
-**Newinit behavior (updated for WCPP MAX 0412+):**
-- `Newinit` is now called on startup by default (`newinitOnStart` config, defaults to true)
-- On WCPP MAX 0412+, Newinit establishes the longlink connection required for the unified dispatch pipeline
-- Without Newinit, the server will not push messages through any channel (WS, Webhook, etc.)
-- Newinit also returns initial Synckeys and self wxid
+**Newinit history (was auto-called, now reverted):**
+- WCPP MAX 0412+ requires `/Login/Newinit` to establish the longlink before any push channel (WS / Webhook / RabbitMQ) actually receives data
+- We briefly auto-called Newinit on startup (`newinitOnStart`), but this re-enters `/Login/*` scope. **Reverted**: the operator runs Newinit manually
+- The `newinitOnStart` config field still exists but is only honored when `host` is set AND syncMode ≠ `webhook`. In passive webhook mode it is ignored
 
 **This plugin assumes:**
 - The WeChatPadProMax server is already logged in and online
-- A valid `authcode` (for MAX) or `adminKey` + `authKey` (for standard WCPP) is provided by the server admin
+- `/Login/Newinit` has been called (by the operator) so the server's longlink is up
+- A valid `authcode` (for MAX) or `adminKey` + `authKey` (for standard WCPP) is provided by the server admin **if** any active operation is needed (sending, contact fetch, auto-register webhook). Pure passive webhook receive needs neither.
 - The WeChat account is stable and ready to send/receive messages
 
 **This plugin focuses on:**
@@ -131,8 +134,9 @@ Full WeChatPadProMAX API documentation is mirrored locally in `docs/api-referenc
 
 ### Webhook Mode (WeChatPadProMAX — HTTP push to us)
 - WCPP MAX pushes messages to our local HTTP server instead of us polling or connecting WS
-- Set `syncMode: "webhook"`, `webhookUrl` (required), optionally `webhookHost` (default `127.0.0.1`), `webhookPort` (default 8000), `webhookPath` (default `/webhook`) and `webhookSecret`
-- Our plugin starts an HTTP server on `webhookHost:webhookPort` and registers `webhookUrl` with WCPP MAX via `/Webhook/Set`
+- Set `syncMode: "webhook"`, optionally `webhookHost` (default `127.0.0.1`), `webhookPort` (default 8000), `webhookPath` (default `/webhook`) and `webhookSecret`
+- **`host` is optional in webhook mode.** If `host` is set, the plugin auto-registers the webhook via `/Webhook/Set`. If `host` is empty, the plugin runs in **passive mode**: it just binds the local listener; the operator handles registration and Newinit out-of-band. Passive mode is the recommended layout when the WCPP MAX address is unstable (DHCP) or when you want strict separation from `/Login/*` and `/Webhook/Set`
+- `webhookUrl` is only consumed by the auto-registration path; in passive mode it can be omitted
 - **Default bind is loopback (`127.0.0.1`)** to match OpenClaw gateway's own default and force a reverse proxy (e.g. Caddy) as the public entry; set `webhookHost: "0.0.0.0"` to expose directly
 - Webhook payload envelope: `{ MessageType, Signature, Timestamp, Wxid, IsSelf, Data: { messages: [...] } }`
 - Signature verification: `HMAC-SHA256(secret, "{Wxid}:{MessageType}:{Timestamp}")`, anti-replay with 15-minute window
@@ -141,6 +145,58 @@ Full WeChatPadProMAX API documentation is mirrored locally in `docs/api-referenc
 - Limitation: `MsgSource` (used for `<atuserlist>` @bot detection) is not available in webhook format; @bot still works via `pushContent` fallback
 - On disconnect, webhook is automatically removed via `/Webhook/Remove`
 - Tested and confirmed working on WCPP MAX 0416: webhook registration, test delivery, and real message push all functional
+
+## OpenClaw-Side Enablement (web UI / openclaw.json)
+
+The plugin manifest + channel config are not enough on their own — OpenClaw needs the plugin enabled and (optionally) a route binding. These live in `~/.openclaw/openclaw.json`, which is also what the OpenClaw web UI's config form writes to.
+
+**Required:**
+- `plugins.entries.wechatpadpro.enabled: true` — without this the plugin is loaded but skipped (`ui/src/ui/plugin-activation.ts`)
+- `channels.wechatpadpro.{ host, authcode, syncMode, ... }` — the channel account block (per-account `enabled` defaults to `true`)
+
+**Optional, but worth knowing:**
+- `bindings[]` — *not* required. If no entry matches `{ channel: "wechatpadpro", ... }`, `resolveAgentRoute` falls through to `default` at `src/routing/resolve-route.ts:835` and the message is routed to the default agent. It is **not** silently dropped (`dispatch.ts:76` is just defensive). Add a binding only if you need a non-default agent or per-peer routing.
+- The web UI has no dedicated toggle for `plugins.entries.*.enabled` or `bindings[]` — edit `openclaw.json` directly (or via the web config editor).
+
+## Webhook Deployment: Reverse-Proxy Mode
+
+Recommended layout when exposing the webhook publicly:
+
+```
+WCPP MAX  ──HTTPS──▶  Caddy/nginx (public :8443)  ──HTTP──▶  127.0.0.1:8000/webhook (our plugin)
+```
+
+- `webhookHost: "127.0.0.1"` (default) — bind loopback only
+- `webhookPort: 8000` (default) — local plain-HTTP listener
+- `webhookPath: "/webhook"` (default) — the path the local server actually listens on
+- `webhookUrl: "https://public.domain:port/webhook"` — **must include `/webhook`** (or whatever `webhookPath` is); the reverse proxy forwards path verbatim, so omitting it lands on `/` which 404s
+- `webhookSecret: "<hex>"` — strongly recommended for any public URL; both ends share this and the plugin auto-pushes it to WCPP MAX in `/Webhook/Set`
+
+The reverse proxy itself does **not** need any path rewrites; just upstream `127.0.0.1:8000`.
+
+### Manual webhook registration on the WCPP MAX side
+
+When `host` is configured, the plugin auto-calls `/Webhook/Set` on `gateway.startAccount`. In **passive mode** (host empty) the operator must register manually — same goes for `/Login/Newinit`, since without it the server's longlink stays down and **no push lands anywhere**, regardless of how correctly the webhook is wired:
+
+```bash
+# 1. (Required on 0412+) bring up the longlink
+curl -X POST "http://<wcpp-max-host>:8062/api/Login/Newinit?authcode=<AUTHCODE>"
+
+# 2. Register webhook
+curl -X POST "http://<wcpp-max-host>:8062/api/Webhook/Set?authcode=<AUTHCODE>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://<your-public-domain>:<port>/webhook",
+    "secret": "<hex secret matching webhookSecret>",
+    "enabled": true,
+    "messageTypes": ["*"],
+    "includeSelfMessage": false,
+    "timeout": 5,
+    "retryCount": 3
+  }'
+```
+
+Verify with `GET /api/Webhook/Get?authcode=...` and trigger a test push with `POST /api/Webhook/Test?authcode=...`. The plugin's HMAC verifier expects `HMAC-SHA256(secret, "{Wxid}:{MessageType}:{Timestamp}")` hex-lowercase in the `Signature` field.
 
 ## WeChat Message Format
 
