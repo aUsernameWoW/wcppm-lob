@@ -132,10 +132,15 @@ const wechatpadproConfigAdapter = {
   isConfigured(account: ResolvedAccount): boolean {
     return isConfigured(account);
   },
-  isEnabled(account: ResolvedAccount, cfg: OpenClawConfig): boolean {
+  isEnabled(_account: ResolvedAccount, cfg: OpenClawConfig): boolean {
+    // "Is this account enabled in config?" — answered purely from the config section.
+    // Config completeness is the separate concern of `isConfigured`. We must NOT
+    // call `isConfigured(account)` here because the gateway sometimes invokes
+    // isEnabled with a stub account (no syncMode/host) during introspection paths,
+    // and that stub would falsely report unconfigured → disabled → channel never starts.
     const section = readSection(cfg);
-    if (section?.enabled === false) return false;
-    return isConfigured(account);
+    if (!section) return false;
+    return section.enabled !== false;
   },
   describeAccount(account: ResolvedAccount) {
     return {
@@ -168,8 +173,14 @@ const wechatpadproConfigAdapter = {
   },
 };
 
-export const wechatpadproPlugin = createChatChannelPlugin<ResolvedAccount>({
-  base: createChannelPluginBase({
+// `createChannelPluginBase` does NOT pass `gateway` through to its result (its
+// spread list only includes id/meta/setup/config/capabilities/etc.). If we put
+// `gateway` inside the helper call, `plugin.gateway` ends up undefined — the
+// gateway then short-circuits at `if (!startAccount) return` and silently
+// never starts our channel. Attach `gateway` directly onto the base object,
+// mirroring how `extensions/twitch/src/plugin.ts` structures it inline.
+const wechatpadproBase = {
+  ...createChannelPluginBase({
     id: "wechatpadpro",
     meta: {
       id: "wechatpadpro",
@@ -193,7 +204,8 @@ export const wechatpadproPlugin = createChatChannelPlugin<ResolvedAccount>({
         } as OpenClawConfig;
       },
     },
-    gateway: {
+  }),
+  gateway: {
       startAccount: async (ctx: any) => {
         const account = ctx.account as ResolvedAccount;
         if (!isConfigured(account)) {
@@ -253,8 +265,11 @@ export const wechatpadproPlugin = createChatChannelPlugin<ResolvedAccount>({
           lastStopAt: Date.now(),
         });
       },
-    },
-  }),
+  },
+};
+
+export const wechatpadproPlugin = createChatChannelPlugin<ResolvedAccount>({
+  base: wechatpadproBase as any,
 
   security: {
     dm: {
