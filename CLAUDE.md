@@ -35,11 +35,19 @@ An OpenClaw channel plugin that bridges WeChatPadPro / WeChatPadProMAX into Open
 src/
 ├── index.ts          — Plugin entry point (defineChannelPluginEntry)
 ├── channel.ts        — OpenClaw channel plugin definition + runtime lifecycle
+│                       (config adapter, gateway.startAccount/stopAccount, outbound)
 ├── client.ts         — Core API client: auth, WebSocket, Sync polling, Webhook receive, send
+├── dispatch.ts       — Inbound → OpenClaw auto-reply pipeline bridge
+│                       (resolveAgentRoute → finalizeInboundContext →
+│                        createReplyDispatcherWithTyping → dispatchInboundMessage)
 ├── setup-entry.ts    — Lightweight setup entry for onboarding
 └── shims/
-    └── openclaw/
-        └── channel-core.ts  — Type shims for standalone compilation
+    └── openclaw/     — Typecheck-only shims for openclaw/plugin-sdk/* paths
+        ├── channel-core.ts
+        ├── reply-runtime.ts
+        ├── routing.ts
+        ├── channel-reply-pipeline.ts
+        └── config-runtime.ts
 tools/
 └── debug.ts          — Standalone CLI for testing WCPP MAX API (npx tsx tools/debug.ts)
 docs/
@@ -58,6 +66,34 @@ The OpenClaw gateway web UI renders channel settings from `channelConfigs[channe
 - `uiHints` keys must match schema property names; supported hint fields are `label`, `help`, `placeholder`, `sensitive`, `advanced`, `tags`, `itemTemplate` (defined in `openclaw/plugin-sdk` → `channels/plugins/types.config.ts`)
 - OpenClaw does **not** recognize custom `x-openclaw-*` JSON Schema keys — don't put `x-openclaw-order`, `x-openclaw-showWhen`, etc., they're silently ignored
 - Reference: `src/config/channel-config-metadata.ts:69-82` in the OpenClaw source (at `/home/radxa/openclaw-source-codes`)
+
+## Plugin Surface Required by the OpenClaw Gateway
+
+A channel plugin is just `{ id, meta, capabilities, configSchema, config, setup, gateway, security?, threading?, outbound? }`. **Anything missing here will silently break a different gateway code path** — there is no central validator, the gateway just calls `plugin.config.X(...)` and crashes.
+
+- `config` — **required**. Implements `listAccountIds`, `resolveAccount`, `defaultAccountId`, `inspectAccount`, `isEnabled`, `isConfigured`, `describeAccount`, `setAccountEnabled`, `deleteAccount`, `resolveAllowFrom`, `formatAllowFrom`. Without these the web UI errors out with `TypeError: Cannot read properties of undefined (reading 'listAccountIds')` on every `channels.status` / `health` / `usage.cost` call. `resolveAccount` must NOT throw on partial config — the gateway introspects the channel before the user finishes the form.
+- `gateway.startAccount(ctx)` / `stopAccount(ctx)` — without these the channel renders in the UI but never actually connects. `ctx` provides `{ cfg, accountId, account, runtime, abortSignal, log, getStatus, setStatus }`.
+- `setup` — only `resolveAccountId` and `applyAccountConfig` are read by the gateway. `inspectAccount`/`resolveAccount` belong on `config`, not `setup` (the gateway never calls `plugin.setup.inspectAccount`).
+- Reference plugin layout: `extensions/twitch/src/plugin.ts` and `extensions/feishu/src/channel.ts` in the OpenClaw source.
+
+## Inbound Auto-Reply Pipeline
+
+`gateway.startAccount` calls `startWcppRuntime`, which produces `NormalizedMessage` objects. Each message is forwarded to `dispatchInboundToOpenClaw` (in `src/dispatch.ts`) which runs:
+
+```
+loadConfig → resolveAgentRoute → finalizeInboundContext →
+  createChannelReplyPipeline → createReplyDispatcherWithTyping →
+  dispatchInboundMessage
+```
+
+The `deliver` callback we hand to the dispatcher is what closes the loop — it receives the agent's `ReplyPayload` and calls `client.sendText` (or `sendQuote` when `payload.replyToId` / `payload.replyToTag` is set). Errors in the deliver path are logged with the `wechatpadpro:` prefix, never thrown — one bad message must not kill the receiver loop.
+
+**MsgContext fields** (built in `dispatch.ts:buildFromTag` and the `finalizeInboundContext` call): `Provider`, `Surface`, `OriginatingChannel` all = `"wechatpadpro"`; `ChatType` = `"group"|"direct"`; `From` = `group:${groupId}` for groups, `wechatpadpro:${senderWxid}` for DMs; `To` = the wxid we send the reply back to (groupId for groups, senderWxid for DMs); `SessionKey`/`AccountId` from `resolveAgentRoute`; `WasMentioned` only set for groups.
+
+**Out of scope today** (would need additional work):
+- Inbound media routed to the agent — currently text-only; resolved media is on `msg.raw.media` if needed
+- `ReplyPayload.mediaUrl` / `interactive` / `btw` — `deliver` ignores everything except `text`. Explicit `outbound.sendMedia` calls still work.
+- Typing indicators, debouncer, history aggregation, mention regex preprocessing — all skipped
 
 ## API Reference
 
