@@ -9,7 +9,8 @@ import {
   createChannelPluginBase,
 } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
-import { WcppClient, type NormalizedMessage, type QuoteInfo } from "./client.js";
+import { WcppClient, type NormalizedMessage } from "./client.js";
+import { dispatchInboundToOpenClaw } from "./dispatch.js";
 
 // ──────────────────────────────────────────────
 // Account resolution
@@ -202,11 +203,29 @@ export const wechatpadproPlugin = createChatChannelPlugin<ResolvedAccount>({
           lastStartAt: Date.now(),
           lastError: null,
         });
-        await startWcppRuntime(account, ctx.log ?? console as any, async (msg) => {
-          // Best-effort dispatch: forward to any inbound bridge OpenClaw injects
-          // via runtime, otherwise just log. Wiring full reply-runtime dispatch
-          // is a separate task — see TODO.md.
-          ctx.runtime?.dispatchInbound?.(msg);
+        const log = (ctx.log ?? console) as any;
+        const dispatchCtx = {
+          accountId: ctx.accountId,
+          log,
+          send: {
+            sendText: async (to: string, text: string) =>
+              client ? await client.sendText(to, text) : false,
+            sendQuote: async (to: string, text: string, quoteMsgId: string) =>
+              client ? await client.sendQuote(to, text, quoteMsgId) : false,
+          },
+        };
+        await startWcppRuntime(account, log, async (msg) => {
+          await dispatchInboundToOpenClaw(dispatchCtx, {
+            chatType: msg.chatType,
+            conversationId: msg.groupId || msg.senderId,
+            senderWxid: msg.senderId,
+            senderName: msg.senderName,
+            text: msg.text,
+            msgId: msg.raw?.normalized?.msgId ?? `wcpp-${Date.now()}`,
+            isAtBot: msg.isAtBot,
+            replyToBody: msg.replyToBody,
+            replyToSender: msg.replyToSender,
+          });
         });
       },
       stopAccount: async (ctx: any) => {
