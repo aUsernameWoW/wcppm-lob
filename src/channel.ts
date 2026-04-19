@@ -232,6 +232,18 @@ export const wechatpadproPlugin = createChatChannelPlugin<ResolvedAccount>({
             replyToSender: msg.replyToSender,
           });
         });
+
+        // OpenClaw treats startAccount as a long-running task: the moment this
+        // returns, the gateway flips `running: false` in its `finally`, even though
+        // our HTTP listener / WS / Sync loop is happily running in the background.
+        // Block here until the gateway aborts us, then clean up.
+        await new Promise<void>((resolve) => {
+          const sig: AbortSignal | undefined = ctx.abortSignal;
+          if (!sig) return; // no signal: stay alive forever; stopAccount handles teardown
+          if (sig.aborted) { resolve(); return; }
+          sig.addEventListener("abort", () => resolve(), { once: true });
+        });
+        stopWcppRuntime();
       },
       stopAccount: async (ctx: any) => {
         stopWcppRuntime();
