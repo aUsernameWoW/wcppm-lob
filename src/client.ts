@@ -47,6 +47,13 @@ export interface WcppConfig {
   webhookSecret?: string;
   /** External URL to register with WCPP MAX (required for webhook mode) */
   webhookUrl?: string;
+  /**
+   * When true, webhook signature mismatches log the full signing input
+   * and include a non-sensitive diagnostic block in the 401 response body.
+   * The hex prefix (first 12 chars) of expected/got HMACs is leaked — do
+   * NOT enable in production since it narrows brute-force space on the secret.
+   */
+  webhookDebug?: boolean;
   /** Nurturing mode: receive-only, no sending (default false for safety during initial period) */
   readOnly?: boolean;
   /** Allow these MsgTypes through (default: [1, 3, 34, 47, 49]) */
@@ -1365,10 +1372,40 @@ export class WcppClient {
 
           // Signature verification
           if (this.config.webhookSecret) {
-            if (!this.verifyWebhookSignature(envelope, this.config.webhookSecret)) {
-              this.log.warn("WCPP MAX: webhook signature verification failed");
+            const verdict = this.verifyWebhookSignature(envelope, this.config.webhookSecret);
+            if (!verdict.ok) {
+              const debug = this.config.webhookDebug === true;
+              if (debug) {
+                this.log.warn(
+                  `WCPP MAX: webhook signature verification failed — ` +
+                  `signingInput="${verdict.signingInput}" ` +
+                  `expectedPrefix=${verdict.expectedPrefix} ` +
+                  `gotPrefix=${verdict.gotPrefix} ` +
+                  `gotLen=${verdict.gotLen} ` +
+                  `isSelf=${envelope.IsSelf} ` +
+                  `msgCount=${envelope.Data?.messages?.length ?? 0} ` +
+                  `secretLen=${this.config.webhookSecret.length}`
+                );
+              } else {
+                this.log.warn("WCPP MAX: webhook signature verification failed (enable webhookDebug for details)");
+              }
               res.writeHead(401, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ ok: false, error: "invalid signature" }));
+              res.end(JSON.stringify(debug
+                ? {
+                    ok: false,
+                    error: "invalid signature",
+                    debug: {
+                      signingInput: verdict.signingInput,
+                      expectedPrefix: verdict.expectedPrefix,
+                      gotPrefix: verdict.gotPrefix,
+                      gotLen: verdict.gotLen,
+                      isSelf: envelope.IsSelf,
+                      msgCount: envelope.Data?.messages?.length ?? 0,
+                      secretLen: this.config.webhookSecret.length,
+                    },
+                  }
+                : { ok: false, error: "invalid signature" }
+              ));
               return;
             }
           }
@@ -1413,15 +1450,27 @@ export class WcppClient {
     }
   }
 
-  private verifyWebhookSignature(envelope: WebhookEnvelope, secret: string): boolean {
-    const data = `${envelope.Wxid}:${envelope.MessageType}:${envelope.Timestamp}`;
-    const expected = createHmac("sha256", secret).update(data).digest("hex");
+  private verifyWebhookSignature(
+    envelope: WebhookEnvelope,
+    secret: string,
+  ): { ok: true } | { ok: false; signingInput: string; expectedPrefix: string; gotPrefix: string; gotLen: number } {
+    const signingInput = `${envelope.Wxid}:${envelope.MessageType}:${envelope.Timestamp}`;
+    const expected = createHmac("sha256", secret).update(signingInput).digest("hex");
     const got = (envelope.Signature || "").toLowerCase();
+    let match = false;
     try {
-      return timingSafeEqual(Buffer.from(expected, "utf8"), Buffer.from(got, "utf8"));
+      match = timingSafeEqual(Buffer.from(expected, "utf8"), Buffer.from(got, "utf8"));
     } catch {
-      return false;
+      match = false;
     }
+    if (match) return { ok: true };
+    return {
+      ok: false,
+      signingInput,
+      expectedPrefix: expected.slice(0, 12),
+      gotPrefix: got.slice(0, 12),
+      gotLen: got.length,
+    };
   }
 
   /**

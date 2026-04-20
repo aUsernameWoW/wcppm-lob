@@ -42,6 +42,7 @@ export interface ResolvedAccount {
   webhookPath?: string;
   webhookSecret?: string;
   webhookUrl?: string;
+  webhookDebug?: boolean;
 }
 
 const DEFAULT_ACCOUNT_ID = "default";
@@ -87,6 +88,7 @@ function resolveAccount(
     webhookPath: section.webhookPath,
     webhookSecret: section.webhookSecret,
     webhookUrl: section.webhookUrl,
+    webhookDebug: section.webhookDebug,
   };
 }
 
@@ -354,6 +356,7 @@ export async function startWcppRuntime(
       webhookPath: account.webhookPath,
       webhookSecret: account.webhookSecret,
       webhookUrl: account.webhookUrl,
+      webhookDebug: account.webhookDebug,
     },
     log as any,
   );

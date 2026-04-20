@@ -83,6 +83,11 @@
             "type": "string",
             "description": "HMAC-SHA256 secret for webhook signature verification (recommended)"
           },
+          "webhookDebug": {
+            "type": "boolean",
+            "description": "On signature mismatch, log full signing input and return diagnostic fields in 401 body. Leaks a 12-char HMAC prefix — disable in production.",
+            "default": false
+          },
           "newinitOnStart": {
             "type": "boolean",
             "description": "Call Newinit on startup to establish longlink (required for WCPP MAX 0412+)",
@@ -201,6 +206,11 @@
           "label": "Webhook Secret",
           "sensitive": true,
           "help": "HMAC-SHA256 shared secret for signature verification"
+        },
+        "webhookDebug": {
+          "label": "Webhook Debug Mode",
+          "advanced": true,
+          "help": "Enable only while diagnosing signature failures — leaks a 12-char HMAC prefix in logs and 401 bodies."
         },
         "newinitOnStart": {
           "label": "Newinit on Start",
