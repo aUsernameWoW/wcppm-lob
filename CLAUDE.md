@@ -155,6 +155,16 @@ Full WeChatPadProMAX API documentation is mirrored locally in `docs/api-referenc
 - On disconnect, webhook is automatically removed via `/Webhook/Remove`
 - Tested and confirmed working on WCPP MAX 0416: webhook registration, test delivery, and real message push all functional
 
+### Webhook Gotchas Confirmed in Production
+
+1. **`/Webhook/Remove` clears the config, NOT the retry queue.** If a push fails for any reason, WCPPM parks it in an in-memory retry queue that survives `/Webhook/Remove` → `/Webhook/Set`, survives plugin restarts, and (as far as we can tell) only drains when the server process itself restarts or when the receiver returns 200.
+2. **A queue item carries whatever `Signature` was computed at enqueue time.** Messages enqueued during a window when `webhookSecret` was empty on the WCPPM side keep an empty `body.Signature` forever — changing the secret later does NOT re-sign them. They'll 401 on every retry until you drain them.
+3. **`/Webhook/Test` always signs with the currently-stored secret** (different code path). Test passing therefore does NOT prove the real-push path will pass — if the queue is poisoned, Test is green and real messages 401.
+4. **Debug flow when signatures fail mysteriously** (`src/client.ts:1373+`):
+   - Set `webhookDebug: true` — the 401 log line prints `signingInput`, expected/got HMAC prefixes, envelope top-level keys, HTTP header names, and stuffs the same diagnostic into a top-level `message` field of the 401 body (WCPPM's Go client extracts `.message` for 4xx responses; for 5xx it uses raw `body=`, which is why empty `message=` is the default look on 401).
+   - If `gotLen=0`, you're in case 2 above (poisoned queue). Flip `webhookSilentDropUnsigned: true` to 200-and-drop those until the queue drains, then flip both flags off to restore strict mode.
+5. **Doc gotcha**: the HMAC test vector in `docs/api-reference/docs/7359735m0.md:41` is wrong — the `df5fdd...` hex doesn't match HMAC-SHA256 of the shown input. Our implementation is correct (verified against openssl + the actual WCPPM `/Webhook/Test` signature). Don't chase the doc.
+
 ## OpenClaw-Side Enablement (web UI / openclaw.json)
 
 The plugin manifest + channel config are not enough on their own — OpenClaw needs the plugin enabled and (optionally) a route binding. These live in `~/.openclaw/openclaw.json`, which is also what the OpenClaw web UI's config form writes to.
@@ -295,6 +305,8 @@ Must split on first `:\n` to extract sender and text.
       "webhookPath": "/webhook",  // Path for webhook endpoint (default /webhook)
       "webhookUrl": "https://your.public.domain:8443/webhook",  // URL to register with WCPP MAX (required for webhook mode)
       "webhookSecret": "...",     // HMAC-SHA256 secret for webhook signature verification (strongly recommended)
+      "webhookDebug": false,      // On sig mismatch, log signingInput + HMAC prefixes + envelope/header keys; stuff debugMsg into 401 body. Leaks a 12-char HMAC prefix — diagnostic only
+      "webhookSilentDropUnsigned": false,  // If set, 200-and-drop pushes whose body.Signature is empty (escape hatch for a poisoned retry queue). Wrong-but-non-empty sigs still 401
       "readOnly": true,           // Receive-only, no sending
       "newinitOnStart": true,     // Call Newinit on startup for longlink (default true, required for 0412+)
       "wsFallbackThreshold": 3,   // Consecutive WS failures before falling back to sync (default 3)
