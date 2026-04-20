@@ -1376,6 +1376,12 @@ export class WcppClient {
             if (!verdict.ok) {
               const debug = this.config.webhookDebug === true;
               if (debug) {
+                // Include envelope top-level keys and request headers so we
+                // can spot a stale sender that puts Signature in a header
+                // or under a different case (e.g. "signature").
+                const envKeys = Object.keys(envelope as Record<string, unknown>).join(",");
+                const headerKeys = Object.keys(req.headers).join(",");
+                const sigHeader = req.headers["x-signature"] ?? req.headers["signature"] ?? "(none)";
                 this.log.warn(
                   `WCPP MAX: webhook signature verification failed — ` +
                   `signingInput="${verdict.signingInput}" ` +
@@ -1384,15 +1390,23 @@ export class WcppClient {
                   `gotLen=${verdict.gotLen} ` +
                   `isSelf=${envelope.IsSelf} ` +
                   `msgCount=${envelope.Data?.messages?.length ?? 0} ` +
-                  `secretLen=${this.config.webhookSecret.length}`
+                  `secretLen=${this.config.webhookSecret.length} ` +
+                  `envKeys=[${envKeys}] ` +
+                  `headerKeys=[${headerKeys}] ` +
+                  `x-signature=${sigHeader}`
                 );
               } else {
                 this.log.warn("WCPP MAX: webhook signature verification failed (enable webhookDebug for details)");
               }
+              // WCPPM's delivery log extracts `.message` for 4xx responses
+              // (vs raw body for 5xx), so pack diagnostics into `message`
+              // when debug is on — otherwise their log field stays empty.
+              const debugMsg = `invalid signature: input="${verdict.signingInput}" expected=${verdict.expectedPrefix}.. got=${verdict.gotPrefix}.. gotLen=${verdict.gotLen} secretLen=${this.config.webhookSecret.length}`;
               res.writeHead(401, { "Content-Type": "application/json" });
               res.end(JSON.stringify(debug
                 ? {
                     ok: false,
+                    message: debugMsg,
                     error: "invalid signature",
                     debug: {
                       signingInput: verdict.signingInput,
@@ -1404,7 +1418,7 @@ export class WcppClient {
                       secretLen: this.config.webhookSecret.length,
                     },
                   }
-                : { ok: false, error: "invalid signature" }
+                : { ok: false, message: "invalid signature", error: "invalid signature" }
               ));
               return;
             }
