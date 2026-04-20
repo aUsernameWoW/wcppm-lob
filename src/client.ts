@@ -1379,7 +1379,7 @@ export class WcppClient {
                 // Include envelope top-level keys and request headers so we
                 // can spot a stale sender that puts Signature in a header
                 // or under a different case (e.g. "signature").
-                const envKeys = Object.keys(envelope as Record<string, unknown>).join(",");
+                const envKeys = Object.keys(envelope as unknown as Record<string, unknown>).join(",");
                 const headerKeys = Object.keys(req.headers).join(",");
                 const sigHeader = req.headers["x-signature"] ?? req.headers["signature"] ?? "(none)";
                 this.log.warn(
