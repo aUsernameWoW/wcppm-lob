@@ -1,7 +1,9 @@
 /**
- * WeChatPadPro / WeChatPadProMAX channel plugin for OpenClaw.
+ * WeChatPadProMax channel plugin for OpenClaw.
  *
- * Supports both WS (standard WCPP) and HTTP Sync polling (WCPP MAX).
+ * Base inbound transport is WebSocket push (/ws/sync). Webhook can be
+ * enabled as an additional inbound channel; dedup by MsgId handles the
+ * double-delivery.
  */
 
 import {
@@ -18,25 +20,20 @@ import { dispatchInboundToOpenClaw } from "./dispatch.js";
 
 export interface ResolvedAccount {
   accountId: string | null;
-  adminKey: string;
   host: string;
   port: number;
-  authKey?: string;
   authcode?: string;
   wxid?: string;
   allowFrom: string[];
   dmPolicy: string | undefined;
   replyWithMention: boolean;
   proxy?: string;
-  syncMode: "ws" | "sync" | "websocket" | "webhook";
   wsUrl?: string;
-  syncInterval?: number;
+  webhookEnabled?: boolean;
   readOnly?: boolean;
   allowMsgTypes?: number[];
   passRevokemsg?: boolean;
   maxMessageAge?: number;
-  newinitOnStart?: boolean;
-  wsFallbackThreshold?: number;
   webhookHost?: string;
   webhookPort?: number;
   webhookPath?: string;
@@ -58,32 +55,22 @@ function resolveAccount(
 ): ResolvedAccount {
   const section = readSection(cfg) ?? {};
 
-  // Mode + validation are best-effort here so the gateway can still introspect
-  // the channel before the user has finished filling in the web UI form.
-  const syncMode: "ws" | "sync" | "websocket" | "webhook" =
-    section.syncMode ?? (section.authcode ? "sync" : "ws");
-
   return {
     accountId: accountId ?? null,
-    adminKey: section.adminKey ?? "",
     host: section.host,
     port: section.port ?? 8062,
-    authKey: section.authKey,
     authcode: section.authcode,
     wxid: section.wxid,
     allowFrom: section.allowFrom ?? [],
     dmPolicy: section.dmSecurity,
     replyWithMention: section.replyWithMention ?? false,
     proxy: section.proxy,
-    syncMode,
     wsUrl: section.wsUrl,
-    syncInterval: section.syncInterval,
+    webhookEnabled: section.webhookEnabled === true,
     readOnly: section.readOnly,
     allowMsgTypes: section.allowMsgTypes,
     passRevokemsg: section.passRevokemsg,
     maxMessageAge: section.maxMessageAge,
-    newinitOnStart: section.newinitOnStart,
-    wsFallbackThreshold: section.wsFallbackThreshold,
     webhookHost: section.webhookHost,
     webhookPort: section.webhookPort,
     webhookPath: section.webhookPath,
@@ -102,11 +89,12 @@ let client: WcppClient | null = null;
 
 function inspectAccount(cfg: OpenClawConfig, _accountId?: string | null) {
   const section = readSection(cfg);
-  const hasAuth = section?.adminKey || section?.authcode;
-  const isWebhook = section?.syncMode === "webhook";
-  // Webhook is a passive receiver — even without host/authcode it can listen
-  // and process pushes (registration + Newinit are the operator's responsibility).
-  const configured = isWebhook ? true : Boolean(section?.host && hasAuth);
+  const hasAuth = Boolean(section?.authcode);
+  // Active mode (host set): needs authcode. Passive webhook-only (no host):
+  // needs webhookEnabled. Anything else is not configured.
+  const configured =
+    (Boolean(section?.host) && hasAuth) ||
+    (!section?.host && section?.webhookEnabled === true);
   return {
     enabled: configured && section?.enabled !== false,
     configured,
@@ -116,10 +104,9 @@ function inspectAccount(cfg: OpenClawConfig, _accountId?: string | null) {
 
 function isConfigured(account: ResolvedAccount | undefined): boolean {
   if (!account) return false;
-  if (account.syncMode === "webhook") return true;
-  if (!account.host) return false;
-  if (account.syncMode === "ws") return Boolean(account.adminKey);
-  return Boolean(account.authcode);
+  if (account.host) return Boolean(account.authcode);
+  // No host → must be passive webhook-only.
+  return account.webhookEnabled === true;
 }
 
 const wechatpadproConfigAdapter = {
@@ -140,7 +127,7 @@ const wechatpadproConfigAdapter = {
     // "Is this account enabled in config?" — answered purely from the config section.
     // Config completeness is the separate concern of `isConfigured`. We must NOT
     // call `isConfigured(account)` here because the gateway sometimes invokes
-    // isEnabled with a stub account (no syncMode/host) during introspection paths,
+    // isEnabled with a stub account (no host / no webhookEnabled) during introspection paths,
     // and that stub would falsely report unconfigured → disabled → channel never starts.
     const section = readSection(cfg);
     if (!section) return false;
@@ -214,7 +201,7 @@ const wechatpadproBase = {
         const account = ctx.account as ResolvedAccount;
         if (!isConfigured(account)) {
           ctx.log?.warn?.(
-            "wechatpadpro: account not fully configured, skipping start (need host + adminKey or authcode)",
+            "wechatpadpro: account not fully configured, skipping start (need host + authcode, or webhookEnabled for passive mode)",
           );
           return;
         }
@@ -336,23 +323,18 @@ export async function startWcppRuntime(
 ): Promise<void> {
   client = new WcppClient(
     {
-      adminKey: account.adminKey,
       host: account.host,
       port: account.port,
-      authKey: account.authKey,
       authcode: account.authcode,
       wxid: account.wxid,
       proxy: account.proxy,
       replyWithMention: account.replyWithMention,
-      syncMode: account.syncMode,
       wsUrl: account.wsUrl,
-      syncInterval: account.syncInterval,
+      webhookEnabled: account.webhookEnabled,
       readOnly: account.readOnly,
       allowMsgTypes: account.allowMsgTypes,
       passRevokemsg: account.passRevokemsg,
       maxMessageAge: account.maxMessageAge,
-      newinitOnStart: account.newinitOnStart,
-      wsFallbackThreshold: account.wsFallbackThreshold,
       webhookHost: account.webhookHost,
       webhookPort: account.webhookPort,
       webhookPath: account.webhookPath,
@@ -364,13 +346,16 @@ export async function startWcppRuntime(
     log as any,
   );
 
-  // Login / verify auth
   const creds = await client.login();
   if (!creds) {
     log.error("WeChatPadPro: login/auth failed, channel will not receive messages");
     return;
   }
-  log.info(`WeChatPadPro: authenticated, wxid=${creds.wxid}, mode=${account.syncMode}`);
+  const transports = [
+    account.host ? "websocket" : null,
+    account.webhookEnabled ? "webhook" : null,
+  ].filter(Boolean).join("+") || "none";
+  log.info(`WeChatPadPro: authenticated, wxid=${creds.wxid}, transports=${transports}`);
 
   // Wire up inbound handler (normalized messages)
   client.onMessage = async (msg: NormalizedMessage) => {

@@ -17,8 +17,7 @@ These are the WeChatPadProMax server administrator's responsibility, configured 
 
 **Newinit history (was auto-called, now reverted):**
 - WCPP MAX 0412+ requires `/Login/Newinit` to establish the longlink before any push channel (WS / Webhook / RabbitMQ) actually receives data
-- We briefly auto-called Newinit on startup (`newinitOnStart`), but this re-enters `/Login/*` scope. **Reverted**: the operator runs Newinit manually
-- The `newinitOnStart` config field still exists but is only honored when `host` is set AND syncMode ≠ `webhook`. In passive webhook mode it is ignored
+- We briefly auto-called Newinit on startup, but this re-enters `/Login/*` scope. **Reverted**: the operator runs Newinit manually. The `newinitOnStart` config flag was removed in the transport refactor
 
 **This plugin assumes:**
 - The WeChatPadProMax server is already logged in and online
@@ -84,7 +83,7 @@ A channel plugin is just `{ id, meta, capabilities, configSchema, config, setup,
 When the channel loads, web UI shows `已配置=是 运行中=否` (or CLI shows `disabled, configured` with **no** `error:` field, no `channel exited`, no `channel startup failed`, and zero plugin-internal logs after `gateway ready`), it is almost certainly one of these:
 
 1. **`createChannelPluginBase` silently drops `gateway`.** That helper (`src/plugin-sdk/core.ts:638` in the OpenClaw source) only spreads `id, meta, setup, capabilities, commands, doctor, agentPrompt, streaming, reload, gatewayMethods, configSchema, config, security, groups`. **`gateway` is not in the list.** Putting `gateway: { startAccount, stopAccount }` inside `createChannelPluginBase({...})` makes `plugin.gateway === undefined`, and the gateway short-circuits at `server-channels.ts:292` (`if (!startAccount) return;`) without logging anything. **Fix**: structure like `extensions/twitch/src/plugin.ts` — build a plain base object that includes `gateway` as a sibling of `id/meta/setup/config`, then pass it as `base:` to `createChatChannelPlugin`. See `src/channel.ts:wechatpadproBase`.
-2. **`isEnabled` must not call `isConfigured(account)`.** The gateway probes `plugin.config.isEnabled(account, cfg)` with a stub account where `account.syncMode` and `account.host` are both undefined. If `isEnabled` delegates to `isConfigured(account)`, that stub call returns false → gateway records `enabled: false, lastError: "disabled"` → channel never starts. `isEnabled` must look at `section.enabled !== false` only; configuration completeness is `isConfigured`'s separate concern.
+2. **`isEnabled` must not call `isConfigured(account)`.** The gateway probes `plugin.config.isEnabled(account, cfg)` with a stub account where `account.host` and `account.webhookEnabled` are both undefined. If `isEnabled` delegates to `isConfigured(account)`, that stub call returns false → gateway records `enabled: false, lastError: "disabled"` → channel never starts. `isEnabled` must look at `section.enabled !== false` only; configuration completeness is `isConfigured`'s separate concern.
 
 Diagnosis order: (1) run `openclaw channels status` — if no `running`, the lifecycle is broken (these traps) not the plugin's internal logic. (2) Add `console.error("[trace] startAccount entered")` at the top of `startAccount`. If it never fires, you're hitting trap 1 or one of the silent-return guards in `server-channels.ts:285-396`. (3) Add `console.error` inside `isEnabled` and `isConfigured` to spot stub-account calls.
 
@@ -115,45 +114,31 @@ Full WeChatPadProMAX API documentation is mirrored locally in `docs/api-referenc
 - Covers all modules: Admin, Login, Msg, Friend, Group, FriendCircle, Finder, Tools, Webhook, User, TenPay, Wxapp, OfficialAccounts, Label, etc.
 - Sourced from `https://wx.knowhub.cloud/llms.txt` (Apifox-hosted, can be flaky)
 
-## Four Sync Modes
+## Transport Model
 
-### WS Mode (standard WeChatPadPro)
-- WebSocket at `ws://host:port/ws/GetSyncMsg?key=AUTHKEY`
-- Requires `adminKey` to generate an auth key
-- Real-time push, auto-reconnect
+The plugin supports WCPPM only. The legacy standard-WeChatPadPro path (`/ws/GetSyncMsg` + `adminKey` + QR login) was dropped in the sync-mode refactor; the former `syncMode` enum is gone.
 
-### Sync Mode (WeChatPadProMAX — HTTP polling)
-- HTTP POST to `/api/Msg/Sync?authcode=AUTHCODE`
-- Uses incremental polling with `Synckey` (protobuf base64 from `Data.KeyBuf.buffer`)
-- `ContinueFlag != 0` → more data available, poll again immediately
-- Otherwise wait `syncInterval` ms (default 5000) before next poll
-- Automatically activated when `authcode` is set and `syncMode` is `"sync"`
+### Base: WebSocket push (WCPPM `/ws/sync`)
+- Always active when `host` is set.
+- `ws://{host}:8089/ws/sync?authcode=AUTHCODE` (override with `wsUrl`).
+- Real-time push wrapped in the 20260411+ outer envelope — two shapes (`Data.syncData` / `Data.data`) carry the same inner SyncResponse, so every message is delivered twice; dedup by `MsgId` handles this.
+- `Data.wxid` on the envelope supplies self-wxid without needing ModUserInfos.
+- Auto-reconnects on close. No fallback-to-polling path — the WS was unstable on 0412 but is solid on 0416+; if it ever breaks again, surface the error instead of silently switching transports.
+- This is also the only outbound path: sends always use `/api/Msg/SendTxt` / `/api/Msg/Quote` / etc. via HTTP.
 
-### WebSocket Mode (WeChatPadProMAX — push)
-- WebSocket at `ws://host:8089/ws/sync?authcode=AUTHCODE`
-- Real-time push of messages wrapped in an outer envelope (since WCPP MAX 20260411)
-- Two envelope formats observed: `Data.syncData` and `Data.data` — both contain the same inner SyncResponse
-- Server pushes each message **twice** (once per format); dedup by `MsgId` handles this
-- `Data.wxid` in the `syncData` envelope provides self-wxid without needing ModUserInfos
-- Uses same message processing pipeline as Sync mode
-- Auto-reconnect on disconnect; falls back to Sync polling after `wsFallbackThreshold` consecutive failures (default 3)
-- Set `syncMode: "websocket"` and optionally `wsUrl` for custom URL
-- If `wsUrl` is not set, auto-constructs from `host` as `ws://{host}:8089/ws/sync?authcode={authcode}`
-- **WS confirmed working on WCPP MAX 0416** — the 0412 regression (immediate disconnect, code 1006) is fixed. Connections are stable and authenticated.
+### Additive: webhook receiver (`webhookEnabled: true`)
+- Opt-in extra inbound channel on top of WebSocket. Spins up a local HTTP listener; WCPPM pushes to it via the standard `/Webhook/*` flow.
+- When `host` is set and `webhookUrl` is configured, the plugin auto-calls `/Webhook/Set` on start and `/Webhook/Remove` on stop. If `webhookUrl` is omitted, the plugin still binds the listener but leaves registration to the operator.
+- **Passive webhook-only mode**: set `webhookEnabled: true` with `host` empty. Plugin only binds the listener; `/Login/Newinit` + `/Webhook/Set` are the operator's job, and outbound sends will throw because there's no server to talk to. This is the layout for fully decoupled deployments (unstable WCPPM address, strict separation from `/Login/*`).
+- Default bind is loopback (`127.0.0.1`) to force a reverse proxy as the public entry; set `webhookHost: "0.0.0.0"` to expose directly.
+- Webhook payload envelope: `{ MessageType, Signature, Timestamp, Wxid, IsSelf, Data: { messages: [...] } }`; signature = `HMAC-SHA256(secret, "{Wxid}:{MessageType}:{Timestamp}")` with a 15-minute anti-replay window.
+- Messages are converted to the internal `SyncMessage` shape and routed through the same dedup + filter + normalize pipeline as WS. When both WS and webhook deliver the same message, dedup by `MsgId` drops the duplicate.
+- Limitation: webhook payload has no `MsgSource`, so `<atuserlist>` @bot detection falls back to `pushContent` ("在群聊中@了你") only.
 
-### Webhook Mode (WeChatPadProMAX — HTTP push to us)
-- WCPP MAX pushes messages to our local HTTP server instead of us polling or connecting WS
-- Set `syncMode: "webhook"`, optionally `webhookHost` (default `127.0.0.1`), `webhookPort` (default 8000), `webhookPath` (default `/webhook`) and `webhookSecret`
-- **`host` is optional in webhook mode.** If `host` is set, the plugin auto-registers the webhook via `/Webhook/Set`. If `host` is empty, the plugin runs in **passive mode**: it just binds the local listener; the operator handles registration and Newinit out-of-band. Passive mode is the recommended layout when the WCPP MAX address is unstable (DHCP) or when you want strict separation from `/Login/*` and `/Webhook/Set`
-- `webhookUrl` is only consumed by the auto-registration path; in passive mode it can be omitted
-- **Default bind is loopback (`127.0.0.1`)** to match OpenClaw gateway's own default and force a reverse proxy (e.g. Caddy) as the public entry; set `webhookHost: "0.0.0.0"` to expose directly
-- Webhook payload envelope: `{ MessageType, Signature, Timestamp, Wxid, IsSelf, Data: { messages: [...] } }`
-- Signature verification: `HMAC-SHA256(secret, "{Wxid}:{MessageType}:{Timestamp}")`, anti-replay with 15-minute window
-- Each message has: `fromUser`, `toUser`, `msgType`, `msgId`, `newMsgId`, `createTime`, `text`, `rawContent`, `pushContent`
-- Messages are converted to `SyncMessage` format and fed through the same processing pipeline (dedup, filter, normalize, quote parse, media extract)
-- Limitation: `MsgSource` (used for `<atuserlist>` @bot detection) is not available in webhook format; @bot still works via `pushContent` fallback
-- On disconnect, webhook is automatically removed via `/Webhook/Remove`
-- Tested and confirmed working on WCPP MAX 0416: webhook registration, test delivery, and real message push all functional
+### One-shot: `forceSync()` (manual catch-up)
+- `WcppClient.forceSync()` performs a single `/api/Msg/Sync` pull and drains `ContinueFlag` before returning. No persistent polling loop.
+- Intended for a future "Force refresh" UI action — surfacing it as a user-triggered button is on the roadmap but not wired up today.
+- `login()` already issues a one-off Sync probe on startup to verify the authcode, so initial catch-up happens automatically the first time the channel connects.
 
 ### Webhook Gotchas Confirmed in Production
 
@@ -171,7 +156,7 @@ The plugin manifest + channel config are not enough on their own — OpenClaw ne
 
 **Required:**
 - `plugins.entries.wechatpadpro.enabled: true` — without this the plugin is loaded but skipped (`ui/src/ui/plugin-activation.ts`)
-- `channels.wechatpadpro.{ host, authcode, syncMode, ... }` — the channel account block (per-account `enabled` defaults to `true`)
+- `channels.wechatpadpro.{ host, authcode, webhookEnabled, ... }` — the channel account block (per-account `enabled` defaults to `true`)
 
 **Optional, but worth knowing:**
 - `bindings[]` — *not* required. If no entry matches `{ channel: "wechatpadpro", ... }`, `resolveAgentRoute` falls through to `default` at `src/routing/resolve-route.ts:835` and the message is routed to the default agent. It is **not** silently dropped (`dispatch.ts:76` is just defensive). Add a binding only if you need a non-default agent or per-peer routing.
@@ -293,25 +278,23 @@ Must split on first `:\n` to extract sender and text.
 {
   "channels": {
     "wechatpadpro": {
-      "host": "YOUR_HOST",
+      "host": "YOUR_HOST",               // Required for WebSocket + outbound; empty = passive webhook-only mode
       "port": 8062,
-      "authcode": "...",           // Required for sync/websocket/webhook mode
-      "adminKey": "...",           // Required for WS mode only
-      "syncMode": "webhook",      // "ws" | "sync" | "websocket" | "webhook" (auto-detected from authcode → sync)
-      "wsUrl": "ws://HOST:8089/ws/sync",  // Optional: custom WS URL for websocket mode
-      "syncInterval": 5000,       // Poll interval in ms (sync mode only)
-      "webhookHost": "127.0.0.1", // Bind address for local webhook server (default 127.0.0.1; use 0.0.0.0 to expose directly)
-      "webhookPort": 8000,        // Port for local webhook HTTP server (webhook mode)
-      "webhookPath": "/webhook",  // Path for webhook endpoint (default /webhook)
-      "webhookUrl": "https://your.public.domain:8443/webhook",  // URL to register with WCPP MAX (required for webhook mode)
-      "webhookSecret": "...",     // HMAC-SHA256 secret for webhook signature verification (strongly recommended)
-      "webhookDebug": false,      // On sig mismatch, log signingInput + HMAC prefixes + envelope/header keys; stuff debugMsg into 401 body. Leaks a 12-char HMAC prefix — diagnostic only
-      "webhookSilentDropUnsigned": false,  // If set, 200-and-drop pushes whose body.Signature is empty (escape hatch for a poisoned retry queue). Wrong-but-non-empty sigs still 401
-      "readOnly": true,           // Receive-only, no sending
-      "newinitOnStart": true,     // Call Newinit on startup for longlink (default true, required for 0412+)
-      "wsFallbackThreshold": 3,   // Consecutive WS failures before falling back to sync (default 3)
-      "dmSecurity": "allow-all",  // "allowlist" | "allow-all" | "pairing"
-      "allowFrom": ["wxid_xxx"],  // DM allowlist
+      "authcode": "...",                 // Required whenever host is set
+      "wsUrl": "ws://HOST:8089/ws/sync", // Optional override; auto-constructed from host when empty
+
+      "webhookEnabled": false,           // Also spin up a local webhook listener (additive inbound on top of WS)
+      "webhookUrl": "https://your.public.domain:8443/webhook",  // Auto-registered via /Webhook/Set when host is set
+      "webhookHost": "127.0.0.1",        // Default loopback; use 0.0.0.0 to expose directly
+      "webhookPort": 8000,
+      "webhookPath": "/webhook",
+      "webhookSecret": "...",            // HMAC-SHA256 secret (strongly recommended)
+      "webhookDebug": false,             // Leak diagnostic HMAC prefix on 401 for signature debugging
+      "webhookSilentDropUnsigned": false, // Drain-the-queue escape hatch for unsigned retries
+
+      "readOnly": true,                  // Receive-only, no sending
+      "dmSecurity": "allow-all",         // "allowlist" | "allow-all" | "pairing"
+      "allowFrom": ["wxid_xxx"],
       "allowMsgTypes": [1,3,34,47,48,49],
       "passRevokemsg": true,
       "maxMessageAge": 180
@@ -335,7 +318,7 @@ Based on the available WeChatPadProMAX API, here are candidates for implementati
 | unified media resolver | Let upstream code treat voice/image/video uniformly | ✅ Implemented via `resolveMedia()` / `isMediaMessage()` |
 | channel inbound media integration | Surface media info to upper layers without extra parsing | ✅ Implemented — dispatch `raw` now includes `{ platform, normalized, media }` envelope |
 | attachment-ready media bridge | Prepare media for future OpenClaw attachment ingestion | ✅ Implemented — each resolved media object now exposes `attachment` metadata and `materialize()` |
-| Webhook receive mode | WCPP MAX pushes messages to our HTTP server | ✅ Implemented — `syncMode: "webhook"`, auto-registers via `/Webhook/Set`, HMAC-SHA256 signature verification, converts to SyncMessage and reuses full pipeline |
+| Webhook receive mode | WCPP MAX pushes messages to our HTTP server | ✅ Implemented — `webhookEnabled: true`, auto-registers via `/Webhook/Set` when `host`+`webhookUrl` set, HMAC-SHA256 signature verification, converts to SyncMessage and reuses full pipeline |
 | `/Webhook/Set` / `/Webhook/Get` / `/Webhook/Remove` / `/Webhook/Test` | Manage webhook config on WCPP MAX | ✅ Implemented in client + debug CLI (`webhook-set`, `webhook-get`, `webhook-remove`, `webhook-test`, `webhook-listen`) |
 
 ### High Priority — Core Messaging
@@ -384,7 +367,7 @@ All `/Login/*`, `/Admin/*`, `/User/*` account management APIs.
 
 - Sync polling may return duplicate `PushContent` for the same message (reported by users in the WCPP community) — dedup handles this
 - WCPP MAX authcode is single-use per login session; if the server restarts, a new authcode may be needed
-- `@bot` detection in group chats relies on `<atuserlist>` in `MsgSource` XML — some clients may not include this; webhook mode lacks `MsgSource` entirely, so @bot detection falls back to `pushContent` ("在群聊中@了你") only
+- `@bot` detection in group chats relies on `<atuserlist>` in `MsgSource` XML — some clients may not include this; webhook delivery lacks `MsgSource` entirely, so on webhook-only paths @bot detection falls back to `pushContent` ("在群聊中@了你") only
 - Voice messages (MsgType 34) now have client-side metadata extraction (`bufid`, `fromUserName`, `length`, `msgId`, `voiceurl`, `aeskey`)
 - `downloadVoice(...)` is implemented against `/Tools/DownloadVoice`, but response payload shape is not fully documented, so JSON response decoding is best-effort
 - `downloadImage(...)` / `downloadVideo(...)` are implemented as best-effort helpers using extracted XML metadata (`aesKey`, CDN URLs, md5, lengths, msgId, fromUserName)

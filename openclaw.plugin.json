@@ -3,7 +3,7 @@
   "kind": "channel",
   "channels": ["wechatpadpro"],
   "name": "WeChatPadPro",
-  "description": "OpenClaw channel plugin for WeChatPadPro / WeChatPadProMax",
+  "description": "OpenClaw channel plugin for WeChatPadProMax",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -12,62 +12,44 @@
   "channelConfigs": {
     "wechatpadpro": {
       "label": "WeChatPadPro",
-      "description": "Connect OpenClaw to WeChat via WeChatPadPro / WeChatPadProMax (iPad protocol).",
+      "description": "Connect OpenClaw to WeChat via WeChatPadProMax (iPad protocol). WebSocket is the base transport; webhook can be enabled as an additional inbound channel.",
       "schema": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "host": {
             "type": "string",
-            "description": "WeChatPadPro server host (IP or hostname)"
+            "description": "WeChatPadProMax server host (IP or hostname). Required for outbound; leave empty only for passive webhook-only receivers."
           },
           "port": {
             "type": "number",
-            "description": "WeChatPadPro server port",
+            "description": "WeChatPadProMax HTTP API port",
             "default": 8062
-          },
-          "adminKey": {
-            "type": "string",
-            "description": "WeChatPadPro admin key (required for WS mode only)"
-          },
-          "authKey": {
-            "type": "string",
-            "description": "Pre-generated auth key for standard WCPP (optional, auto-generated if omitted)"
           },
           "authcode": {
             "type": "string",
-            "description": "WeChatPadProMAX authcode (required for sync / websocket / webhook modes)"
+            "description": "WeChatPadProMax authcode"
           },
           "wxid": {
             "type": "string",
-            "description": "WeChat ID (optional; auto-detected from Newinit response)"
-          },
-          "syncMode": {
-            "type": "string",
-            "enum": ["ws", "sync", "websocket", "webhook"],
-            "description": "Message sync mode. Auto-detected from authcode if not set."
-          },
-          "syncInterval": {
-            "type": "number",
-            "description": "Poll interval in ms (sync mode only)",
-            "default": 5000
+            "description": "WeChat ID (optional; auto-detected from Newinit / WS envelope)"
           },
           "wsUrl": {
             "type": "string",
-            "description": "Custom WebSocket URL for websocket mode (auto-constructed from host when empty)"
+            "description": "Custom WebSocket URL (auto-constructed from host as ws://{host}:8089/ws/sync when empty)"
           },
-          "wsFallbackThreshold": {
-            "type": "number",
-            "description": "Consecutive WebSocket failures before falling back to HTTP polling",
-            "default": 3
+          "webhookEnabled": {
+            "type": "boolean",
+            "description": "Additionally run a local HTTP listener and register it with WCPPM so pushes arrive via webhook as well as WebSocket. Duplicates are deduped by MsgId.",
+            "default": false
           },
           "webhookUrl": {
             "type": "string",
-            "description": "URL WCPP MAX will POST messages to (required for webhook mode)"
+            "description": "Public URL WCPPM will POST to (used for auto-registration via /Webhook/Set). Required when webhookEnabled and host is set; ignored in passive webhook-only mode."
           },
           "webhookHost": {
             "type": "string",
-            "description": "Bind address for the local webhook HTTP server (default 127.0.0.1; set to 0.0.0.0 to expose directly without a reverse proxy)",
+            "description": "Bind address for the local webhook HTTP server (default 127.0.0.1; set 0.0.0.0 to expose directly without a reverse proxy)",
             "default": "127.0.0.1"
           },
           "webhookPort": {
@@ -81,7 +63,7 @@
           },
           "webhookSecret": {
             "type": "string",
-            "description": "HMAC-SHA256 secret for webhook signature verification (recommended)"
+            "description": "HMAC-SHA256 secret for webhook signature verification (strongly recommended)"
           },
           "webhookDebug": {
             "type": "boolean",
@@ -92,11 +74,6 @@
             "type": "boolean",
             "description": "If a push arrives with an empty body.Signature, return 200 and drop the messages instead of 401. Escape hatch for draining a WCPPM retry queue built while no secret was configured. Wrong-but-non-empty signatures are still rejected.",
             "default": false
-          },
-          "newinitOnStart": {
-            "type": "boolean",
-            "description": "Call Newinit on startup to establish longlink (required for WCPP MAX 0412+)",
-            "default": true
           },
           "readOnly": {
             "type": "boolean",
@@ -139,60 +116,41 @@
             "type": "string",
             "description": "Proxy URL for outbound HTTP/WS (e.g. socks5://user:pass@host:port)"
           }
-        },
-        "required": ["host"]
+        }
       },
       "uiHints": {
         "host": {
           "label": "Server Host",
           "placeholder": "192.168.1.100",
-          "help": "WeChatPadPro server IP or hostname"
+          "help": "WeChatPadProMax server IP or hostname. Leave empty only for passive webhook-only receivers (no outbound)."
         },
         "port": {
           "label": "Server Port",
           "help": "Default 8062"
         },
-        "adminKey": {
-          "label": "Admin Key",
-          "sensitive": true,
-          "help": "Required only for WS mode (standard WCPP)"
-        },
-        "authKey": {
-          "label": "Auth Key",
-          "sensitive": true,
-          "help": "Pre-generated auth key (optional; auto-generated from adminKey if omitted)"
-        },
         "authcode": {
           "label": "Authcode",
           "sensitive": true,
-          "help": "Required for sync / websocket / webhook modes (WCPP MAX)"
+          "help": "WeChatPadProMax authcode"
         },
         "wxid": {
           "label": "WeChat ID",
-          "help": "Auto-detected from Newinit response when left empty"
-        },
-        "syncMode": {
-          "label": "Sync Mode",
-          "help": "ws = WebSocket (standard WCPP) · sync = HTTP polling · websocket = WS push (MAX) · webhook = HTTP push (MAX)"
-        },
-        "syncInterval": {
-          "label": "Sync Interval (ms)",
-          "help": "Used only when syncMode = sync"
+          "help": "Auto-detected from Newinit response / WS envelope when left empty"
         },
         "wsUrl": {
           "label": "WebSocket URL",
           "placeholder": "ws://host:8089/ws/sync",
+          "advanced": true,
           "help": "Optional override; auto-constructed from host when empty"
         },
-        "wsFallbackThreshold": {
-          "label": "WS Fallback Threshold",
-          "advanced": true,
-          "help": "Consecutive WS failures before falling back to HTTP polling"
+        "webhookEnabled": {
+          "label": "Enable Webhook Receiver",
+          "help": "Also accept inbound pushes over HTTP webhook in addition to WebSocket. Useful as a redundancy layer; duplicates are deduped by MsgId."
         },
         "webhookUrl": {
           "label": "Webhook URL",
           "placeholder": "http://YOUR_IP:8000/webhook",
-          "help": "URL WCPP MAX will POST to (required for webhook mode)"
+          "help": "Public URL WCPPM will POST to. Required when webhookEnabled and host is set."
         },
         "webhookHost": {
           "label": "Webhook Bind Address",
@@ -201,10 +159,12 @@
         },
         "webhookPort": {
           "label": "Webhook Port",
+          "advanced": true,
           "help": "Local HTTP listener port"
         },
         "webhookPath": {
           "label": "Webhook Path",
+          "advanced": true,
           "help": "Endpoint path (default /webhook)"
         },
         "webhookSecret": {
@@ -221,10 +181,6 @@
           "label": "Silently Drop Unsigned Pushes",
           "advanced": true,
           "help": "Workaround for a poisoned WCPPM retry queue. Turn on to drain, then turn off to restore strict signature verification."
-        },
-        "newinitOnStart": {
-          "label": "Newinit on Start",
-          "help": "Activates the longlink dispatch pipeline; required for WCPP MAX 0412+"
         },
         "readOnly": {
           "label": "Read-Only Mode",

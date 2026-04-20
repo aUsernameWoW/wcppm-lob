@@ -1,11 +1,14 @@
 /**
- * WeChatPadPro / WeChatPadProMAX API client.
+ * WeChatPadProMax API client.
  *
- * Supports two modes:
- * 1. WebSocket (standard WeChatPadPro) — `/ws/GetSyncMsg`
- * 2. HTTP Sync polling (WeChatPadProMAX) — `/api/Msg/Sync`
+ * WebSocket push (`/ws/sync`) is the base inbound transport. Webhook (HTTP
+ * push to our local listener) can be enabled as an additional inbound
+ * channel alongside WS — duplicates are deduped by MsgId. Outbound always
+ * uses the MAX `/api/*` HTTP endpoints.
  *
- * Mode is determined by `syncMode` in config.
+ * `forceSync()` exposes a one-shot `/api/Msg/Sync` pull for manual
+ * catch-up (used by the future force-refresh UI action). There is no
+ * persistent polling loop in normal operation.
  */
 
 import WebSocket from "ws";
@@ -18,34 +21,24 @@ import type { Logger } from "openclaw/plugin-sdk/channel-core";
 // ──────────────────────────────────────────────
 
 export interface WcppConfig {
-  adminKey: string;
+  /** WCPPM server host. Required for outbound + WS; may be empty for passive webhook-only receivers. */
   host: string;
   port: number;
-  authKey?: string;
+  /** WCPPM authcode. Required whenever host is set. */
+  authcode?: string;
+  /** Cached self wxid (optional; auto-detected from Newinit / WS envelope). */
   wxid?: string;
   proxy?: string;
   replyWithMention?: boolean;
-  /**
-   * "ws" = WebSocket (standard WCPP /ws/GetSyncMsg)
-   * "sync" = HTTP polling (WCPP MAX /api/Msg/Sync)
-   * "websocket" = WebSocket push (WCPP MAX /ws/sync)
-   * "webhook" = HTTP push from WCPP MAX to our local server
-   */
-  syncMode?: "ws" | "sync" | "websocket" | "webhook";
-  /** WCPP MAX authcode (used instead of key for /api/* endpoints) */
-  authcode?: string;
-  /** Custom WebSocket URL (optional, for WCPP MAX websocket mode) */
+  /** Override WebSocket URL (default: ws://{host}:8089/ws/sync?authcode=…). */
   wsUrl?: string;
-  /** Sync polling interval in ms (default 5000) */
-  syncInterval?: number;
-  /** Port for local webhook HTTP server (default 8000) */
+  /** Also run a local webhook HTTP listener (additional inbound channel on top of WS). */
+  webhookEnabled?: boolean;
   webhookHost?: string;
   webhookPort?: number;
-  /** URL path for webhook endpoint (default "/webhook") */
   webhookPath?: string;
-  /** HMAC-SHA256 secret for webhook signature verification */
   webhookSecret?: string;
-  /** External URL to register with WCPP MAX (required for webhook mode) */
+  /** External URL to register with WCPPM via /Webhook/Set (ignored in passive mode). */
   webhookUrl?: string;
   /**
    * When true, webhook signature mismatches log the full signing input
@@ -64,22 +57,14 @@ export interface WcppConfig {
    * Pushes with a wrong-but-non-empty signature are still rejected with 401.
    */
   webhookSilentDropUnsigned?: boolean;
-  /** Nurturing mode: receive-only, no sending (default false for safety during initial period) */
   readOnly?: boolean;
-  /** Allow these MsgTypes through (default: [1, 3, 34, 47, 49]) */
   allowMsgTypes?: number[];
-  /** Also pass through revokemsg from MsgType 10002? (default true) */
   passRevokemsg?: boolean;
-  /** Max age for messages in seconds — drop older (default 180) */
   maxMessageAge?: number;
-  /** Call Newinit on startup to establish longlink (required for WCPP MAX 0412+) */
-  newinitOnStart?: boolean;
-  /** How many consecutive WS failures before falling back to sync polling (default 3) */
-  wsFallbackThreshold?: number;
 }
 
 export interface WcppCredentials {
-  authKey: string;
+  authcode: string;
   wxid: string;
 }
 
@@ -340,19 +325,6 @@ export type ResolvedMedia =
       materialize: (dir?: string) => Promise<{ filePath: string; mimeType: string; fileName: string }>;
     };
 
-/** Raw WS message from standard WeChatPadPro */
-export interface WcppRawMessage {
-  msg_id: number;
-  new_msg_id?: string;
-  from_user_name: { str: string };
-  to_user_name: { str: string };
-  content: { str: string };
-  push_content?: string;
-  msg_source?: string;
-  msg_type: number;
-  create_time: number;
-}
-
 // ──────────────────────────────────────────────
 // Client
 // ──────────────────────────────────────────────
@@ -360,22 +332,14 @@ export interface WcppRawMessage {
 type MessageHandler = (msg: NormalizedMessage) => void;
 
 export class WcppClient {
-  public authKey: string | null;
   public wxid: string | null;
-  public syncMode: "ws" | "sync" | "websocket" | "webhook";
   private baseUrl: string;
 
-  // WS state
-  private ws: WebSocket | null = null;
-  private wsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
-
-  // Sync polling state
-  private syncTimer: ReturnType<typeof setTimeout> | null = null;
-  private synckey: string; // base64 KeyBuf.buffer for next poll
+  // Sync cursor (used by forceSync and by the login verify call)
+  private synckey: string; // base64 KeyBuf.buffer for next request
   private continueFlag: number;
   private seenMsgIds: Set<string> = new Set();
   private readonly SEEN_MSG_ID_MAX = 10000;
-  private syncRunning = false;
 
   // Webhook state
   private webhookServer: HttpServer | null = null;
@@ -392,13 +356,20 @@ export class WcppClient {
     private log: Logger,
   ) {
     this.config = config;
-    this.authKey = config.authKey ?? null;
     this.wxid = config.wxid ?? null;
-    this.syncMode = config.syncMode ?? "ws";
     this.baseUrl = config.host ? `http://${config.host}:${config.port}` : "";
     this.synckey = "string"; // initial value for first Sync call
     this.continueFlag = 0;
-    this.MAX_WS_FAILURES_BEFORE_FALLBACK = config.wsFallbackThreshold ?? 3;
+  }
+
+  private requireAuthcode(): string {
+    const ac = this.config.authcode;
+    if (!ac) throw new Error("WCPPM: authcode is required");
+    return ac;
+  }
+
+  private authQuery(): string {
+    return `authcode=${this.requireAuthcode()}`;
   }
 
   // ──────────────────────────────────────────────
@@ -414,162 +385,49 @@ export class WcppClient {
   }
 
   // ──────────────────────────────────────────────
-  // Auth & Login (standard WCPP endpoints)
+  // Auth & Login
   // ──────────────────────────────────────────────
 
-  async generateAuthKey(): Promise<string | null> {
-    const url = `${this.baseUrl}/admin/GenAuthKey1?key=${this.config.adminKey}`;
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ Count: 1, Days: 365 }),
-      });
-      const data = (await res.json()) as any;
-      if (data.Code === 200 && data.Data) {
-        const key = this.extractAuthKey(data.Data);
-        if (key) { this.authKey = key; return key; }
-      }
-      return null;
-    } catch (e) {
-      this.log.error("WCPP: error generating auth key", e);
-      return null;
-    }
-  }
-
-  private extractAuthKey(data: unknown): string | null {
-    if (Array.isArray(data) && data.length > 0) return data[0];
-    if (typeof data === "object" && data !== null) {
-      const obj = data as Record<string, unknown>;
-      if (Array.isArray(obj.authKeys) && obj.authKeys.length > 0)
-        return obj.authKeys[0] as string;
-    }
-    return null;
-  }
-
-  async checkOnlineStatus(): Promise<boolean> {
-    if (!this.authKey) return false;
-    try {
-      const res = await fetch(`${this.baseUrl}/login/GetLoginStatus?key=${this.authKey}`);
-      const data = (await res.json()) as any;
-      if (data.Code === 200 && data.Data?.loginState === 1) return true;
-      if (data.Code === -2) this.authKey = null;
-      return false;
-    } catch { return false; }
-  }
-
-  async getLoginQrCode(): Promise<string | null> {
-    if (!this.authKey) return null;
-    const payload: Record<string, unknown> = { Check: false };
-    if (this.config.proxy) payload.Proxy = this.config.proxy;
-    try {
-      const res = await fetch(`${this.baseUrl}/login/GetLoginQrCodeNew?key=${this.authKey}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const data = (await res.json()) as any;
-      return data.Code === 200 ? data.Data?.QrCodeUrl ?? null : null;
-    } catch (e) {
-      this.log.error("WCPP: error getting QR code", e);
-      return null;
-    }
-  }
-
-  async checkLoginStatus(): Promise<WcppCredentials | null> {
-    if (!this.authKey) return null;
-    for (let i = 0; i < 36; i++) {
-      try {
-        const res = await fetch(`${this.baseUrl}/login/CheckLoginStatus?key=${this.authKey}`);
-        const data = (await res.json()) as any;
-        if (data.Code === 200 && data.Data?.state != null) {
-          if (data.Data.state === 2) {
-            this.wxid = data.Data.wxid;
-            return { authKey: this.authKey, wxid: this.wxid! };
-          }
-          if (data.Data.state === -2) return null;
-        }
-      } catch { /* retry */ }
-      await new Promise(r => setTimeout(r, 5000));
-    }
-    return null;
-  }
-
-  async wakeUpLogin(): Promise<boolean> {
-    if (!this.authKey) return false;
-    try {
-      const res = await fetch(`${this.baseUrl}/login/WakeUpLogin?key=${this.authKey}`, { method: "POST" });
-      const data = (await res.json()) as any;
-      return data.Code === 200;
-    } catch { return false; }
-  }
-
   /**
-   * Full login orchestration. Returns credentials on success.
+   * Verify the configured authcode is usable.
+   *
+   * Passive webhook-only mode (no host): we cannot and must not contact the
+   * server — /Login/Newinit and /Webhook/Set are the operator's job. Return
+   * a synthetic credentials object so the gateway treats the channel as up.
+   *
+   * Active mode (host set): skip /Login/Newinit (that stays the operator's
+   * responsibility — see CLAUDE.md "Scope & Responsibilities") and verify
+   * the authcode via a single /api/Msg/Sync probe.
    */
   async login(): Promise<WcppCredentials | null> {
-    // Webhook mode is a passive receiver. If host is not provided we cannot (and must not)
-    // talk to the WCPP MAX server at all — registration, Newinit, contact lookup, etc.
-    // are entirely the operator's responsibility (out-of-band Swagger/curl).
-    if (this.syncMode === "webhook" && !this.config.host) {
-      this.log.info("WCPP MAX: webhook passive mode (no host configured); skipping login/Newinit");
-      return { authKey: this.config.authcode ?? "", wxid: this.wxid ?? "unknown" };
+    if (!this.config.host) {
+      this.log.info("WCPPM: passive webhook-only mode (no host); skipping server verification");
+      return { authcode: this.config.authcode ?? "", wxid: this.wxid ?? "unknown" };
     }
 
-    // For sync/websocket/webhook mode with authcode
-    if ((this.syncMode === "sync" || this.syncMode === "websocket" || this.syncMode === "webhook") && this.config.authcode) {
-      // Call Newinit first if configured (required for WCPP MAX 0412+ longlink)
-      if (this.config.newinitOnStart !== false) {
-        const initResult = await this.newinit();
-        if (initResult) {
-          if (initResult.wxid) this.wxid = initResult.wxid;
-          // Use the Newinit synckey as initial cursor
-          if (initResult.currentSynckey) this.synckey = initResult.currentSynckey;
-        } else {
-          this.log.warn("WCPP MAX: Newinit failed, falling back to Sync test");
-        }
-      }
-
-      // Verify via a test Sync request
-      const testResult = await this.doSyncRequest();
-      if (testResult && testResult.Success) {
-        if (testResult.Data?.ModUserInfos?.[0]) {
-          this.wxid = testResult.Data.ModUserInfos[0].UserName.string;
-          this.log.info(`WCPP MAX: sync test OK, wxid=${this.wxid}`);
-          this.ingestContacts(testResult);
-          if (testResult.Data.KeyBuf?.buffer) {
-            this.synckey = testResult.Data.KeyBuf.buffer;
-          }
-          return { authKey: this.config.authcode!, wxid: this.wxid! };
-        }
-        this.log.info("WCPP MAX: sync test OK but no ModUserInfos");
-        return { authKey: this.config.authcode!, wxid: this.wxid ?? "unknown" };
-      }
-      this.log.error("WCPP MAX: sync test failed, authcode may be invalid");
+    if (!this.config.authcode) {
+      this.log.error("WCPPM: authcode is required when host is set");
       return null;
     }
 
-    // Standard WCPP login flow
-    if (await this.checkOnlineStatus() && this.authKey && this.wxid) {
-      return { authKey: this.authKey, wxid: this.wxid };
+    const testResult = await this.doSyncRequest();
+    if (!testResult || !testResult.Success) {
+      this.log.error("WCPPM: sync probe failed, authcode may be invalid");
+      return null;
     }
 
-    if (this.authKey && this.wxid) {
-      const woke = await this.wakeUpLogin();
-      if (woke && await this.checkOnlineStatus()) {
-        return { authKey: this.authKey, wxid: this.wxid };
+    if (testResult.Data?.ModUserInfos?.[0]) {
+      this.wxid = testResult.Data.ModUserInfos[0].UserName.string;
+      this.log.info(`WCPPM: sync probe OK, wxid=${this.wxid}`);
+      this.ingestContacts(testResult);
+      if (testResult.Data.KeyBuf?.buffer) {
+        this.synckey = testResult.Data.KeyBuf.buffer;
       }
+      return { authcode: this.config.authcode, wxid: this.wxid! };
     }
 
-    if (!this.authKey) {
-      const key = await this.generateAuthKey();
-      if (!key) return null;
-    }
-
-    const qrUrl = await this.getLoginQrCode();
-    if (!qrUrl) return null;
-    this.log.info(`WCPP: scan QR code to login: ${qrUrl}`);
-    return this.checkLoginStatus();
+    this.log.info("WCPPM: sync probe OK but no ModUserInfos");
+    return { authcode: this.config.authcode, wxid: this.wxid ?? "unknown" };
   }
 
   // ──────────────────────────────────────────────
@@ -631,7 +489,7 @@ export class WcppClient {
   // ──────────────────────────────────────────────
 
   private async doSyncRequest(): Promise<SyncResponse | null> {
-    const authcode = this.config.authcode ?? this.authKey;
+    const authcode = this.config.authcode;
     if (!authcode) return null;
 
     const url = `${this.baseUrl}/api/Msg/Sync?authcode=${authcode}`;
@@ -1053,174 +911,33 @@ export class WcppClient {
   }
 
   /**
-   * Start the Sync polling loop.
+   * Run a one-shot /api/Msg/Sync pull and feed the result through the
+   * standard dedup + filter + normalize pipeline. Follows `ContinueFlag`
+   * so a single call drains all backlog.
+   *
+   * Intended for manual catch-up (e.g. a future force-refresh UI action).
+   * Normal inbound flow runs over WebSocket and optionally webhook.
    */
-  startSyncPolling(): void {
-    if (this.syncRunning) return;
-    this.syncRunning = true;
-    this.log.info("WCPP MAX: starting Sync polling loop");
-    this.pollOnce();
-  }
-
-  stopSyncPolling(): void {
-    this.syncRunning = false;
-    if (this.syncTimer) {
-      clearTimeout(this.syncTimer);
-      this.syncTimer = null;
-    }
-    this.log.info("WCPP MAX: stopped Sync polling");
-  }
-
-  private async pollOnce(): Promise<void> {
-    if (!this.syncRunning) return;
-
-    try {
+  async forceSync(): Promise<boolean> {
+    for (;;) {
       const resp = await this.doSyncRequest();
-      if (resp?.Success && resp.Data) {
-        this.processSyncResponse(resp);
-
-        // If ContinueFlag != 0, there's more data — poll again immediately
-        if (this.continueFlag !== 0) {
-          this.log.debug("WCPP MAX: ContinueFlag != 0, polling again immediately");
-          setImmediate(() => this.pollOnce());
-          return;
-        }
-      } else if (resp && !resp.Success) {
-        this.log.warn(`WCPP MAX: Sync returned !Success: Code=${resp.Code} Message=${resp.Message}`);
+      if (!resp) return false;
+      if (!resp.Success) {
+        this.log.warn(`WCPPM: forceSync Sync returned !Success: Code=${resp.Code} Message=${resp.Message}`);
+        return false;
       }
-    } catch (e) {
-      this.log.error("WCPP MAX: poll error", e);
-    }
-
-    // Schedule next poll
-    const interval = this.config.syncInterval ?? 5000;
-    this.syncTimer = setTimeout(() => this.pollOnce(), interval);
-  }
-
-  // ──────────────────────────────────────────────
-  // WebSocket (standard WCPP)
-  // ──────────────────────────────────────────────
-
-  connectWebSocket(): void {
-    if (!this.authKey) {
-      this.log.error("WCPP: cannot connect WS without auth key");
-      return;
-    }
-
-    const wsUrl = `ws://${this.config.host}:${this.config.port}/ws/GetSyncMsg?key=${this.authKey}`;
-    this.log.info(`WCPP: connecting WebSocket to ${this.config.host}:${this.config.port}`);
-
-    this.ws = new WebSocket(wsUrl);
-
-    this.ws.on("open", () => this.log.info("WCPP: WebSocket connected"));
-
-    this.ws.on("message", (raw: WebSocket.Data) => {
-      try {
-        const parsed = JSON.parse(raw.toString()) as WcppRawMessage;
-        if (parsed.msg_id != null && parsed.from_user_name?.str) {
-          const normalized = this.normalizeWsMessage(parsed);
-          if (normalized) this._onMessage?.(normalized);
-        }
-      } catch { /* ignore */ }
-    });
-
-    this.ws.on("close", (code) => {
-      this.log.warn(`WCPP: WebSocket closed (code=${code}), reconnecting in 5s...`);
-      this.scheduleWsReconnect();
-    });
-
-    this.ws.on("error", (err) => this.log.error("WCPP: WebSocket error", err));
-
-    // Keepalive
-    const pingInterval = setInterval(() => {
-      if (this.ws?.readyState === WebSocket.OPEN) {
-        this.ws.ping();
-      } else {
-        clearInterval(pingInterval);
-      }
-    }, 30_000);
-  }
-
-  private normalizeWsMessage(msg: WcppRawMessage): NormalizedMessage | null {
-    const fromUser = msg.from_user_name?.str ?? "";
-    const content = msg.content?.str ?? "";
-    const pushContent = msg.push_content ?? "";
-    const msgSource = msg.msg_source ?? "";
-
-    if (fromUser === this.wxid) return null; // drop own messages
-
-    const isGroup = fromUser.includes("@chatroom");
-    let senderWxid = fromUser;
-    let text = content;
-    let groupId: string | null = null;
-    let isAtBot = false;
-
-    if (isGroup) {
-      groupId = fromUser;
-      const colonIdx = content.indexOf(":\n");
-      if (colonIdx > 0) {
-        senderWxid = content.substring(0, colonIdx);
-        text = content.substring(colonIdx + 2);
-      }
-      if (this.wxid) {
-        isAtBot =
-          msgSource.includes(`<atuserlist>${this.wxid}</atuserlist>`) ||
-          msgSource.includes(`<atuserlist>${this.wxid},`) ||
-          msgSource.includes(`,${this.wxid}</atuserlist>`);
-      }
-    }
-
-    const quote = msg.msg_type === 49 ? this.parseQuoteMessage(text) : null;
-
-    text = this.formatInboundDisplayText(msg.msg_type, text);
-
-    return {
-      msgId: String(msg.new_msg_id ?? msg.msg_id),
-      fromUser,
-      toUser: msg.to_user_name?.str ?? "",
-      msgType: msg.msg_type,
-      content,
-      pushContent,
-      msgSource,
-      createTime: msg.create_time,
-      senderWxid,
-      text,
-      isGroup,
-      groupId,
-      isAtBot,
-      quote,
-      raw: msg,
-    };
-  }
-
-  private scheduleWsReconnect(): void {
-    if (this.wsReconnectTimer) return;
-    this.wsReconnectTimer = setTimeout(() => {
-      this.wsReconnectTimer = null;
-      this.connectWebSocket();
-    }, 5000);
-  }
-
-  disconnectWebSocket(): void {
-    if (this.wsReconnectTimer) {
-      clearTimeout(this.wsReconnectTimer);
-      this.wsReconnectTimer = null;
-    }
-    if (this.ws) {
-      this.ws.removeAllListeners();
-      this.ws.close();
-      this.ws = null;
+      if (resp.Data) this.processSyncResponse(resp);
+      if (this.continueFlag === 0) return true;
+      this.log.debug("WCPPM: forceSync ContinueFlag != 0, pulling again");
     }
   }
 
   // ──────────────────────────────────────────────
-  // WebSocket for WCPP MAX (push mode)
+  // WebSocket (WCPPM push — base inbound transport)
   // ──────────────────────────────────────────────
 
   private maxWs: WebSocket | null = null;
   private maxWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private maxWsConsecutiveFailures = 0;
-  private MAX_WS_FAILURES_BEFORE_FALLBACK = 3;
 
   connectMaxWebSocket(): void {
     const authcode = this.config.authcode;
@@ -1237,7 +954,6 @@ export class WcppClient {
 
     this.maxWs.on("open", () => {
       this.log.info("WCPP MAX: WebSocket connected");
-      this.maxWsConsecutiveFailures = 0;
     });
 
     this.maxWs.on("message", (raw: WebSocket.Data) => {
@@ -1303,17 +1019,6 @@ export class WcppClient {
     });
 
     this.maxWs.on("close", (code) => {
-      this.maxWsConsecutiveFailures++;
-      if (this.maxWsConsecutiveFailures >= this.MAX_WS_FAILURES_BEFORE_FALLBACK) {
-        this.log.warn(
-          `WCPP MAX: WebSocket failed ${this.maxWsConsecutiveFailures} times consecutively, ` +
-          `falling back to Sync polling mode`
-        );
-        this.disconnectMaxWebSocket();
-        this.syncMode = "sync";
-        this.startSyncPolling();
-        return;
-      }
       this.log.warn(`WCPP MAX: WebSocket closed (code=${code}), reconnecting in 5s...`);
       this.scheduleMaxWsReconnect();
     });
@@ -1624,30 +1329,32 @@ export class WcppClient {
   // Unified connect/disconnect
   // ──────────────────────────────────────────────
 
+  /**
+   * Bring up inbound transports:
+   *   - host set              → WebSocket push (base inbound + required for outbound)
+   *   - webhookEnabled        → also start local webhook listener
+   *   - host + webhookEnabled → auto-register the webhook with WCPPM via /Webhook/Set
+   *   - no host + webhookEnabled → passive webhook-only mode; outbound will throw
+   */
   connect(): void {
-    if (this.syncMode === "webhook") {
-      this.startWebhookServer();
-      // Auto-register only if host is configured. In passive mode (no host) the operator
-      // is expected to call /Webhook/Set + /Login/Newinit out-of-band.
-      if (this.config.host) {
-        this.registerWebhook();
-      } else {
-        this.log.info("WCPP MAX: webhook passive mode; skipping /Webhook/Set (operator-managed)");
-      }
-    } else if (this.syncMode === "sync") {
-      this.startSyncPolling();
-    } else if (this.syncMode === "websocket") {
+    if (this.config.host) {
       this.connectMaxWebSocket();
-    } else {
-      this.connectWebSocket();
+    }
+    if (this.config.webhookEnabled) {
+      this.startWebhookServer();
+      if (this.config.host && this.config.webhookUrl) {
+        this.registerWebhook();
+      } else if (this.config.host) {
+        this.log.info("WCPPM: webhookEnabled but no webhookUrl set; skipping /Webhook/Set (operator-managed)");
+      } else {
+        this.log.info("WCPPM: passive webhook-only mode; /Webhook/Set + /Login/Newinit are operator-managed");
+      }
     }
   }
 
   disconnect(): void {
-    this.stopSyncPolling();
-    this.disconnectWebSocket();
     this.disconnectMaxWebSocket();
-    if (this.config.host) {
+    if (this.config.host && this.config.webhookEnabled) {
       this.removeWebhook();
     }
     this.stopWebhookServer();
@@ -1659,63 +1366,34 @@ export class WcppClient {
 
   async sendText(to: string, text: string): Promise<boolean> {
     if (this.config.readOnly) {
-      this.log.warn("WCPP: read-only mode active, not sending message");
+      this.log.warn("WCPPM: read-only mode active, not sending message");
       return false;
     }
 
-    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket" || this.syncMode === "webhook")
-      ? `authcode=${this.config.authcode}`
-      : `key=${this.authKey}`;
-
-    // Try MAX endpoint first (0412 API uses ToWxid + Type: 1)
-    const maxUrl = `${this.baseUrl}/api/Msg/SendTxt?${authParam}`;
-    const maxPayload = {
-      ToWxid: to,
-      Content: text,
-      Type: 1,
-    };
-
+    const url = `${this.baseUrl}/api/Msg/SendTxt?${this.authQuery()}`;
     try {
-      const res = await fetch(maxUrl, {
+      const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(maxPayload),
+        body: JSON.stringify({ ToWxid: to, Content: text, Type: 1 }),
       });
       const data = (await res.json()) as any;
       if (data.Code === 0 || data.Code === 200) return true;
-      // Fall through to standard endpoint
-    } catch {
-      // Fall through to standard endpoint
-    }
-
-    // Standard WCPP endpoint
-    const stdUrl = `${this.baseUrl}/message/SendTextMessage?${authParam}`;
-    try {
-      const res = await fetch(stdUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          MsgItem: [{ MsgType: 1, TextContent: text, ToUserName: to }],
-        }),
-      });
-      const data = (await res.json()) as any;
-      return data.Code === 200;
+      this.log.warn("WCPPM: SendTxt returned non-success", data);
+      return false;
     } catch (e) {
-      this.log.error("WCPP: error sending text", e);
+      this.log.error("WCPPM: error sending text", e);
       return false;
     }
   }
 
   async sendImage(to: string, base64Data: string): Promise<boolean> {
     if (this.config.readOnly) {
-      this.log.warn("WCPP: read-only mode active, not sending image");
+      this.log.warn("WCPPM: read-only mode active, not sending image");
       return false;
     }
 
-    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket" || this.syncMode === "webhook")
-      ? `authcode=${this.config.authcode}`
-      : `key=${this.authKey}`;
-    const url = `${this.baseUrl}/message/SendImageNewMessage?${authParam}`;
+    const url = `${this.baseUrl}/message/SendImageNewMessage?${this.authQuery()}`;
 
     try {
       const res = await fetch(url, {
@@ -1794,10 +1472,7 @@ export class WcppClient {
     payload: Record<string, unknown>,
     outputPath?: string,
   ): Promise<MediaDownloadResult> {
-    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket" || this.syncMode === "webhook")
-      ? `authcode=${this.config.authcode}`
-      : `key=${this.authKey}`;
-    const url = `${this.baseUrl}${endpoint}?${authParam}`;
+    const url = `${this.baseUrl}${endpoint}?${this.authQuery()}`;
 
     const res = await fetch(url, {
       method: "POST",
@@ -1972,11 +1647,7 @@ export class WcppClient {
 
     // Quote API (WCPP MAX /api/Msg/Quote)
     // Fields: ToWxid, Fromusr (quoted sender), Displayname, NewMsgId, QuoteContent, MsgContent
-    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket" || this.syncMode === "webhook")
-      ? `authcode=${this.config.authcode}`
-      : `key=${this.authKey}`;
-
-    const url = `${this.baseUrl}/api/Msg/Quote?${authParam}`;
+    const url = `${this.baseUrl}/api/Msg/Quote?${this.authQuery()}`;
     const payload: Record<string, unknown> = {
       ToWxid: to,
       MsgContent: text,
@@ -2012,12 +1683,8 @@ export class WcppClient {
     const cached = this.contactCache.get(memberWxid);
     if (cached?.NickName?.string) return cached.NickName.string;
 
-    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket" || this.syncMode === "webhook")
-      ? `authcode=${this.config.authcode}`
-      : `key=${this.authKey}`;
-
     try {
-      const res = await fetch(`${this.baseUrl}/group/GetChatroomMemberDetail?${authParam}`, {
+      const res = await fetch(`${this.baseUrl}/group/GetChatroomMemberDetail?${this.authQuery()}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ChatRoomName: groupId }),
@@ -2034,12 +1701,8 @@ export class WcppClient {
   }
 
   async getContactList(): Promise<string[] | null> {
-    const authParam = (this.syncMode === "sync" || this.syncMode === "websocket" || this.syncMode === "webhook")
-      ? `authcode=${this.config.authcode}`
-      : `key=${this.authKey}`;
-
     try {
-      const res = await fetch(`${this.baseUrl}/friend/GetContactList?${authParam}`, {
+      const res = await fetch(`${this.baseUrl}/friend/GetContactList?${this.authQuery()}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ CurrentChatRoomContactSeq: 0, CurrentWxcontactSeq: 0 }),
