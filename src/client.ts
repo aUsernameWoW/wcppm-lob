@@ -54,6 +54,16 @@ export interface WcppConfig {
    * NOT enable in production since it narrows brute-force space on the secret.
    */
   webhookDebug?: boolean;
+  /**
+   * When true, a push whose body.Signature is EMPTY (gotLen=0) is silently
+   * 200'd and its messages are dropped rather than dispatched. This is the
+   * escape hatch for draining a retry queue that was built during a window
+   * when webhookSecret wasn't set on the WCPPM side — those payloads never
+   * had a signature to begin with and will 401 forever otherwise.
+   *
+   * Pushes with a wrong-but-non-empty signature are still rejected with 401.
+   */
+  webhookSilentDropUnsigned?: boolean;
   /** Nurturing mode: receive-only, no sending (default false for safety during initial period) */
   readOnly?: boolean;
   /** Allow these MsgTypes through (default: [1, 3, 34, 47, 49]) */
@@ -1374,6 +1384,20 @@ export class WcppClient {
           if (this.config.webhookSecret) {
             const verdict = this.verifyWebhookSignature(envelope, this.config.webhookSecret);
             if (!verdict.ok) {
+              // Silent-drop escape hatch: empty signature field means the
+              // push was enqueued before a secret was configured on WCPPM.
+              // Accept + drop so WCPPM removes it from the retry queue, but
+              // do NOT run it through the agent pipeline.
+              if (verdict.gotLen === 0 && this.config.webhookSilentDropUnsigned === true) {
+                const n = envelope.Data?.messages?.length ?? 0;
+                this.log.warn(
+                  `WCPP MAX: silently dropping unsigned push ` +
+                  `(ts=${envelope.Timestamp}, age=${Math.round(Date.now() / 1000 - envelope.Timestamp)}s, msgCount=${n})`
+                );
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ ok: true, dropped: true, reason: "unsigned" }));
+                return;
+              }
               const debug = this.config.webhookDebug === true;
               if (debug) {
                 // Include envelope top-level keys and request headers so we

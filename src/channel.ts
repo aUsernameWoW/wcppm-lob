@@ -43,6 +43,7 @@ export interface ResolvedAccount {
   webhookSecret?: string;
   webhookUrl?: string;
   webhookDebug?: boolean;
+  webhookSilentDropUnsigned?: boolean;
 }
 
 const DEFAULT_ACCOUNT_ID = "default";
@@ -89,6 +90,7 @@ function resolveAccount(
     webhookSecret: section.webhookSecret,
     webhookUrl: section.webhookUrl,
     webhookDebug: section.webhookDebug,
+    webhookSilentDropUnsigned: section.webhookSilentDropUnsigned,
   };
 }
 
@@ -357,6 +359,7 @@ export async function startWcppRuntime(
       webhookSecret: account.webhookSecret,
       webhookUrl: account.webhookUrl,
       webhookDebug: account.webhookDebug,
+      webhookSilentDropUnsigned: account.webhookSilentDropUnsigned,
     },
     log as any,
   );

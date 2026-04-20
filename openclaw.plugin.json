@@ -88,6 +88,11 @@
             "description": "On signature mismatch, log full signing input and return diagnostic fields in 401 body. Leaks a 12-char HMAC prefix — disable in production.",
             "default": false
           },
+          "webhookSilentDropUnsigned": {
+            "type": "boolean",
+            "description": "If a push arrives with an empty body.Signature, return 200 and drop the messages instead of 401. Escape hatch for draining a WCPPM retry queue built while no secret was configured. Wrong-but-non-empty signatures are still rejected.",
+            "default": false
+          },
           "newinitOnStart": {
             "type": "boolean",
             "description": "Call Newinit on startup to establish longlink (required for WCPP MAX 0412+)",
@@ -211,6 +216,11 @@
           "label": "Webhook Debug Mode",
           "advanced": true,
           "help": "Enable only while diagnosing signature failures — leaks a 12-char HMAC prefix in logs and 401 bodies."
+        },
+        "webhookSilentDropUnsigned": {
+          "label": "Silently Drop Unsigned Pushes",
+          "advanced": true,
+          "help": "Workaround for a poisoned WCPPM retry queue. Turn on to drain, then turn off to restore strict signature verification."
         },
         "newinitOnStart": {
           "label": "Newinit on Start",
