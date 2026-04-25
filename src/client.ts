@@ -414,13 +414,17 @@ export class WcppClient {
       return null;
     }
 
+    // KeyBuf is the sync cursor — must be picked up from ANY successful Sync,
+    // not gated on ModUserInfos. Without this, synckey stays as the "string"
+    // placeholder forever and forceSync sends a meaningless WS frame.
+    if (testResult.Data?.KeyBuf?.buffer) {
+      this.synckey = testResult.Data.KeyBuf.buffer;
+    }
+
     if (testResult.Data?.ModUserInfos?.[0]) {
       this.wxid = testResult.Data.ModUserInfos[0].UserName.string;
       this.log.info(`WCPPM: sync probe OK, wxid=${this.wxid}`);
       this.ingestContacts(testResult);
-      if (testResult.Data.KeyBuf?.buffer) {
-        this.synckey = testResult.Data.KeyBuf.buffer;
-      }
       return { authcode: this.config.authcode, wxid: this.wxid! };
     }
 
@@ -972,6 +976,12 @@ export class WcppClient {
         if (!this.wxid && envelope.Data.wxid) {
           this.wxid = envelope.Data.wxid;
           this.log.info(`WCPP MAX: detected wxid=${this.wxid} from WS envelope`);
+        }
+
+        // Track sync cursor — needed so forceSync can echo a meaningful Synckey
+        // back over the WS instead of the "string" placeholder.
+        if (inner.Data.KeyBuf?.buffer) {
+          this.synckey = inner.Data.KeyBuf.buffer;
         }
 
         // Process the unwrapped SyncResponse
