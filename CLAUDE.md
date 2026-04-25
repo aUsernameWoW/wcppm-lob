@@ -158,7 +158,8 @@ The plugin supports WCPPM only. The legacy standard-WeChatPadPro path (`/ws/GetS
 
 ### One-shot: `forceSync()` (manual catch-up)
 - `WcppClient.forceSync()` performs a single `/api/Msg/Sync` pull and drains `ContinueFlag` before returning. No persistent polling loop.
-- Intended for a future "Force refresh" UI action — surfacing it as a user-triggered button is on the roadmap but not wired up today.
+- Operator-triggered via the gateway RPC method `wechatpadpro.forceSync` (registered in `src/index.ts:registerFull`). Reach it with `openclaw gateway call wechatpadpro.forceSync` — responds `{ drained: true }` on success, `{ error: "channel not running" }` if the runtime isn't up. Drained messages flow through the normal dedup + filter + dispatch pipeline (same as WS/webhook), so the agent will reply to anything new just as if it arrived via push.
+- No web-UI button surface today: OpenClaw's `/channels` page renders per-channel cards via a hard-coded switch (`ui/src/ui/views/channels.ts:109-182`) and there's no plugin hook to contribute UI elements. Adding a real button would require an OpenClaw core change to make `renderChannel` plugin-extensible.
 - `login()` already issues a one-off Sync probe on startup to verify the authcode, so initial catch-up happens automatically the first time the channel connects.
 
 ### Webhook Gotchas Confirmed in Production

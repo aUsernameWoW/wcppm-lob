@@ -3,15 +3,35 @@
  */
 
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
-import { wechatpadproPlugin } from "./channel.js";
+import { wechatpadproPlugin, getWcppClient } from "./channel.js";
 
 export default defineChannelPluginEntry({
   id: "wechatpadpro",
   name: "WeChatPadPro",
   description: "OpenClaw channel plugin for WeChat via WeChatPadPro / WeChatPadProMax",
   plugin: wechatpadproPlugin,
-  registerFull(api) {
-    // TODO: register gateway method for login QR code display
-    // TODO: register HTTP route for webhook if needed
+  registerFull(api: any) {
+    // Manual catch-up trigger: drain a single /api/Msg/Sync round (following
+    // ContinueFlag) into the normal inbound pipeline. WS push is the base
+    // transport, so this is the operator's escape hatch when push has gone
+    // quiet but the WCPPM longlink is still up. No web-UI button surface
+    // exists today (channel cards in OpenClaw's UI are hard-coded), so this
+    // is reachable via `openclaw gateway call wechatpadpro.forceSync`.
+    api.registerGatewayMethod(
+      "wechatpadpro.forceSync",
+      async ({ respond }: { respond: (ok: boolean, payload?: unknown) => void }) => {
+        const client = getWcppClient();
+        if (!client) {
+          respond(false, { error: "channel not running" });
+          return;
+        }
+        try {
+          const drained = await client.forceSync();
+          respond(true, { drained });
+        } catch (err) {
+          respond(false, { error: err instanceof Error ? err.message : String(err) });
+        }
+      },
+    );
   },
 });
