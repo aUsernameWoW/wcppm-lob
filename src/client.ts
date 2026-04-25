@@ -919,7 +919,13 @@ export class WcppClient {
       return { triggered: false, reason: "WebSocket not connected" };
     }
     const frame = JSON.stringify({ Scene: 0, Synckey: this.synckey });
-    this.maxWs.send(frame);
+    try {
+      this.maxWs.send(frame);
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e);
+      this.log.warn(`WCPPM: forceSync WS send failed: ${reason}`);
+      return { triggered: false, reason };
+    }
     this.log.info("WCPPM: forceSync request sent over WS");
     return { triggered: true };
   }
