@@ -335,9 +335,8 @@ export class WcppClient {
   public wxid: string | null;
   private baseUrl: string;
 
-  // Sync cursor (used by forceSync and by the login verify call)
+  // Sync cursor (used by forceSync WS frames and by the login verify call)
   private synckey: string; // base64 KeyBuf.buffer for next request
-  private continueFlag: number;
   private seenMsgIds: Set<string> = new Set();
   private readonly SEEN_MSG_ID_MAX = 10000;
 
@@ -359,7 +358,6 @@ export class WcppClient {
     this.wxid = config.wxid ?? null;
     this.baseUrl = config.host ? `http://${config.host}:${config.port}` : "";
     this.synckey = "string"; // initial value for first Sync call
-    this.continueFlag = 0;
   }
 
   private requireAuthcode(): string {
@@ -522,9 +520,6 @@ export class WcppClient {
     if (resp.Data.KeyBuf?.buffer) {
       this.synckey = resp.Data.KeyBuf.buffer;
     }
-
-    // Update continue flag
-    this.continueFlag = resp.Data.ContinueFlag ?? 0;
 
     // Cache contacts
     this.ingestContacts(resp);
@@ -911,25 +906,22 @@ export class WcppClient {
   }
 
   /**
-   * Run a one-shot /api/Msg/Sync pull and feed the result through the
-   * standard dedup + filter + normalize pipeline. Follows `ContinueFlag`
-   * so a single call drains all backlog.
+   * Ask WCPPM to push pending sync data over the WebSocket connection we
+   * already have open. Sends a single Sync request frame on the existing WS;
+   * WCPPM responds via the normal push path so results flow back through our
+   * existing on("message") handler — same dedup / filter / normalize pipeline
+   * as live push.
    *
-   * Intended for manual catch-up (e.g. a future force-refresh UI action).
-   * Normal inbound flow runs over WebSocket and optionally webhook.
+   * Fire-and-forget: returns immediately. No HTTP, no loop, no rate risk.
    */
-  async forceSync(): Promise<boolean> {
-    for (;;) {
-      const resp = await this.doSyncRequest();
-      if (!resp) return false;
-      if (!resp.Success) {
-        this.log.warn(`WCPPM: forceSync Sync returned !Success: Code=${resp.Code} Message=${resp.Message}`);
-        return false;
-      }
-      if (resp.Data) this.processSyncResponse(resp);
-      if (this.continueFlag === 0) return true;
-      this.log.debug("WCPPM: forceSync ContinueFlag != 0, pulling again");
+  forceSync(): { triggered: boolean; reason?: string } {
+    if (!this.maxWs || this.maxWs.readyState !== WebSocket.OPEN) {
+      return { triggered: false, reason: "WebSocket not connected" };
     }
+    const frame = JSON.stringify({ Scene: 0, Synckey: this.synckey });
+    this.maxWs.send(frame);
+    this.log.info("WCPPM: forceSync request sent over WS");
+    return { triggered: true };
   }
 
   // ──────────────────────────────────────────────

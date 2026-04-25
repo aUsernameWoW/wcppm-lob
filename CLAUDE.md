@@ -157,10 +157,11 @@ The plugin supports WCPPM only. The legacy standard-WeChatPadPro path (`/ws/GetS
 - Limitation: webhook payload has no `MsgSource`, so `<atuserlist>` @bot detection falls back to `pushContent` ("在群聊中@了你") only.
 
 ### One-shot: `forceSync()` (manual catch-up)
-- `WcppClient.forceSync()` performs a single `/api/Msg/Sync` pull and drains `ContinueFlag` before returning. No persistent polling loop.
-- Operator-triggered via the gateway RPC method `wechatpadpro.forceSync` (registered in `src/index.ts:registerFull`). Reach it with `openclaw gateway call wechatpadpro.forceSync` — responds `{ drained: true }` on success, `{ error: "channel not running" }` if the runtime isn't up. Drained messages flow through the normal dedup + filter + dispatch pipeline (same as WS/webhook), so the agent will reply to anything new just as if it arrived via push.
+- `WcppClient.forceSync()` sends a single `{Scene:0, Synckey:...}` Sync request frame **over the already-open WebSocket** and returns immediately. WCPPM responds via the normal push path, so any new data lands in our existing `on("message")` handler and flows through the standard dedup + filter + normalize + dispatch pipeline.
+- **Do NOT loop or call `/api/Msg/Sync` over HTTP from forceSync.** Earlier impl looped on `ContinueFlag` and produced ~260 HTTP Sync requests in 118s on a single trigger — that's exactly the high-frequency-sync pattern Tencent risk-flags (CLAUDE.md "Account Safety Incident"). Reuse the WS that's already open for inbound push; one frame, fire and forget.
+- Operator-triggered via the gateway RPC method `wechatpadpro.forceSync` (registered in `src/index.ts:registerFull`). Reach it with `openclaw gateway call wechatpadpro.forceSync` — responds `{ triggered: true }` when the WS is open, `{ triggered: false, reason: "WebSocket not connected" }` otherwise, `{ error: "channel not running" }` if the runtime isn't up.
 - No web-UI button surface today: OpenClaw's `/channels` page renders per-channel cards via a hard-coded switch (`ui/src/ui/views/channels.ts:109-182`) and there's no plugin hook to contribute UI elements. Adding a real button would require an OpenClaw core change to make `renderChannel` plugin-extensible.
-- `login()` already issues a one-off Sync probe on startup to verify the authcode, so initial catch-up happens automatically the first time the channel connects.
+- `login()` still issues a single one-off `/api/Msg/Sync` HTTP probe on startup to verify the authcode and pick up self-wxid. That's the only place HTTP Sync is called.
 
 ### Webhook Gotchas Confirmed in Production
 
