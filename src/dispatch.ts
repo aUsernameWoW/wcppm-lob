@@ -12,6 +12,7 @@
 
 import { loadConfig } from "openclaw/plugin-sdk/config-runtime";
 import { createChannelReplyPipeline } from "openclaw/plugin-sdk/channel-reply-pipeline";
+import type { DirectDmDecision } from "openclaw/plugin-sdk/direct-dm-access";
 import {
   createReplyDispatcherWithTyping,
   dispatchInboundMessage,
@@ -34,10 +35,22 @@ export type WcppSendApi = {
   sendQuote: (toWxid: string, text: string, quoteMsgId: string) => Promise<boolean>;
 };
 
+export type WcppDmAuthorizer = (input: {
+  senderId: string;
+  reply: (text: string) => Promise<void>;
+}) => Promise<DirectDmDecision>;
+
 export type WcppDispatchContext = {
   accountId: string;
   log: WcppLogger;
   send: WcppSendApi;
+  /**
+   * Inbound DM gate. Built from `dmSecurity` + `allowFrom` in channel.ts,
+   * backed by the framework's pairing store. Absent when the host didn't
+   * supply a `runtime` handle (older gateway / tests) — falls through to
+   * "allow everything" so DMs don't silently vanish.
+   */
+  authorizeDm?: WcppDmAuthorizer;
 };
 
 export type WcppInboundMessage = {
@@ -63,6 +76,26 @@ export async function dispatchInboundToOpenClaw(
   ctx: WcppDispatchContext,
   msg: WcppInboundMessage,
 ): Promise<void> {
+  // DM gate: enforce dmSecurity before the message hits the agent pipeline.
+  // On "pairing", the authorizer has already sent a challenge via sendText;
+  // on "block", we drop silently. Groups bypass this entirely.
+  if (msg.chatType === "dm" && ctx.authorizeDm) {
+    const reply = async (text: string) => {
+      try {
+        await ctx.send.sendText(msg.senderWxid, text);
+      } catch (err) {
+        ctx.log.warn(`wechatpadpro: pairing reply to ${msg.senderWxid} failed: ${String(err)}`);
+      }
+    };
+    const decision = await ctx.authorizeDm({ senderId: msg.senderWxid, reply });
+    if (decision !== "allow") {
+      ctx.log.debug(
+        `wechatpadpro: DM from ${msg.senderWxid} → ${decision} (skipping agent dispatch)`,
+      );
+      return;
+    }
+  }
+
   const cfg = loadConfig();
 
   let route: ReturnType<typeof resolveAgentRoute>;

@@ -11,8 +11,13 @@ import {
   createChannelPluginBase,
 } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
+import { createChannelPairingController } from "openclaw/plugin-sdk/channel-pairing";
+import {
+  createPreCryptoDirectDmAuthorizer,
+  resolveInboundDirectDmAccessWithRuntime,
+} from "openclaw/plugin-sdk/direct-dm-access";
 import { WcppClient, type NormalizedMessage } from "./client.js";
-import { dispatchInboundToOpenClaw } from "./dispatch.js";
+import { dispatchInboundToOpenClaw, type WcppDmAuthorizer } from "./dispatch.js";
 
 // ──────────────────────────────────────────────
 // Account resolution
@@ -221,6 +226,14 @@ const wechatpadproBase = {
             sendQuote: async (to: string, text: string, quoteMsgId: string) =>
               client ? await client.sendQuote(to, text, quoteMsgId) : false,
           },
+          authorizeDm: buildDmAuthorizer({
+            runtime: ctx.runtime,
+            cfg: ctx.cfg,
+            accountId: ctx.accountId,
+            dmPolicy: account.dmPolicy,
+            allowFrom: account.allowFrom,
+            log,
+          }),
         };
         await startWcppRuntime(account, log, async (msg) => {
           await dispatchInboundToOpenClaw(dispatchCtx, {
@@ -299,6 +312,79 @@ export const wechatpadproPlugin = createChatChannelPlugin<ResolvedAccount>({
     },
   },
 });
+
+// ──────────────────────────────────────────────
+// DM policy gate
+// ──────────────────────────────────────────────
+
+/**
+ * Build a DM authorizer bound to the current account + runtime. This is what
+ * turns `dmSecurity` from a metadata field into an actual inbound gate: it
+ * runs before the agent pipeline, sends a pairing challenge on first contact
+ * when `dmSecurity: "pairing"`, and drops non-allowlisted senders on
+ * `"allowlist"` / `"disabled"`.
+ *
+ * Returns undefined when `runtime` is missing (older gateway, tests) so the
+ * dispatch side can fall through to "accept everything" — we'd rather lose
+ * the policy than silently swallow DMs the user expects to see.
+ */
+function buildDmAuthorizer(params: {
+  runtime: any;
+  cfg: any;
+  accountId: string;
+  dmPolicy: string | undefined;
+  allowFrom: string[];
+  log: { info: (...args: any[]) => void; warn: (...args: any[]) => void; debug: (...args: any[]) => void };
+}): WcppDmAuthorizer | undefined {
+  const { runtime, cfg, accountId, dmPolicy, allowFrom, log } = params;
+  if (!runtime) return undefined;
+
+  const pairing = createChannelPairingController({
+    core: runtime,
+    channel: "wechatpadpro",
+    accountId,
+  });
+
+  const commands = runtime?.channel?.commands;
+  const commandRuntime = {
+    shouldComputeCommandAuthorized:
+      commands?.shouldComputeCommandAuthorized ?? ((_body: string, _cfg: any) => false),
+    resolveCommandAuthorizedFromAuthorizers:
+      commands?.resolveCommandAuthorizedFromAuthorizers ?? ((_p: any) => false),
+  };
+
+  const resolveAccess = (senderId: string) =>
+    resolveInboundDirectDmAccessWithRuntime({
+      cfg,
+      channel: "wechatpadpro",
+      accountId,
+      dmPolicy,
+      allowFrom,
+      senderId,
+      rawBody: "",
+      // WeChat wxids are opaque — exact match, plus "*" wildcard.
+      isSenderAllowed: (sender, list) =>
+        list.some((entry) => entry === "*" || entry === sender),
+      runtime: commandRuntime,
+    });
+
+  return createPreCryptoDirectDmAuthorizer({
+    resolveAccess,
+    issuePairingChallenge: async ({ senderId, reply }) => {
+      await pairing.issueChallenge({
+        senderId,
+        senderIdLine: `Your WeChat ID: ${senderId}`,
+        sendPairingReply: reply,
+        onCreated: ({ code }) =>
+          log.info(`wechatpadpro: pairing challenge issued for ${senderId} (code=${code})`),
+        onReplyError: (err) =>
+          log.warn(`wechatpadpro: pairing reply send failed for ${senderId}: ${String(err)}`),
+      });
+    },
+    onBlocked: ({ senderId, reason }) =>
+      log.debug(`wechatpadpro: blocked DM from ${senderId} (${reason})`),
+  });
+}
 
 // ──────────────────────────────────────────────
 // Runtime lifecycle

@@ -46,10 +46,12 @@ src/
 └── shims/
     └── openclaw/     — Typecheck-only shims for openclaw/plugin-sdk/* paths
         ├── channel-core.ts
-        ├── reply-runtime.ts
-        ├── routing.ts
+        ├── channel-pairing.ts
         ├── channel-reply-pipeline.ts
-        └── config-runtime.ts
+        ├── config-runtime.ts
+        ├── direct-dm-access.ts
+        ├── reply-runtime.ts
+        └── routing.ts
 tools/
 └── debug.ts          — Standalone CLI for testing WCPP MAX API (npx tsx tools/debug.ts)
 docs/
@@ -101,10 +103,29 @@ The `deliver` callback we hand to the dispatcher is what closes the loop — it 
 
 **MsgContext fields** (built in `dispatch.ts:buildFromTag` and the `finalizeInboundContext` call): `Provider`, `Surface`, `OriginatingChannel` all = `"wechatpadpro"`; `ChatType` = `"group"|"direct"`; `From` = `group:${groupId}` for groups, `wechatpadpro:${senderWxid}` for DMs; `To` = the wxid we send the reply back to (groupId for groups, senderWxid for DMs); `SessionKey`/`AccountId` from `resolveAgentRoute`; `WasMentioned` only set for groups.
 
+### DM policy gate (`dmSecurity`)
+
+DMs are gated **inside our plugin** before the agent pipeline runs — the framework's `reply-runtime` / `channel-reply-pipeline` / `routing.ts` do **not** enforce `dmPolicy`, so declaring `security.dm` on the plugin alone is metadata-only. The gate is built in `channel.ts:buildDmAuthorizer` and invoked at the top of `dispatch.ts:dispatchInboundToOpenClaw`. Groups bypass the gate entirely.
+
+Flow, per DM:
+1. `buildDmAuthorizer` wires `createChannelPairingController` + `createPreCryptoDirectDmAuthorizer` against `ctx.runtime` at startup.
+2. For each inbound DM, `authorizeDm({ senderId, reply })` runs before `resolveAgentRoute`. `reply` is `client.sendText(senderWxid, ...)`.
+3. Decision table (from `src/security/dm-policy-shared.ts:resolveDmGroupAccessDecision`):
+   - `"open"` → allow
+   - `"disabled"` → block
+   - `"allowlist"` → allow if sender in `allowFrom`, else block
+   - `"pairing"` (default when `dmSecurity` is unset) → allow if in `allowFrom` or pairing store, else emit **one** pairing challenge via `sendText` (subsequent unpaired messages are silent until paired)
+4. On anything but `"allow"`, dispatch returns without touching the agent.
+
+Matching is exact-string on wxid, with `"*"` wildcard. `runtime.channel.commands.*` is consulted only for command authorization and falls back to `() => false` stubs when absent, so a missing command surface doesn't break DM gating.
+
+**When `ctx.runtime` is undefined** (older gateway, tests), `authorizeDm` stays `undefined` and the dispatcher falls through to "allow everything" — we'd rather lose the policy than silently swallow DMs the user expects to see.
+
 **Out of scope today** (would need additional work):
 - Inbound media routed to the agent — currently text-only; resolved media is on `msg.raw.media` if needed
 - `ReplyPayload.mediaUrl` / `interactive` / `btw` — `deliver` ignores everything except `text`. Explicit `outbound.sendMedia` calls still work.
 - Typing indicators, debouncer, history aggregation, mention regex preprocessing — all skipped
+- Group `groupPolicy` / `groupAllowFrom` enforcement — only DM side is gated; groups pass unconditionally
 
 ## API Reference
 
@@ -271,6 +292,7 @@ Must split on first `:\n` to extract sender and text.
 - **Dedup by `NewMsgId`** (not `MsgId` — `MsgId` can repeat across sessions, `NewMsgId` is globally unique)
 - **`readOnly` mode** blocks all outbound sends — for account stability during initial period
 - **Age filter** drops messages older than `maxMessageAge` seconds (default 180) to avoid replaying stale history
+- **DM gate is plugin-local**, not framework-enforced — see "DM policy gate" under the Inbound pipeline. The `security.dm` block on the plugin is metadata only; the actual gate lives in `channel.ts:buildDmAuthorizer` + `dispatch.ts`.
 
 ## Config Reference
 
