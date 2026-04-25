@@ -357,7 +357,7 @@ export class WcppClient {
     this.config = config;
     this.wxid = config.wxid ?? null;
     this.baseUrl = config.host ? `http://${config.host}:${config.port}` : "";
-    this.synckey = "string"; // initial value for first Sync call
+    this.synckey = ""; // empty until we ingest a real KeyBuf cursor; doSyncRequest omits Synckey while empty
   }
 
   private requireAuthcode(): string {
@@ -495,7 +495,11 @@ export class WcppClient {
     if (!authcode) return null;
 
     const url = `${this.baseUrl}/api/Msg/Sync?authcode=${authcode}`;
-    const payload = { Scene: 0, Synckey: this.synckey };
+    // WCPPM Swagger spec: body is `{ "Scene": 0 }` with Synckey omitted on
+    // first call. Sending Synckey="" or a placeholder string returns no data.
+    // Only attach Synckey once we've ingested a real KeyBuf cursor.
+    const payload: { Scene: number; Synckey?: string } = { Scene: 0 };
+    if (this.synckey) payload.Synckey = this.synckey;
 
     try {
       const res = await fetch(url, {
@@ -910,28 +914,34 @@ export class WcppClient {
   }
 
   /**
-   * Ask WCPPM to push pending sync data over the WebSocket connection we
-   * already have open. Sends a single Sync request frame on the existing WS;
-   * WCPPM responds via the normal push path so results flow back through our
-   * existing on("message") handler — same dedup / filter / normalize pipeline
-   * as live push.
+   * Operator-triggered manual catch-up. **Exactly one** HTTP POST
+   * /api/Msg/Sync. Whatever it returns flows through the normal dedup +
+   * filter + dispatch pipeline.
    *
-   * Fire-and-forget: returns immediately. No HTTP, no loop, no rate risk.
+   * Independent of /Login/Newinit: Newinit drives WCPPM's real-time push
+   * pipeline (longlink + WS/webhook); /api/Msg/Sync is a separate on-demand
+   * pull that works whether the longlink is up or not.
+   *
+   * **No loop.** If `hasMore` (Sync's `ContinueFlag != 0`), the operator
+   * decides whether to invoke forceSync again — not the code. Auto-looping
+   * was the Account-Safety-Incident pattern (~260 requests on one trigger).
+   *
+   * (We also tried sending a Sync request frame over the open /ws/sync WS;
+   * WCPPM logged receipt but never pushed anything back, so /ws/sync is
+   * push-only from WCPPM's side and can't be used as a pull trigger.)
    */
-  forceSync(): { triggered: boolean; reason?: string } {
-    if (!this.maxWs || this.maxWs.readyState !== WebSocket.OPEN) {
-      return { triggered: false, reason: "WebSocket not connected" };
+  async forceSync(): Promise<{ ok: boolean; reason?: string; messages?: number; hasMore?: boolean }> {
+    const before = this.seenMsgIds.size;
+    const resp = await this.doSyncRequest();
+    if (!resp) return { ok: false, reason: "Sync request failed (see logs)" };
+    if (!resp.Success) {
+      return { ok: false, reason: `WCPPM Sync !Success Code=${resp.Code} Message=${resp.Message}` };
     }
-    const frame = JSON.stringify({ Scene: 0, Synckey: this.synckey });
-    try {
-      this.maxWs.send(frame);
-    } catch (e) {
-      const reason = e instanceof Error ? e.message : String(e);
-      this.log.warn(`WCPPM: forceSync WS send failed: ${reason}`);
-      return { triggered: false, reason };
-    }
-    this.log.info("WCPPM: forceSync request sent over WS");
-    return { triggered: true };
+    if (resp.Data) this.processSyncResponse(resp);
+    const messages = this.seenMsgIds.size - before;
+    const hasMore = (resp.Data?.ContinueFlag ?? 0) !== 0;
+    this.log.info(`WCPPM: forceSync drained one round, ${messages} new message(s), hasMore=${hasMore}`);
+    return { ok: true, messages, hasMore };
   }
 
   // ──────────────────────────────────────────────

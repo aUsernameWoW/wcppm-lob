@@ -11,9 +11,11 @@ export default defineChannelPluginEntry({
   description: "OpenClaw channel plugin for WeChat via WeChatPadPro / WeChatPadProMax",
   plugin: wechatpadproPlugin,
   registerFull(api: any) {
-    // Manual catch-up trigger: send one Sync request frame over the already-open
-    // WebSocket. WCPPM pushes any new data back via the same WS, going through
-    // our normal inbound handler. Reach via `openclaw gateway call wechatpadpro.forceSync`.
+    // Manual catch-up trigger: one HTTP /api/Msg/Sync round. New messages flow
+    // through the normal dedup + filter + dispatch pipeline. Independent of
+    // /Login/Newinit (which drives the real-time push pipeline; Sync is a
+    // separate on-demand pull). NO loop — operator re-invokes if hasMore.
+    // Reach via `openclaw gateway call wechatpadpro.forceSync`.
     api.registerGatewayMethod(
       "wechatpadpro.forceSync",
       async ({ respond }: { respond: (ok: boolean, payload?: unknown) => void }) => {
@@ -22,8 +24,8 @@ export default defineChannelPluginEntry({
           respond(false, { error: "channel not running" });
           return;
         }
-        const result = client.forceSync();
-        respond(result.triggered, result);
+        const result = await client.forceSync();
+        respond(result.ok, result);
       },
     );
   },
