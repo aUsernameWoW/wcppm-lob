@@ -192,6 +192,26 @@ The plugin manifest + channel config are not enough on their own — OpenClaw ne
 - `bindings[]` — *not* required. If no entry matches `{ channel: "wechatpadpro", ... }`, `resolveAgentRoute` falls through to `default` at `src/routing/resolve-route.ts:835` and the message is routed to the default agent. It is **not** silently dropped (`dispatch.ts:76` is just defensive). Add a binding only if you need a non-default agent or per-peer routing.
 - The web UI has no dedicated toggle for `plugins.entries.*.enabled` or `bindings[]` — edit `openclaw.json` directly (or via the web config editor).
 
+### Strict config validation (OpenClaw 2026.5.18+)
+
+OpenClaw 2026.5.18 tightened `channels.<id>` validation: each block is run through `validateJsonSchemaValue` (`src/config/validation.ts:995`) against the plugin's declared schema, which uses `additionalProperties: false`. Any field not declared in `openclaw.plugin.json` → `channelConfigs.wechatpadpro.schema.properties` fails the channel as `invalid config: must NOT have additional properties`.
+
+Two gotchas:
+
+1. **The error path is the parent, not the offending key.** AJV reports the violation on `channels.wechatpadpro`, so the message does not name which property is extra. To find it, diff schema vs config:
+
+   ```bash
+   python3 -c "
+   import json
+   schema = set(json.load(open('/home/radxa/wcppm-lob/openclaw.plugin.json'))['channelConfigs']['wechatpadpro']['schema']['properties'])
+   config = set(json.load(open('/home/radxa/.openclaw/openclaw.json'))['channels']['wechatpadpro'])
+   print('offenders:', config - schema)"
+   ```
+
+2. **5.7 and earlier were lenient.** Stale fields that 5.7 silently ignored (e.g. `groupAllowFrom` from earlier group-filtering plans that were never implemented — `dispatch.ts` still passes all group messages unconditionally) break the channel on first 5.18 launch with no warning at upgrade time. Removing the field from `~/.openclaw/openclaw.json` is the fix; only add it back to the schema if we actually implement the feature.
+
+`openclaw doctor` surfaces the same error in its summary but with the same parent-only path, so the diff command above is still the fastest way to find which key.
+
 ## Webhook Deployment: Reverse-Proxy Mode
 
 Recommended layout when exposing the webhook publicly:
