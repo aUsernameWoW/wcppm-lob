@@ -10,22 +10,23 @@ An OpenClaw channel plugin that bridges WeChatPadPro / WeChatPadProMAX into Open
 - **All `/Login/*` operations** — QR code scanning, 62-data login, A16 login, token renewal, heartbeat management, **and `/Login/Newinit`**
 - **All `/User/*` operations** — account info edits, profile, device management, etc.
 
-These are the WeChatPadProMax server administrator's responsibility, configured out-of-band (Swagger UI / curl). If no messages arrive because the operator forgot to run `/Login/Newinit` or `/Webhook/Set`, **that's an operator config issue, not ours** — we don't paper over it by re-introducing auto-calls into those surfaces.
+These are the WeChatPadProMax server administrator's responsibility, configured out-of-band (Swagger UI / curl). If no messages arrive, it's almost always login state, the longlink/`Identify` handshake, or `/Webhook/Set` config — **a server-side/operator issue, not ours** — we don't paper over it by re-introducing auto-calls into those surfaces. **`/Login/Newinit` is NOT the fix** — it's full re-init and ban-risky; see the corrected note below.
 
 **Hard constraints confirmed in production:**
 - For account nurturing / safety, prefer passive receive paths and avoid unnecessary active operations
 
-**Newinit vs. `/api/Msg/Sync` — keep these straight:**
-- `/Login/Newinit` brings up WCPPM's **real-time push pipeline**: it tells WCPPM to keep an active longlink open to Tencent so new messages are delivered to WCPPM as they arrive, then forwarded to subscribers (WS / Webhook / RabbitMQ). Without Newinit, real-time push stays silent.
-- `/api/Msg/Sync` is a **separate on-demand pull**. Each call is a synchronous fetch — WCPPM goes and asks Tencent for whatever's there and returns it in the response. **Works whether Newinit was called or not.**
-- So: `forceSync()` (which calls Sync) does NOT require Newinit. Real-time WS/Webhook push DOES.
+**Newinit vs. `/api/Msg/Sync` — keep these straight (corrected 2026-06-04):**
+- **`/Login/Newinit` is full re-initialization and is effectively deprecated / dangerous.** Official clients only fire it on first install or after being offline for weeks; calling it from a protocol stack is a textbook risk-control trigger (“环境异常 / 限制登录” → ban). **Do NOT call it — not on startup, not manually.** The WCPPM author's build has removed the auto-call entirely.
+- **Real-time push does NOT need Newinit.** On a normal scan-login, WCPPM auto-runs a *lightweight* init (undocumented endpoint): a `Scene=3` incremental sync to fetch the `SyncKey`, then it opens the TCP longlink to `long.weixin.qq.com`, sends `Identify` (CGI 138) to bind the account, and does one `postLonglinkSync` to activate the channel. **That** is what brings up real-time push — automatically, at login. New messages then arrive via a longlink wake-packet (`CmdId=24/318/353`) which triggers a short-link Sync pull, forwarded to subscribers (WS / Webhook / RabbitMQ).
+- `/api/Msg/Sync` is a **separate on-demand pull**. Each call is a synchronous fetch — WCPPM asks Tencent for whatever's there and returns it. **Works regardless of the push path.**
+- So: `forceSync()` (which calls Sync) is independent of the longlink push path. If push is silent, the cause is login / `SyncKey` / `Identify` / webhook config — **never** "forgot Newinit."
 
-**Newinit history (was auto-called, now reverted):**
-- We briefly auto-called Newinit on startup, but this re-enters `/Login/*` scope. **Reverted**: the operator runs Newinit manually. The `newinitOnStart` config flag was removed in the transport refactor
+**Newinit history (was auto-called, now permanently removed):**
+- We briefly auto-called Newinit on startup. This was reverted in the transport refactor (the `newinitOnStart` flag was removed) — originally to respect `/Login/*` scope, but the stronger reason confirmed since: **full-init is a ban trigger.** It should never be called, by us or the operator.
 
 **This plugin assumes:**
 - The WeChatPadProMax server is already logged in and online
-- `/Login/Newinit` has been called (by the operator) **if real-time WS/Webhook push is desired**. Without Newinit, push stays silent — but operator-triggered `wechatpadpro.forceSync` still works because it goes through HTTP `/api/Msg/Sync`, which is independent.
+- The account was logged in normally — WCPPM auto-establishes the longlink/push at login (lightweight init; see above). **`/Login/Newinit` is NOT needed and must not be called.** If real-time push is silent, debug login / `SyncKey` / `Identify` / webhook config; operator-triggered `wechatpadpro.forceSync` over HTTP `/api/Msg/Sync` works independently regardless.
 - A valid `authcode` (for MAX) or `adminKey` + `authKey` (for standard WCPP) is provided by the server admin **if** any active operation is needed (sending, contact fetch, auto-register webhook). Pure passive webhook receive needs neither.
 - The WeChat account is stable and ready to send/receive messages
 
@@ -154,7 +155,7 @@ The plugin supports WCPPM only. The legacy standard-WeChatPadPro path (`/ws/GetS
 ### Additive: webhook receiver (`webhookEnabled: true`)
 - Opt-in extra inbound channel on top of WebSocket. Spins up a local HTTP listener; WCPPM pushes to it via the standard `/Webhook/*` flow.
 - When `host` is set and `webhookUrl` is configured, the plugin auto-calls `/Webhook/Set` on start and `/Webhook/Remove` on stop. If `webhookUrl` is omitted, the plugin still binds the listener but leaves registration to the operator.
-- **Passive webhook-only mode**: set `webhookEnabled: true` with `host` empty. Plugin only binds the listener; `/Login/Newinit` + `/Webhook/Set` are the operator's job, and outbound sends will throw because there's no server to talk to. This is the layout for fully decoupled deployments (unstable WCPPM address, strict separation from `/Login/*`).
+- **Passive webhook-only mode**: set `webhookEnabled: true` with `host` empty. Plugin only binds the listener; `/Webhook/Set` is the operator's job (the longlink comes up automatically at login — do **not** call `/Login/Newinit`), and outbound sends will throw because there's no server to talk to. This is the layout for fully decoupled deployments (unstable WCPPM address, strict separation from `/Login/*`).
 - Default bind is loopback (`127.0.0.1`) to force a reverse proxy as the public entry; set `webhookHost: "0.0.0.0"` to expose directly.
 - Webhook payload envelope: `{ MessageType, Signature, Timestamp, Wxid, IsSelf, Data: { messages: [...] } }`; signature = `HMAC-SHA256(secret, "{Wxid}:{MessageType}:{Timestamp}")` with a 15-minute anti-replay window.
 - Messages are converted to the internal `SyncMessage` shape and routed through the same dedup + filter + normalize pipeline as WS. When both WS and webhook deliver the same message, dedup by `MsgId` drops the duplicate.
@@ -164,7 +165,7 @@ The plugin supports WCPPM only. The legacy standard-WeChatPadPro path (`/ws/GetS
 - `WcppClient.forceSync()` does **exactly one** HTTP `POST /api/Msg/Sync`. The response (with any `AddMsgs`) is fed through the normal dedup + filter + normalize + dispatch pipeline, same as if it had arrived via WS push. Returns `{ ok, messages, hasMore }`.
 - **No loop on `ContinueFlag`.** Earlier impl looped until ContinueFlag === 0 and produced ~260 HTTP Sync requests in 118s on one trigger — exactly the high-frequency-sync pattern Tencent risk-flags (see "Account Safety Incident"). When `hasMore: true`, the **operator** decides to invoke forceSync again. Don't auto-loop.
 - **Request body must be `{ "Scene": 0 }` with `Synckey` omitted on the first call.** Sending an empty string (`""`), null, or a placeholder (`"string"`) returns no data — WCPPM treats it as a stale cursor and returns nothing useful. After a successful Sync we ingest `Data.KeyBuf.buffer` and pass it as `Synckey` on subsequent calls.
-- **Independent of `/Login/Newinit`.** Sync is an on-demand pull — WCPPM goes and asks Tencent synchronously, doesn't need the real-time longlink. So forceSync works even when push is silent.
+- **Independent of the real-time push path.** Sync is an on-demand pull — WCPPM asks Tencent synchronously, doesn't need the longlink. So forceSync works even when push is silent (and has nothing to do with `/Login/Newinit`, which must not be called).
 - We did try sending a Sync request frame over the open `/ws/sync` WebSocket; WCPPM logged receipt but never pushed anything back. So `/ws/sync` is push-only from WCPPM's side and can't be used as a pull trigger — forceSync has to go through HTTP.
 - Operator-triggered via the gateway RPC method `wechatpadpro.forceSync` (registered in `src/index.ts:registerFull`). Reach it with `openclaw gateway call wechatpadpro.forceSync` — responds `{ ok: true, messages: N, hasMore: bool }` on success, `{ error: "channel not running" }` if the runtime isn't up.
 - No web-UI button surface today: OpenClaw's `/channels` page renders per-channel cards via a hard-coded switch (`ui/src/ui/views/channels.ts:109-182`) and there's no plugin hook to contribute UI elements. Adding a real button would require an OpenClaw core change to make `renderChannel` plugin-extensible.
@@ -230,13 +231,10 @@ The reverse proxy itself does **not** need any path rewrites; just upstream `127
 
 ### Manual webhook registration on the WCPP MAX side
 
-When `host` is configured, the plugin auto-calls `/Webhook/Set` on `gateway.startAccount`. In **passive mode** (host empty) the operator must register manually — same goes for `/Login/Newinit`. Without Newinit the server's longlink stays down and **no real-time push lands anywhere**, regardless of how correctly the webhook is wired. (Operator-triggered `wechatpadpro.forceSync` over HTTP `/api/Msg/Sync` still works without Newinit — see "One-shot: forceSync" above.)
+When `host` is configured, the plugin auto-calls `/Webhook/Set` on `gateway.startAccount`. In **passive mode** (host empty) the operator must register the webhook manually. The longlink that drives real-time push is established **automatically at login** — do **not** call `/Login/Newinit` to "wake it up" (full-init, ban-risky). If push is silent with the webhook correctly wired, debug login / `SyncKey` / `Identify` per the WCPPM author's troubleshooting flow, not Newinit. (Operator-triggered `wechatpadpro.forceSync` over HTTP `/api/Msg/Sync` works independently either way.)
 
 ```bash
-# 1. (Required on 0412+) bring up the longlink
-curl -X POST "http://<wcpp-max-host>:8062/api/Login/Newinit?authcode=<AUTHCODE>"
-
-# 2. Register webhook
+# Register webhook (the longlink is already up from login — do NOT call /Login/Newinit)
 curl -X POST "http://<wcpp-max-host>:8062/api/Webhook/Set?authcode=<AUTHCODE>" \
   -H "Content-Type: application/json" \
   -d '{
@@ -428,7 +426,7 @@ All `/Login/*`, `/Admin/*`, `/User/*` account management APIs.
 - Current swagger access for some media endpoints has been flaky (`502`), so payload assembly is based on extracted metadata plus flexible request fields
 - CDN-level direct media decryption/playback via raw CDN URLs + `aeskey` is still not implemented
 - **SendTxt API uses `ToWxid` not `ToUserName`** — for users with custom WeChat IDs (e.g. "gxnnycz"), `ToWxid` must be the `UserName` string from search results, not the underlying `wxid_xxx`. Using the wxid returns `Ret: -2`
-- **`Newinit` required on 0412+ for real-time push** — without calling `/Login/Newinit`, WCPPM's longlink to Tencent stays down and no WS/Webhook push will fire. (HTTP `/api/Msg/Sync` and our `wechatpadpro.forceSync` RPC still work without it.) Newinit is operator-managed; the plugin does NOT auto-call it (see "Scope & Responsibilities")
+- **`Newinit` is deprecated / ban-risky — do NOT call it** (corrected 2026-06-04; supersedes the earlier "Newinit required for push" note). Real-time push comes up automatically at login: WCPPM runs a lightweight `Scene=3` sync to get the `SyncKey`, opens the longlink, sends `Identify`, and activates the channel — no `/Login/Newinit` involved. Full-init (`/Login/Newinit`) is what official clients only do on first install / weeks-offline, so firing it from a protocol stack is a classic risk-control trigger. The plugin does not call it; the operator must not either. (HTTP `/api/Msg/Sync` and `wechatpadpro.forceSync` remain independent.)
 - **WCPP MAX 0416 fixes WS** — the 0412 WebSocket regression (immediate disconnect, code 1006) is resolved. WS connections are now stable and authenticated. The server also now supports RabbitMQ as a third downstream channel alongside WS and Webhook
 
 ## Account Safety Incident (2026-04-12)
@@ -438,7 +436,7 @@ All `/Login/*`, `/Admin/*`, `/User/*` account management APIs.
 **Root cause:** Calling `Newinit` + `StartAutoSync` activated the server's unified dispatch pipeline, but all downstream channels were broken (WS: 0412 regression — fixed in 0416, Webhook: not configured). The server entered a tight loop — receiving data via longlink every few seconds, attempting to push to WS (fail) and Webhook (fail), repeating indefinitely. Tencent's risk detection flagged this abnormal high-frequency sync pattern over ~20 minutes and banned the account.
 
 **Lessons / hard rules:**
-1. **Never activate server-side auto-sync (`StartAutoSync`, `Newinit`) unless at least one downstream channel (WS, Webhook, or our Sync polling) is actively consuming data.** An active pipeline with no consumers creates a server-side retry storm that looks like abuse to Tencent.
+1. **Never call `/Login/Newinit` (full-init) at all** — it's a top-tier risk-control trigger on its own (confirmed 2026-06-04; the modern WCPPM build establishes the longlink automatically at login, so there is no legitimate reason to call it). More generally, never activate server-side auto-sync (`StartAutoSync`) unless at least one downstream channel (WS, Webhook, or our Sync polling) is actively consuming data — an active pipeline with no consumers creates a server-side retry storm that looks like abuse to Tencent.
 2. **Rate-limit debug operations** — minimum 3-5 seconds between API calls; never probe multiple endpoints in rapid succession.
 3. **Prefer reading server logs (via SSH + tmux) over hammering the API** when debugging connectivity issues.
 4. **Do not call `Friend/Search` + `SendTxt` + `Newinit` + `StartAutoSync` in the same short session** — the combination of active operations across multiple API surfaces amplifies risk.
@@ -450,14 +448,14 @@ Standalone CLI for testing WCPP MAX API without running OpenClaw:
 
 ```bash
 npm run debug status        # Check server + authcode validity
-npm run debug newinit       # Establish longlink via /Login/Newinit
+npm run debug newinit       # ⚠️ DEPRECATED/DANGEROUS — calls /Login/Newinit (full-init, ban risk). Don't use; the longlink comes up at login.
 npm run debug heartbeat     # Send longlink heartbeat
 npm run debug sync 5        # Poll /Msg/Sync 5 rounds
 npm run debug ws 30         # Listen on WebSocket for 30s
 npm run debug send gxnnycz "hello"  # Send text message
 npm run debug search gxnnycz        # Search contact
 npm run debug contacts      # List all contacts
-npm run debug recv 120      # Newinit + live sync poll for 2 minutes
+npm run debug recv 120      # ⚠️ calls Newinit first (ban risk) — avoid; use 'ws' or 'sync' instead
 
 # Webhook commands
 npm run debug webhook-set "http://OUR_IP:8000/webhook" [secret]  # Register webhook
