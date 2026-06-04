@@ -8,14 +8,12 @@
  *
  * Commands:
  *   status          Check if the server is reachable and authcode is valid
- *   newinit         Call /Login/Newinit to establish longlink
  *   heartbeat       Call /Login/HeartBeatLong
  *   sync [n]        Poll /Msg/Sync n times (default 1) and print messages
  *   ws [seconds]    Connect WebSocket and listen for messages (default 30s)
  *   send <to> <text>  Send a text message
  *   search <keyword>  Search for a contact by WeChat ID / phone / etc.
  *   contacts        Fetch contact list
- *   recv [seconds]  Combined: newinit + sync poll loop, printing messages live
  *
  * Config is read from local-config.json in the project root:
  *   { "host": "...", "authcode": "...", "wsUrl": "ws://..." }
@@ -133,28 +131,6 @@ async function cmdStatus(cfg: DebugConfig) {
   }
 }
 
-async function cmdNewinit(cfg: DebugConfig) {
-  console.log("Calling /Login/Newinit...");
-  try {
-    const data = await api(cfg, "POST", "/Login/Newinit");
-    console.log(`Success: ${data.Success}`);
-    if (data.Data?.ModUserInfos?.[0]) {
-      console.log(`wxid: ${data.Data.ModUserInfos[0].UserName?.string}`);
-      console.log(`Nickname: ${data.Data.ModUserInfos[0].NickName?.string}`);
-    }
-    console.log(`ContinueFlag: ${data.Data?.ContinueFlag}`);
-    console.log(`CurrentSynckey length: ${data.Data?.CurrentSynckey?.iLen}`);
-    console.log(`MaxSynckey length: ${data.Data?.MaxSynckey?.iLen}`);
-    const msgs = data.Data?.AddMsgs?.length ?? 0;
-    if (msgs > 0) {
-      console.log(`\nMessages (${msgs}):`);
-      for (const m of data.Data.AddMsgs) console.log(summarizeMsg(m));
-    }
-  } catch (e: any) {
-    console.error(`Newinit failed: ${e.message}`);
-  }
-}
-
 async function cmdHeartbeat(cfg: DebugConfig) {
   console.log("Calling /Login/HeartBeatLong...");
   try {
@@ -257,7 +233,7 @@ async function cmdWs(cfg: DebugConfig, seconds: number = 30) {
     clearTimeout(timeout);
     if (code === 1006 && msgCount === 0) {
       console.log("\nHint: Server dropped the connection immediately (0412 WS regression?).");
-      console.log("Try 'recv' command instead — it uses Sync polling which works reliably.");
+      console.log("Try 'sync' command instead — it uses on-demand Sync polling which works reliably.");
     }
   });
 
@@ -338,61 +314,6 @@ async function cmdContacts(cfg: DebugConfig) {
   } catch (e: any) {
     console.error(`Contact list error: ${e.message}`);
   }
-}
-
-async function cmdRecv(cfg: DebugConfig, seconds: number = 60) {
-  console.log("Initializing longlink (Newinit)...");
-  try {
-    const initData = await api(cfg, "POST", "/Login/Newinit");
-    if (initData.Success) {
-      const wxid = initData.Data?.ModUserInfos?.[0]?.UserName?.string;
-      console.log(`Newinit OK${wxid ? ` (wxid=${wxid})` : ""}`);
-    } else {
-      console.log(`Newinit returned: ${initData.Message} (continuing anyway)`);
-    }
-  } catch (e: any) {
-    console.log(`Newinit failed: ${e.message} (continuing with Sync only)`);
-  }
-
-  console.log(`\nPolling for messages (${seconds}s)... Press Ctrl+C to stop.\n`);
-
-  let synckey = "";
-  let totalMsgs = 0;
-  const endTime = Date.now() + seconds * 1000;
-
-  while (Date.now() < endTime) {
-    try {
-      const data = await api(cfg, "POST", "/Msg/Sync", { Scene: 0, Synckey: synckey });
-      if (!data.Success) {
-        console.error(`Sync failed: ${data.Message}`);
-        await new Promise(r => setTimeout(r, 5000));
-        continue;
-      }
-
-      if (data.Data?.KeyBuf?.buffer) synckey = data.Data.KeyBuf.buffer;
-
-      const msgs = data.Data?.AddMsgs ?? [];
-      for (const m of msgs) {
-        // Skip noise
-        if (m.MsgType === 51) continue;
-        if (m.MsgType === 10002 && !m.Content?.string?.includes("revokemsg")) continue;
-
-        totalMsgs++;
-        console.log(`[${timestamp()}] ${summarizeMsg(m)}`);
-      }
-
-      // If more data, poll immediately; otherwise wait
-      if (data.Data?.ContinueFlag && data.Data.ContinueFlag !== 0) {
-        continue;
-      }
-      await new Promise(r => setTimeout(r, 3000));
-    } catch (e: any) {
-      console.error(`Poll error: ${e.message}`);
-      await new Promise(r => setTimeout(r, 5000));
-    }
-  }
-
-  console.log(`\nDone. Total messages: ${totalMsgs}`);
 }
 
 async function cmdWebhookSet(cfg: DebugConfig, callbackUrl: string, secret?: string) {
@@ -503,7 +424,6 @@ const cfg = loadConfig();
 
 const commands: Record<string, () => Promise<void>> = {
   status: () => cmdStatus(cfg),
-  newinit: () => cmdNewinit(cfg),
   heartbeat: () => cmdHeartbeat(cfg),
   sync: () => cmdSync(cfg, Number(args[0]) || 1),
   ws: () => cmdWs(cfg, Number(args[0]) || 30),
@@ -519,7 +439,6 @@ const commands: Record<string, () => Promise<void>> = {
     return cmdSearch(cfg, args[0]);
   },
   contacts: () => cmdContacts(cfg),
-  recv: () => cmdRecv(cfg, Number(args[0]) || 60),
   "webhook-set": () => {
     if (!args[0]) { console.error("Usage: webhook-set <url> [secret]"); process.exit(1); }
     return cmdWebhookSet(cfg, args[0], args[1]);
@@ -537,14 +456,12 @@ Usage: npx tsx tools/debug.ts <command> [args...]
 
 Commands:
   status              Check server + authcode validity
-  newinit             Initialize longlink (/Login/Newinit)
   heartbeat           Send longlink heartbeat
   sync [rounds]       Poll /Msg/Sync (default: 1 round)
   ws [seconds]        Listen on WebSocket (default: 30s)
   send <to> <text>    Send a text message (use UserName, not wxid)
   search <keyword>    Search contacts by WeChat ID / phone
   contacts            List all contacts
-  recv [seconds]      Newinit + live sync polling (default: 60s)
 
 Webhook:
   webhook-set <url> [secret]   Register webhook with WCPP MAX

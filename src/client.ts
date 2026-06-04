@@ -28,7 +28,7 @@ export interface WcppConfig {
   port: number;
   /** WCPPM authcode. Required whenever host is set. */
   authcode?: string;
-  /** Cached self wxid (optional; auto-detected from Newinit / WS envelope). */
+  /** Cached self wxid (optional; auto-detected from the WS envelope or Sync ModUserInfos). */
   wxid?: string;
   /**
    * Proxy URL for outbound HTTP + WS (e.g. `http://host:port`,
@@ -420,12 +420,14 @@ export class WcppClient {
    * Verify the configured authcode is usable.
    *
    * Passive webhook-only mode (no host): we cannot and must not contact the
-   * server — /Login/Newinit and /Webhook/Set are the operator's job. Return
-   * a synthetic credentials object so the gateway treats the channel as up.
+   * server — /Webhook/Set is the operator's job. The real-time push longlink
+   * is established automatically at login (do NOT call /Login/Newinit — it is
+   * full re-init and ban-risky; see CLAUDE.md). Return a synthetic credentials
+   * object so the gateway treats the channel as up.
    *
-   * Active mode (host set): skip /Login/Newinit (that stays the operator's
-   * responsibility — see CLAUDE.md "Scope & Responsibilities") and verify
-   * the authcode via a single /api/Msg/Sync probe.
+   * Active mode (host set): never call /Login/Newinit (full-init, ban-risky —
+   * see CLAUDE.md "Scope & Responsibilities"); the push longlink already comes
+   * up at login. Just verify the authcode via a single /api/Msg/Sync probe.
    */
   async login(): Promise<WcppCredentials | null> {
     if (!this.config.host) {
@@ -460,60 +462,6 @@ export class WcppClient {
 
     this.log.info("WCPPM: sync probe OK but no ModUserInfos");
     return { authcode: this.config.authcode, wxid: this.wxid ?? "unknown" };
-  }
-
-  // ──────────────────────────────────────────────
-  // Newinit (WCPP MAX 0412+ longlink establishment)
-  // ──────────────────────────────────────────────
-
-  /**
-   * Call /Login/Newinit to initialize the longlink connection.
-   * Required on WCPP MAX 0412+ to enable the unified dispatch pipeline.
-   * Returns the initial Synckey pair, or null on failure.
-   */
-  async newinit(maxSynckey?: string, currentSynckey?: string): Promise<{
-    currentSynckey: string;
-    maxSynckey: string;
-    wxid: string | null;
-  } | null> {
-    const authcode = this.config.authcode;
-    if (!authcode) {
-      this.log.error("WCPP MAX: cannot call Newinit without authcode");
-      return null;
-    }
-
-    let url = `${this.baseUrl}/api/Login/Newinit?authcode=${authcode}`;
-    if (maxSynckey) url += `&MaxSynckey=${encodeURIComponent(maxSynckey)}`;
-    if (currentSynckey) url += `&CurrentSynckey=${encodeURIComponent(currentSynckey)}`;
-
-    try {
-      const res = await this.httpFetch(url, { method: "POST" });
-      if (!res.ok) {
-        this.log.error(`WCPP MAX: Newinit HTTP ${res.status}`);
-        return null;
-      }
-      const data = (await res.json()) as any;
-      if (!data.Success) {
-        this.log.error(`WCPP MAX: Newinit failed: ${data.Message}`);
-        return null;
-      }
-
-      const d = data.Data;
-      const curKey = d?.CurrentSynckey?.buffer ?? "";
-      const maxKey = d?.MaxSynckey?.buffer ?? "";
-
-      // Extract wxid from ModUserInfos
-      let wxid: string | null = null;
-      if (d?.ModUserInfos?.[0]?.UserName?.string) {
-        wxid = d.ModUserInfos[0].UserName.string;
-      }
-
-      this.log.info(`WCPP MAX: Newinit OK${wxid ? ` (wxid=${wxid})` : ""}, longlink established`);
-      return { currentSynckey: curKey, maxSynckey: maxKey, wxid };
-    } catch (e) {
-      this.log.error("WCPP MAX: Newinit request error", e);
-      return null;
-    }
   }
 
   // ──────────────────────────────────────────────
@@ -553,18 +501,35 @@ export class WcppClient {
    */
   private processSyncResponse(resp: SyncResponse): void {
     if (!resp.Data) return;
+    this.ingestSyncMessages(resp);
+  }
 
-    // Update synckey for next poll
-    if (resp.Data.KeyBuf?.buffer) {
-      this.synckey = resp.Data.KeyBuf.buffer;
+  /**
+   * Shared inbound ingest pipeline used by both the HTTP Sync path
+   * (processSyncResponse / forceSync / webhook) and the WebSocket push
+   * handler (after it unwraps the 20260411+ envelope to the inner
+   * SyncResponse). Holds: synckey update from KeyBuf, contact caching,
+   * self-wxid detection from ModUserInfos, then the per-message
+   * MsgType/age filters, dedup, normalize, drop-own-DM, and emit.
+   *
+   * Own-message policy: drop own DMs (`senderWxid === this.wxid && !isGroup`)
+   * but KEEP own group messages — unified across all transports here so the
+   * WS path no longer diverges from the Sync/webhook path.
+   */
+  private ingestSyncMessages(inner: SyncResponse): void {
+    if (!inner.Data) return;
+
+    // Update synckey for the next poll / so forceSync can echo a real cursor
+    if (inner.Data.KeyBuf?.buffer) {
+      this.synckey = inner.Data.KeyBuf.buffer;
     }
 
     // Cache contacts
-    this.ingestContacts(resp);
+    this.ingestContacts(inner);
 
     // Extract self wxid from ModUserInfos if not set
-    if (!this.wxid && resp.Data.ModUserInfos?.[0]) {
-      this.wxid = resp.Data.ModUserInfos[0].UserName.string;
+    if (!this.wxid && inner.Data.ModUserInfos?.[0]) {
+      this.wxid = inner.Data.ModUserInfos[0].UserName.string;
       this.log.info(`WCPP MAX: detected wxid=${this.wxid} from sync`);
     }
 
@@ -573,7 +538,7 @@ export class WcppClient {
     const passRevoke = this.config.passRevokemsg ?? true;
     const maxAge = this.config.maxMessageAge ?? 180;
 
-    for (const msg of resp.Data.AddMsgs ?? []) {
+    for (const msg of inner.Data.AddMsgs ?? []) {
       // Use MsgId as dedup key — NewMsgId can lose precision via JSON.parse
       const dedupKey = `${msg.MsgId}`;
 
@@ -605,7 +570,7 @@ export class WcppClient {
       // Normalize and emit
       const normalized = this.normalizeSyncMessage(msg);
       if (normalized) {
-        // Drop own messages (unless from filehelper or similar)
+        // Drop own DMs; keep own group messages (unless from filehelper or similar)
         if (normalized.senderWxid === this.wxid && !normalized.isGroup) continue;
         this._onMessage?.(normalized);
       }
@@ -948,9 +913,10 @@ export class WcppClient {
    * /api/Msg/Sync. Whatever it returns flows through the normal dedup +
    * filter + dispatch pipeline.
    *
-   * Independent of /Login/Newinit: Newinit drives WCPPM's real-time push
-   * pipeline (longlink + WS/webhook); /api/Msg/Sync is a separate on-demand
-   * pull that works whether the longlink is up or not.
+   * Independent of the real-time push path: WCPPM establishes the push
+   * longlink automatically at login (NOT via /Login/Newinit, which is
+   * full-init and ban-risky — see CLAUDE.md). /api/Msg/Sync is a separate
+   * on-demand pull that works whether the longlink is up or not.
    *
    * **No loop.** If `hasMore` (Sync's `ContinueFlag != 0`), the operator
    * decides whether to invoke forceSync again — not the code. Auto-looping
@@ -980,12 +946,22 @@ export class WcppClient {
 
   private maxWs: WebSocket | null = null;
   private maxWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private maxWsPingTimer: ReturnType<typeof setInterval> | null = null;
+  /** Consecutive reconnect attempts; drives exponential backoff. Reset to 0 on 'open'. */
+  private maxWsReconnectAttempt = 0;
 
   connectMaxWebSocket(): void {
     const authcode = this.config.authcode;
     if (!authcode) {
       this.log.error("WCPP MAX: cannot connect WS without authcode");
       return;
+    }
+
+    // Clear any stale keepalive interval from a previous socket so we never
+    // leave a second interval pinging the new connection (interval leak).
+    if (this.maxWsPingTimer) {
+      clearInterval(this.maxWsPingTimer);
+      this.maxWsPingTimer = null;
     }
 
     // Use custom wsUrl if provided, otherwise construct from host
@@ -998,6 +974,8 @@ export class WcppClient {
 
     this.maxWs.on("open", () => {
       this.log.info("WCPP MAX: WebSocket connected");
+      // Healthy connection — reset backoff so the next drop reconnects fast.
+      this.maxWsReconnectAttempt = 0;
     });
 
     this.maxWs.on("message", (raw: WebSocket.Data) => {
@@ -1014,89 +992,73 @@ export class WcppClient {
           return;
         }
 
-        // Extract wxid from envelope-level field (available in syncData variant)
+        // Extract wxid from envelope-level field (available in syncData variant).
+        // The inner-SyncResponse path (ModUserInfos) is handled inside
+        // ingestSyncMessages; this envelope field is WS-specific.
         if (!this.wxid && envelope.Data.wxid) {
           this.wxid = envelope.Data.wxid;
           this.log.info(`WCPP MAX: detected wxid=${this.wxid} from WS envelope`);
         }
 
-        // Track sync cursor — needed so forceSync can echo a meaningful Synckey
-        // back over the WS instead of the "string" placeholder.
-        if (inner.Data.KeyBuf?.buffer) {
-          this.synckey = inner.Data.KeyBuf.buffer;
-        }
-
-        // Process the unwrapped SyncResponse
-        this.ingestContacts(inner);
-        if (!this.wxid && inner.Data.ModUserInfos?.[0]) {
-          this.wxid = inner.Data.ModUserInfos[0].UserName.string;
-          this.log.info(`WCPP MAX: detected wxid=${this.wxid} from WS ModUserInfos`);
-        }
-
-        const allowTypes = this.config.allowMsgTypes ?? [1, 3, 34, 47, 48, 49];
-        const passRevoke = this.config.passRevokemsg ?? true;
-        const maxAge = this.config.maxMessageAge ?? 180;
-
-        for (const msg of inner.Data.AddMsgs ?? []) {
-          // Use MsgId as primary dedup key — NewMsgId suffers from JS number
-          // precision loss for values > Number.MAX_SAFE_INTEGER, and the server
-          // may push the same message in multiple envelope formats.
-          const dedupKey = `${msg.MsgId}`;
-          if (this.seenMsgIds.has(dedupKey)) continue;
-          if (msg.MsgType === 51) continue;
-          if (msg.MsgType === 10002) {
-            if (!passRevoke) continue;
-            if (!msg.Content.string.includes("revokemsg")) continue;
-          } else if (!allowTypes.includes(msg.MsgType)) {
-            continue;
-          }
-          if (Date.now() / 1000 - msg.CreateTime > maxAge) continue;
-
-          this.seenMsgIds.add(dedupKey);
-          if (this.seenMsgIds.size > this.SEEN_MSG_ID_MAX) {
-            const entries = [...this.seenMsgIds];
-            this.seenMsgIds = new Set(entries.slice(entries.length / 2));
-          }
-
-          const normalized = this.normalizeSyncMessage(msg);
-          if (normalized && normalized.senderWxid !== this.wxid) {
-            this._onMessage?.(normalized);
-          }
-        }
+        // Hand the unwrapped SyncResponse to the shared ingest pipeline
+        // (synckey update, contacts, wxid-from-ModUserInfos, filters, dedup,
+        // normalize, drop-own-DM, emit) — same path as Sync/webhook.
+        this.ingestSyncMessages(inner);
       } catch (e) {
         this.log.debug("WCPP MAX: WS message parse error", e);
       }
     });
 
     this.maxWs.on("close", (code) => {
-      this.log.warn(`WCPP MAX: WebSocket closed (code=${code}), reconnecting in 5s...`);
+      this.log.warn(`WCPP MAX: WebSocket closed (code=${code})`);
+      // Stop pinging the dead socket; connectMaxWebSocket will start a fresh
+      // interval on the next connection.
+      if (this.maxWsPingTimer) {
+        clearInterval(this.maxWsPingTimer);
+        this.maxWsPingTimer = null;
+      }
       this.scheduleMaxWsReconnect();
     });
 
     this.maxWs.on("error", (err) => this.log.error("WCPP MAX: WebSocket error", err));
 
-    // Keepalive
-    const pingInterval = setInterval(() => {
+    // Keepalive — single interval owned by this.maxWsPingTimer (cleared at the
+    // top of connectMaxWebSocket, in 'close', and in disconnectMaxWebSocket) so
+    // a reconnect never leaves a stale interval pinging the new socket.
+    this.maxWsPingTimer = setInterval(() => {
       if (this.maxWs?.readyState === WebSocket.OPEN) {
         this.maxWs.ping();
-      } else {
-        clearInterval(pingInterval);
+      } else if (this.maxWsPingTimer) {
+        clearInterval(this.maxWsPingTimer);
+        this.maxWsPingTimer = null;
       }
     }, 30_000);
   }
 
   private scheduleMaxWsReconnect(): void {
     if (this.maxWsReconnectTimer) return;
+    // Exponential backoff with a cap + jitter — a tight fixed-interval
+    // reconnect loop is exactly the suspicious connect/disconnect pattern
+    // CLAUDE.md's account-safety rules warn against.
+    const base = Math.min(5000 * 2 ** this.maxWsReconnectAttempt, 60_000);
+    const jitter = base * (Math.random() * 0.4 - 0.2); // ±20%
+    const delay = Math.max(0, Math.round(base + jitter));
+    this.maxWsReconnectAttempt += 1;
+    this.log.warn(`WCPP MAX: reconnecting WebSocket in ${delay}ms (attempt ${this.maxWsReconnectAttempt})`);
     this.maxWsReconnectTimer = setTimeout(() => {
       this.maxWsReconnectTimer = null;
       this.connectMaxWebSocket();
-    }, 5000);
+    }, delay);
   }
 
   disconnectMaxWebSocket(): void {
     if (this.maxWsReconnectTimer) {
       clearTimeout(this.maxWsReconnectTimer);
       this.maxWsReconnectTimer = null;
+    }
+    if (this.maxWsPingTimer) {
+      clearInterval(this.maxWsPingTimer);
+      this.maxWsPingTimer = null;
     }
     if (this.maxWs) {
       this.maxWs.removeAllListeners();
@@ -1130,8 +1092,24 @@ export class WcppClient {
       }
 
       let body = "";
-      req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+      let bodyBytes = 0;
+      let bodyTooLarge = false;
+      const MAX_BODY_BYTES = 5 * 1024 * 1024;
+      req.on("data", (chunk: Buffer) => {
+        if (bodyTooLarge) return;
+        bodyBytes += chunk.length;
+        if (bodyBytes > MAX_BODY_BYTES) {
+          bodyTooLarge = true;
+          this.log.warn(`WCPP MAX: webhook body exceeded ${MAX_BODY_BYTES} bytes, rejecting (413)`);
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "payload too large" }));
+          req.destroy();
+          return;
+        }
+        body += chunk.toString();
+      });
       req.on("end", () => {
+        if (bodyTooLarge) return;
         try {
           const envelope = JSON.parse(body) as WebhookEnvelope;
 
@@ -1397,7 +1375,7 @@ export class WcppClient {
       } else if (this.config.host) {
         this.log.info("WCPPM: webhookEnabled but no webhookUrl set; skipping /Webhook/Set (operator-managed)");
       } else {
-        this.log.info("WCPPM: passive webhook-only mode; /Webhook/Set + /Login/Newinit are operator-managed");
+        this.log.info("WCPPM: passive webhook-only mode; /Webhook/Set is operator-managed (the push longlink comes up automatically at login — do NOT call /Login/Newinit)");
       }
     }
   }
@@ -1443,18 +1421,20 @@ export class WcppClient {
       return false;
     }
 
-    const url = `${this.baseUrl}/message/SendImageNewMessage?${this.authQuery()}`;
+    // Confirmed path: /api/Msg/UploadImg (发送图片), payload { Base64, ToWxid }
+    // — see docs/api-reference/api/356821074e0.md. The old
+    // /message/SendImageNewMessage path + MsgItem/ImageContent shape do not
+    // exist in the MAX API and 404'd silently.
+    const url = `${this.baseUrl}/api/Msg/UploadImg?${this.authQuery()}`;
 
     try {
       const res = await this.httpFetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          MsgItem: [{ ImageContent: base64Data, MsgType: 3, ToUserName: to }],
-        }),
+        body: JSON.stringify({ Base64: base64Data, ToWxid: to }),
       });
       const data = (await res.json()) as any;
-      return data.Code === 200;
+      return data.Code === 0 || data.Code === 200;
     } catch (e) {
       this.log.error("WCPP: error sending image", e);
       return false;
@@ -1734,7 +1714,7 @@ export class WcppClient {
     if (cached?.NickName?.string) return cached.NickName.string;
 
     try {
-      const res = await this.httpFetch(`${this.baseUrl}/group/GetChatroomMemberDetail?${this.authQuery()}`, {
+      const res = await this.httpFetch(`${this.baseUrl}/api/Group/GetChatRoomMemberDetail?${this.authQuery()}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ChatRoomName: groupId }),
@@ -1752,7 +1732,13 @@ export class WcppClient {
 
   async getContactList(): Promise<string[] | null> {
     try {
-      const res = await this.httpFetch(`${this.baseUrl}/friend/GetContactList?${this.authQuery()}`, {
+      // Confirmed path: /api/Friend/GetContractList (upstream spells it
+      // "Contract", not "Contact") — see docs/api-reference/api/356820974e0.md.
+      // TODO(verify body): the doc schema uses lowercase
+      // currentChatRoomContactSeq / currentWxcontactSeq; we still send the
+      // PascalCase variants below. Leaving the body as-is to keep this change
+      // path-only; confirm field casing against a live MAX response.
+      const res = await this.httpFetch(`${this.baseUrl}/api/Friend/GetContractList?${this.authQuery()}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ CurrentChatRoomContactSeq: 0, CurrentWxcontactSeq: 0 }),
