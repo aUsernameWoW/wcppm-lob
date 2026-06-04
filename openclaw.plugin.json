@@ -114,7 +114,7 @@
           },
           "proxy": {
             "type": "string",
-            "description": "Proxy URL for outbound HTTP/WS (e.g. socks5://user:pass@host:port)"
+            "description": "Proxy URL for outbound HTTP + WS (http://, https://, or socks5://[user:pass@]host:port). Leave EMPTY for a direct connection — empty explicitly bypasses any ambient/host env proxy, it is not inherited."
           }
         }
       },
@@ -213,6 +213,7 @@
         "proxy": {
           "label": "Proxy URL",
           "placeholder": "socks5://user:pass@host:port",
+          "help": "Routes outbound HTTP + WebSocket through this proxy. Empty = direct (explicitly ignores any host env proxy). Supports http(s):// and socks5://.",
           "advanced": true
         }
       }

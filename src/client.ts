@@ -12,9 +12,11 @@
  */
 
 import WebSocket from "ws";
+import { fetch as undiciFetch } from "undici";
 import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Logger } from "openclaw/plugin-sdk/channel-core";
+import { buildProxyTransport, type ProxyTransport } from "./proxy.js";
 
 // ──────────────────────────────────────────────
 // Config
@@ -28,6 +30,12 @@ export interface WcppConfig {
   authcode?: string;
   /** Cached self wxid (optional; auto-detected from Newinit / WS envelope). */
   wxid?: string;
+  /**
+   * Proxy URL for outbound HTTP + WS (e.g. `http://host:port`,
+   * `socks5://user:pass@host:port`). **Empty/unset = explicit direct
+   * connection** that bypasses any process-global env proxy (OpenClaw installs
+   * a global undici EnvHttpProxyAgent — see ./proxy.ts for why empty ≠ no-op).
+   */
   proxy?: string;
   replyWithMention?: boolean;
   /** Override WebSocket URL (default: ws://{host}:8089/ws/sync?authcode=…). */
@@ -350,6 +358,9 @@ export class WcppClient {
   private _onMessage: MessageHandler | null = null;
   private config: WcppConfig;
 
+  // Outbound proxy transport (direct unless `proxy` is configured)
+  private proxyTransport: ProxyTransport;
+
   constructor(
     config: WcppConfig,
     private log: Logger,
@@ -358,6 +369,25 @@ export class WcppClient {
     this.wxid = config.wxid ?? null;
     this.baseUrl = config.host ? `http://${config.host}:${config.port}` : "";
     this.synckey = ""; // empty until we ingest a real KeyBuf cursor; doSyncRequest omits Synckey while empty
+    // Throws on an unsupported proxy scheme — fail fast at startup with a clear message.
+    this.proxyTransport = buildProxyTransport(config.proxy);
+    this.log.info(
+      this.proxyTransport.kind === "direct"
+        ? "WCPP MAX: outbound = direct (no proxy; bypasses any ambient env proxy)"
+        : `WCPP MAX: outbound via ${this.proxyTransport.kind} proxy`,
+    );
+  }
+
+  /**
+   * fetch() that always carries our proxy dispatcher. For the direct case the
+   * dispatcher is a plain undici Agent, which is what overrides OpenClaw's
+   * process-global EnvHttpProxyAgent — a bare fetch() would inherit it.
+   */
+  private httpFetch(
+    input: string,
+    init: Parameters<typeof undiciFetch>[1] = {},
+  ): ReturnType<typeof undiciFetch> {
+    return undiciFetch(input, { ...init, dispatcher: this.proxyTransport.dispatcher });
   }
 
   private requireAuthcode(): string {
@@ -457,7 +487,7 @@ export class WcppClient {
     if (currentSynckey) url += `&CurrentSynckey=${encodeURIComponent(currentSynckey)}`;
 
     try {
-      const res = await fetch(url, { method: "POST" });
+      const res = await this.httpFetch(url, { method: "POST" });
       if (!res.ok) {
         this.log.error(`WCPP MAX: Newinit HTTP ${res.status}`);
         return null;
@@ -502,7 +532,7 @@ export class WcppClient {
     if (this.synckey) payload.Synckey = this.synckey;
 
     try {
-      const res = await fetch(url, {
+      const res = await this.httpFetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Accept": "application/json" },
         body: JSON.stringify(payload),
@@ -962,7 +992,9 @@ export class WcppClient {
     const wsUrl = this.config.wsUrl ?? `ws://${this.config.host}:8089/ws/sync?authcode=${authcode}`;
     this.log.info(`WCPP MAX: connecting WebSocket to ${wsUrl.replace(/authcode=[^&]+/, "authcode=***")}`);
 
-    this.maxWs = new WebSocket(wsUrl);
+    this.maxWs = this.proxyTransport.wsAgent
+      ? new WebSocket(wsUrl, { agent: this.proxyTransport.wsAgent })
+      : new WebSocket(wsUrl);
 
     this.maxWs.on("open", () => {
       this.log.info("WCPP MAX: WebSocket connected");
@@ -1311,7 +1343,7 @@ export class WcppClient {
     };
 
     try {
-      const res = await fetch(`${this.baseUrl}/api/Webhook/Set?authcode=${authcode}`, {
+      const res = await this.httpFetch(`${this.baseUrl}/api/Webhook/Set?authcode=${authcode}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -1336,7 +1368,7 @@ export class WcppClient {
     const authcode = this.config.authcode;
     if (!authcode) return;
     try {
-      await fetch(`${this.baseUrl}/api/Webhook/Remove?authcode=${authcode}`, { method: "POST" });
+      await this.httpFetch(`${this.baseUrl}/api/Webhook/Remove?authcode=${authcode}`, { method: "POST" });
       this.log.info("WCPP MAX: webhook removed");
     } catch {
       // Best-effort cleanup
@@ -1390,7 +1422,7 @@ export class WcppClient {
 
     const url = `${this.baseUrl}/api/Msg/SendTxt?${this.authQuery()}`;
     try {
-      const res = await fetch(url, {
+      const res = await this.httpFetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ToWxid: to, Content: text, Type: 1 }),
@@ -1414,7 +1446,7 @@ export class WcppClient {
     const url = `${this.baseUrl}/message/SendImageNewMessage?${this.authQuery()}`;
 
     try {
-      const res = await fetch(url, {
+      const res = await this.httpFetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1492,7 +1524,7 @@ export class WcppClient {
   ): Promise<MediaDownloadResult> {
     const url = `${this.baseUrl}${endpoint}?${this.authQuery()}`;
 
-    const res = await fetch(url, {
+    const res = await this.httpFetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "*/*" },
       body: JSON.stringify(payload),
@@ -1677,7 +1709,7 @@ export class WcppClient {
     }
 
     try {
-      const res = await fetch(url, {
+      const res = await this.httpFetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -1702,7 +1734,7 @@ export class WcppClient {
     if (cached?.NickName?.string) return cached.NickName.string;
 
     try {
-      const res = await fetch(`${this.baseUrl}/group/GetChatroomMemberDetail?${this.authQuery()}`, {
+      const res = await this.httpFetch(`${this.baseUrl}/group/GetChatroomMemberDetail?${this.authQuery()}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ChatRoomName: groupId }),
@@ -1720,7 +1752,7 @@ export class WcppClient {
 
   async getContactList(): Promise<string[] | null> {
     try {
-      const res = await fetch(`${this.baseUrl}/friend/GetContactList?${this.authQuery()}`, {
+      const res = await this.httpFetch(`${this.baseUrl}/friend/GetContactList?${this.authQuery()}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ CurrentChatRoomContactSeq: 0, CurrentWxcontactSeq: 0 }),
