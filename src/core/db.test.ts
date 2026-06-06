@@ -87,3 +87,39 @@ test("contacts: re-upserting the same (account,wxid) updates in place, no duplic
 
   db.close();
 });
+
+test("searchContacts: matches wxid or name substring, newest-updated first, respects limit", () => {
+  const db = openDb(":memory:");
+  db.upsertContact({ account: "default", wxid: "wxid_li", name: "李四", updatedAt: 100 });
+  db.upsertContact({ account: "default", wxid: "wxid_zhang", name: "张三", updatedAt: 200 });
+  db.upsertContact({ account: "other", wxid: "wxid_li", name: "李四", updatedAt: 300 });
+
+  const byName = db.searchContacts("default", "李", 10);
+  assert.deepEqual(byName.map((c) => c.wxid), ["wxid_li"]);
+
+  const byWxid = db.searchContacts("default", "wxid_", 10);
+  assert.deepEqual(byWxid.map((c) => c.wxid), ["wxid_zhang", "wxid_li"]); // newest updated_at first
+
+  const limited = db.searchContacts("default", "wxid_", 1);
+  assert.equal(limited.length, 1);
+
+  const empty = db.searchContacts("default", "", 10); // empty q → all in account
+  assert.equal(empty.length, 2);
+
+  db.close();
+});
+
+test("recentInbound: newest-first rows scoped to account, respects limit", () => {
+  const db = openDb(":memory:");
+  db.recordInbound({ id: "a", account: "default", ts: 100, payload: '{"id":"a"}' });
+  db.recordInbound({ id: "b", account: "default", ts: 200, payload: '{"id":"b"}' });
+  db.recordInbound({ id: "x", account: "other", ts: 300, payload: '{"id":"x"}' });
+
+  const rows = db.recentInbound("default", 10);
+  assert.deepEqual(rows.map((r) => r.id), ["b", "a"]); // newest ts first, "other" excluded
+
+  const limited = db.recentInbound("default", 1);
+  assert.deepEqual(limited.map((r) => r.id), ["b"]);
+
+  db.close();
+});

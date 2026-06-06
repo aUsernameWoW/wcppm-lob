@@ -51,6 +51,10 @@ export interface Db {
   upsertContact(contact: ContactEntry): void;
   /** Look up a cached contact/group, or undefined if not cached. */
   getContact(account: string, wxid: string): ContactRow | undefined;
+  /** Read-only: contacts matching wxid/name substring `q`, newest-updated first. Empty q → all in account. */
+  searchContacts(account: string, q: string, limit: number): ContactRow[];
+  /** Read-only: most-recent inbound rows for an account, newest first. */
+  recentInbound(account: string, limit: number): InboundRow[];
   close(): void;
 }
 
@@ -98,6 +102,14 @@ export function openDb(path: string): Db {
   const getContactStmt = db.prepare(
     "SELECT account, wxid, name, type, extra, updated_at FROM contacts WHERE account = ? AND wxid = ?",
   );
+  const searchContactsStmt = db.prepare(
+    "SELECT account, wxid, name, type, extra, updated_at FROM contacts" +
+      " WHERE account = ? AND (wxid LIKE ? OR name LIKE ?) ORDER BY updated_at DESC LIMIT ?",
+  );
+  const recentInboundStmt = db.prepare(
+    "SELECT id, account, ts, payload, delivered_at FROM inbound_log" +
+      " WHERE account = ? ORDER BY ts DESC LIMIT ?",
+  );
 
   return {
     recordInbound(entry) {
@@ -125,6 +137,13 @@ export function openDb(path: string): Db {
     },
     getContact(account, wxid) {
       return getContactStmt.get(account, wxid) as ContactRow | undefined;
+    },
+    searchContacts(account, q, limit) {
+      const like = `%${q}%`;
+      return searchContactsStmt.all(account, like, like, limit) as unknown as ContactRow[];
+    },
+    recentInbound(account, limit) {
+      return recentInboundStmt.all(account, limit) as unknown as InboundRow[];
     },
     close() {
       db.close();
