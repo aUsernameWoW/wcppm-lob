@@ -68,7 +68,8 @@ function main(): void {
   const bridge = createBridgeClient({
     url, token, account, autoAck: false,
     onMessage: (frame: Frame) => update(applyFrame(state, frame)),
-    onReady: (selfWxid) => update(applyStatus(state, { ...state.status, wsUp: true, selfWxid })),
+    onReady: (selfWxid) => update(setConnected(applyStatus(state, { ...state.status, wsUp: true, selfWxid }), true)),
+    onDisconnect: () => update(setConnected(state, false)),
   });
 
   async function execute(cmd: Command): Promise<void> {

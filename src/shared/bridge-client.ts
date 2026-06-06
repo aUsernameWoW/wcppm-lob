@@ -22,6 +22,8 @@ export interface BridgeClientOpts {
   account?: string;
   onMessage: (frame: Frame) => void;
   onReady?: (selfWxid: string) => void;
+  /** Called when the WS closes unexpectedly (before a reconnect attempt). */
+  onDisconnect?: () => void;
   log?: Logger;
   /** Auto-ack each received message frame (default true). */
   autoAck?: boolean;
@@ -94,6 +96,7 @@ export function createBridgeClient(opts: BridgeClientOpts): BridgeClient {
 
     socket.on("close", () => {
       if (closed) return;
+      opts.onDisconnect?.();
       log?.warn?.(`bridge-client WS closed; reconnecting in ${reconnectDelayMs}ms`);
       reconnectTimer = setTimeout(openSocket, reconnectDelayMs);
     });
@@ -166,7 +169,7 @@ export function createBridgeClient(opts: BridgeClientOpts): BridgeClient {
     async getHistory(o) {
       const params = new URLSearchParams({ account: o.account ?? account });
       if (o.chat) params.set("chat", o.chat);
-      if (o.limit) params.set("limit", String(o.limit));
+      if (o.limit !== undefined && o.limit > 0) params.set("limit", String(o.limit));
       const r = await getJson(`/history?${params.toString()}`);
       return Array.isArray(r) ? (r as Frame[]) : [];
     },

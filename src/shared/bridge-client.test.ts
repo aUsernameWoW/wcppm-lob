@@ -114,6 +114,31 @@ test("bridge-client.send: a wrong token yields ok:false (server 401)", async () 
   await server.close();
 });
 
+test("onDisconnect fires when the WS closes unexpectedly", async () => {
+  const server = createBridgeServer({
+    token: "tkn",
+    db: { getUndelivered: () => [], markDelivered: () => {} },
+    send: async () => ({ ok: true }),
+    forceSync: async () => ({ ok: true }),
+    status: () => ({ wsUp: true, selfWxid: "wxid_self" }),
+    selfWxid: () => "wxid_self",
+  });
+  const port = await server.listen(0);
+  let disconnected = false;
+  let client: ReturnType<typeof createBridgeClient>;
+  const done = new Promise<void>((resolve) => {
+    client = createBridgeClient({
+      url: `ws://127.0.0.1:${port}`, token: "tkn", reconnectDelayMs: 50,
+      onMessage: () => {},
+      onReady: () => { void server.close(); }, // drop the connection right after we connect
+      onDisconnect: () => { disconnected = true; client.close(); resolve(); },
+    });
+    client.connect();
+  });
+  await done;
+  assert.equal(disconnected, true);
+});
+
 test("getContacts/getHistory/getHealth hit the read-only endpoints", async () => {
   const frame = { type: "message", id: "h1", account: "default", chatType: "direct",
     from: { wxid: "wxid_li" }, chat: { id: "wxid_li" }, text: "hi", mentionedMe: false, ts: 10 };
