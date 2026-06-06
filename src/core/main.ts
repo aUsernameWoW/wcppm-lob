@@ -22,6 +22,7 @@ import { createBridgeServer, type ServerDeps } from "./server.js";
 import { createSendHandler } from "./wiring.js";
 import { handleInbound } from "./ingest.js";
 import type { Logger } from "../shared/logger.js";
+import type { Frame } from "../shared/frame.js";
 
 const logger: Logger = {
   info: (...a: unknown[]) => console.log("[wcppm]", ...a),
@@ -69,6 +70,29 @@ async function main(): Promise<void> {
     },
     status: () => ({ wsUp, selfWxid: client.wxid ?? undefined, lastMsgTs }),
     selfWxid: () => client.wxid ?? undefined,
+    queryContacts: (account, q, limit) =>
+      db.searchContacts(account, q, limit).map((c) => ({
+        wxid: c.wxid,
+        name: c.name,
+        type: c.type ?? undefined,
+        updatedAt: c.updated_at,
+      })),
+    queryHistory: (account, chat, limit) => {
+      // inbound_log has no chat column; over-fetch then filter parsed frames by chat.
+      const fetchN = chat ? Math.min(limit * 20, 500) : limit;
+      const rows = db.recentInbound(account, fetchN);
+      let frames = rows
+        .map((r) => {
+          try {
+            return JSON.parse(r.payload) as Frame;
+          } catch {
+            return undefined;
+          }
+        })
+        .filter((f): f is Frame => f !== undefined);
+      if (chat) frames = frames.filter((f) => f.chat.id === chat || f.chat.name === chat);
+      return frames.slice(0, limit);
+    },
   };
 
   const server = createBridgeServer(deps);
@@ -89,23 +113,23 @@ async function main(): Promise<void> {
     }
   };
 
-  // Bring up WeChat transports PASSIVELY — no startup /Msg/Sync probe. The WS
-  // push longlink authenticates with the authcode itself and supplies self-wxid
-  // via its envelope; the SyncKey cursor isn't needed (forceSync's first call
-  // omits it). So there is no reason to actively pull on connect — keeping
-  // startup passive is better for account safety. (forceSync stays operator-only.)
+  // Bring up WeChat transports PASSIVELY — no startup /Msg/Sync probe. connect()
+  // is the SINGLE owner of inbound bring-up: it opens the WS push (when host is
+  // set), starts the local webhook listener (when webhookEnabled), and registers
+  // the webhook via /Webhook/Set (when host + webhookUrl). Call it exactly once —
+  // also calling startWebhookServer() here would listen() the webhook port twice
+  // → EADDRINUSE, and would double-fire the active /Webhook/Set call.
+  // The WS push longlink authenticates with the authcode itself and supplies
+  // self-wxid via its envelope; the SyncKey cursor isn't needed (forceSync's
+  // first call omits it). So there is no reason to actively pull on connect —
+  // keeping startup passive is better for account safety. (forceSync stays
+  // operator-only.)
+  client.connect();
   if (cfg.wcpp.host) {
-    client.connect();
     wsUp = true;
     logger.info(`WeChat: connecting WS push to ${cfg.wcpp.host} (passive; no startup Sync)`);
   } else {
     logger.info("WeChat: passive webhook-only mode (no host)");
-  }
-  if (cfg.wcpp.webhookEnabled) {
-    client.startWebhookServer();
-    if (cfg.wcpp.host && cfg.wcpp.webhookUrl) {
-      await client.registerWebhook();
-    }
   }
 
   const port = await server.listen(cfg.bridgePort, cfg.bridgeHost);
