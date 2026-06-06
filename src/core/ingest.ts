@@ -24,10 +24,14 @@ export function handleInbound(msg: NormalizedMessage, deps: IngestDeps): boolean
   const { account, db, broadcast, resolveName } = deps;
   const frame = buildFrame(msg, { account });
 
+  // Fill names from the contact cache only where buildFrame didn't already
+  // derive one from pushContent (pushContent takes precedence, as before).
   if (resolveName) {
-    const fromName = resolveName(frame.from.wxid);
-    if (fromName) frame.from.name = fromName;
-    if (frame.chatType === "group") {
+    if (!frame.from.name) {
+      const fromName = resolveName(frame.from.wxid);
+      if (fromName) frame.from.name = fromName;
+    }
+    if (frame.chatType === "group" && !frame.chat.name) {
       const chatName = resolveName(frame.chat.id);
       if (chatName) frame.chat.name = chatName;
     }

@@ -67,6 +67,35 @@ test("buildFrame: direct message → from=peer, chat=peer, mentionedMe always fa
   assert.equal(frame.account, "acct2");
 });
 
+test("buildFrame: derives from.name from pushContent ('Nick : text')", () => {
+  const msg = baseMsg({ fromUser: "wxid_a", senderWxid: "", pushContent: "Alice : hello there" });
+  const frame = buildFrame(msg, { account: "default" });
+  assert.equal(frame.from.name, "Alice");
+});
+
+test("buildFrame: maps msg.quote → frame.quote", () => {
+  const msg = baseMsg({
+    quote: {
+      referMsgId: "q9",
+      referSenderWxid: "wxid_q",
+      referDisplayName: "Quoted Bob",
+      referContent: "...",
+      referType: 1,
+      referSummary: "the quoted text",
+    },
+  });
+  const frame = buildFrame(msg, { account: "default" });
+  assert.equal(frame.quote?.id, "q9");
+  assert.equal(frame.quote?.summary, "the quoted text");
+  assert.equal(frame.quote?.senderName, "Quoted Bob");
+  assert.equal(frame.quote?.senderWxid, "wxid_q");
+});
+
+test("buildFrame: no quote → frame.quote is undefined", () => {
+  const frame = buildFrame(baseMsg(), { account: "default" });
+  assert.equal(frame.quote, undefined);
+});
+
 test("buildFrame: media descriptor in opts is attached to the frame", () => {
   const msg = baseMsg({ msgType: 3, text: "[image]" });
 

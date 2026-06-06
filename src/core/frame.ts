@@ -15,18 +15,47 @@ export interface BuildFrameOpts {
   media?: FrameMedia;
 }
 
+/**
+ * Best-effort sender display name from WeChat's pushContent, which looks like
+ * "Nickname : message text" or "Nickname sent you a ...". Returns "" if no
+ * name can be extracted. (Contact-cache resolution is layered on in ingest.)
+ */
+export function deriveSenderName(pushContent: string): string {
+  if (!pushContent) return "";
+  const colonIdx = pushContent.indexOf(" : ");
+  if (colonIdx > 0) return pushContent.substring(0, colonIdx);
+  const sentIdx = pushContent.indexOf(" sent ");
+  if (sentIdx > 0) return pushContent.substring(0, sentIdx).trim();
+  return "";
+}
+
 export function buildFrame(msg: NormalizedMessage, opts: BuildFrameOpts): Frame {
+  const from: { wxid: string; name?: string } = {
+    wxid: msg.isGroup ? msg.senderWxid : msg.fromUser,
+  };
+  const name = deriveSenderName(msg.pushContent);
+  if (name) from.name = name;
+
   const frame: Frame = {
     type: "message",
     id: msg.msgId,
     account: opts.account,
     chatType: msg.isGroup ? "group" : "direct",
-    from: { wxid: msg.isGroup ? msg.senderWxid : msg.fromUser },
+    from,
     chat: { id: msg.isGroup ? (msg.groupId ?? msg.fromUser) : msg.fromUser },
     text: msg.text,
     mentionedMe: msg.isGroup ? msg.isAtBot : false,
     ts: msg.createTime,
   };
+
+  if (msg.quote) {
+    frame.quote = {
+      id: msg.quote.referMsgId,
+      summary: msg.quote.referSummary,
+      senderName: msg.quote.referDisplayName,
+      senderWxid: msg.quote.referSenderWxid,
+    };
+  }
   if (opts.media) frame.media = opts.media;
   return frame;
 }

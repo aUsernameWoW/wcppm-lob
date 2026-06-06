@@ -18,6 +18,18 @@ export interface FrameMedia {
   localPath?: string;
 }
 
+/** What an inbound message quotes/replies to, when present. */
+export interface FrameQuote {
+  /** Server-side id of the quoted message. */
+  id?: string;
+  /** Human-readable summary of the quoted content. */
+  summary?: string;
+  /** Display name of the quoted message's sender. */
+  senderName?: string;
+  /** wxid of the quoted message's sender. */
+  senderWxid?: string;
+}
+
 export interface Frame {
   type: "message";
   /** Globally-unique id (the dedup key). */
@@ -32,6 +44,8 @@ export interface Frame {
   text: string;
   /** Group @bot mention (always false for DMs). */
   mentionedMe: boolean;
+  /** Reply/quote context, when this message quotes another. */
+  quote?: FrameQuote;
   media?: FrameMedia;
   /** Server time (seconds). */
   ts: number;
