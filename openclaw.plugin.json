@@ -3,7 +3,7 @@
   "kind": "channel",
   "channels": ["wechatpadpro"],
   "name": "WeChatPadPro",
-  "description": "OpenClaw channel plugin for WeChatPadProMax",
+  "description": "OpenClaw channel plugin for WeChat — thin client of the WeChatPadPro middleware",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -12,184 +12,53 @@
   "channelConfigs": {
     "wechatpadpro": {
       "label": "WeChatPadPro",
-      "description": "Connect OpenClaw to WeChat via WeChatPadProMax (iPad protocol). WebSocket is the base transport; webhook can be enabled as an additional inbound channel.",
+      "description": "Connect OpenClaw to WeChat via the standalone WeChatPadPro middleware. This plugin is a thin client: it subscribes to the middleware over WebSocket for inbound messages and POSTs outbound sends. The WeChat server connection (host, authcode, webhook) is configured on the middleware itself, not here.",
       "schema": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "host": {
+          "bridgeUrl": {
             "type": "string",
-            "description": "WeChatPadProMax server host (IP or hostname). Required for outbound; leave empty only for passive webhook-only receivers."
+            "description": "WebSocket base URL of the WeChatPadPro middleware, e.g. ws://127.0.0.1:8077",
+            "default": "ws://127.0.0.1:8077"
           },
-          "port": {
-            "type": "number",
-            "description": "WeChatPadProMax HTTP API port",
-            "default": 8062
-          },
-          "authcode": {
+          "bridgeToken": {
             "type": "string",
-            "description": "WeChatPadProMax authcode"
+            "description": "Bearer token shared with the middleware (must match the middleware's bridgeToken)."
           },
-          "wxid": {
+          "account": {
             "type": "string",
-            "description": "WeChat ID (optional; auto-detected from Newinit / WS envelope)"
-          },
-          "wsUrl": {
-            "type": "string",
-            "description": "Custom WebSocket URL (auto-constructed from host as ws://{host}:8089/ws/sync when empty)"
-          },
-          "webhookEnabled": {
-            "type": "boolean",
-            "description": "Additionally run a local HTTP listener and register it with WCPPM so pushes arrive via webhook as well as WebSocket. Duplicates are deduped by MsgId.",
-            "default": false
-          },
-          "webhookUrl": {
-            "type": "string",
-            "description": "Public URL WCPPM will POST to (used for auto-registration via /Webhook/Set). Required when webhookEnabled and host is set; ignored in passive webhook-only mode."
-          },
-          "webhookHost": {
-            "type": "string",
-            "description": "Bind address for the local webhook HTTP server (default 127.0.0.1; set 0.0.0.0 to expose directly without a reverse proxy)",
-            "default": "127.0.0.1"
-          },
-          "webhookPort": {
-            "type": "number",
-            "description": "Local HTTP server port for receiving webhook pushes",
-            "default": 8000
-          },
-          "webhookPath": {
-            "type": "string",
-            "description": "Path for the webhook endpoint (default /webhook)"
-          },
-          "webhookSecret": {
-            "type": "string",
-            "description": "HMAC-SHA256 secret for webhook signature verification (strongly recommended)"
-          },
-          "webhookDebug": {
-            "type": "boolean",
-            "description": "On signature mismatch, log full signing input and return diagnostic fields in 401 body. Leaks a 12-char HMAC prefix — disable in production.",
-            "default": false
-          },
-          "webhookSilentDropUnsigned": {
-            "type": "boolean",
-            "description": "If a push arrives with an empty body.Signature, return 200 and drop the messages instead of 401. Escape hatch for draining a WCPPM retry queue built while no secret was configured. Wrong-but-non-empty signatures are still rejected.",
-            "default": false
-          },
-          "readOnly": {
-            "type": "boolean",
-            "description": "Receive-only mode — blocks all outbound sends for account safety",
-            "default": false
-          },
-          "maxMessageAge": {
-            "type": "number",
-            "description": "Drop messages older than this many seconds (avoids replaying stale history)",
-            "default": 180
+            "description": "Middleware account id to subscribe as.",
+            "default": "default"
           },
           "dmSecurity": {
             "type": "string",
             "enum": ["allowlist", "allow-all", "pairing"],
-            "description": "DM security policy",
+            "description": "DM security policy (enforced in this adapter before the agent runs).",
             "default": "allowlist"
           },
           "allowFrom": {
             "type": "array",
             "items": { "type": "string" },
-            "description": "List of wxid allowed to DM the bot (used when dmSecurity = allowlist)"
-          },
-          "allowMsgTypes": {
-            "type": "array",
-            "items": { "type": "number" },
-            "description": "Message types to pass through (1=text, 3=image, 34=voice, 47=sticker, 48=location, 49=app)",
-            "default": [1, 3, 34, 47, 48, 49]
-          },
-          "passRevokemsg": {
-            "type": "boolean",
-            "description": "Pass through message recall notifications (MsgType 10002 revokemsg)",
-            "default": true
-          },
-          "replyWithMention": {
-            "type": "boolean",
-            "description": "In group chats, prefix replies with @sender mention",
-            "default": false
-          },
-          "proxy": {
-            "type": "string",
-            "description": "Proxy URL for outbound HTTP + WS (http://, https://, or socks5://[user:pass@]host:port). Leave EMPTY for a direct connection — empty explicitly bypasses any ambient/host env proxy, it is not inherited."
+            "description": "List of wxid allowed to DM the bot (used when dmSecurity = allowlist)."
           }
         }
       },
       "uiHints": {
-        "host": {
-          "label": "Server Host",
-          "placeholder": "192.168.1.100",
-          "help": "WeChatPadProMax server IP or hostname. Leave empty only for passive webhook-only receivers (no outbound)."
+        "bridgeUrl": {
+          "label": "Middleware URL",
+          "placeholder": "ws://127.0.0.1:8077",
+          "help": "WebSocket base URL of the WeChatPadPro middleware process. The adapter connects here for inbound messages and derives the HTTP send endpoint from it."
         },
-        "port": {
-          "label": "Server Port",
-          "help": "Default 8062"
-        },
-        "authcode": {
-          "label": "Authcode",
+        "bridgeToken": {
+          "label": "Bridge Token",
           "sensitive": true,
-          "help": "WeChatPadProMax authcode"
+          "help": "Shared bearer token; must equal the middleware's bridgeToken."
         },
-        "wxid": {
-          "label": "WeChat ID",
-          "help": "Auto-detected from Newinit response / WS envelope when left empty"
-        },
-        "wsUrl": {
-          "label": "WebSocket URL",
-          "placeholder": "ws://host:8089/ws/sync",
+        "account": {
+          "label": "Account",
           "advanced": true,
-          "help": "Optional override; auto-constructed from host when empty"
-        },
-        "webhookEnabled": {
-          "label": "Enable Webhook Receiver",
-          "help": "Also accept inbound pushes over HTTP webhook in addition to WebSocket. Useful as a redundancy layer; duplicates are deduped by MsgId."
-        },
-        "webhookUrl": {
-          "label": "Webhook URL",
-          "placeholder": "http://YOUR_IP:8000/webhook",
-          "help": "Public URL WCPPM will POST to. Required when webhookEnabled and host is set."
-        },
-        "webhookHost": {
-          "label": "Webhook Bind Address",
-          "advanced": true,
-          "help": "Default 127.0.0.1 (loopback, behind reverse proxy). Set 0.0.0.0 to expose the webhook server directly on all interfaces."
-        },
-        "webhookPort": {
-          "label": "Webhook Port",
-          "advanced": true,
-          "help": "Local HTTP listener port"
-        },
-        "webhookPath": {
-          "label": "Webhook Path",
-          "advanced": true,
-          "help": "Endpoint path (default /webhook)"
-        },
-        "webhookSecret": {
-          "label": "Webhook Secret",
-          "sensitive": true,
-          "help": "HMAC-SHA256 shared secret for signature verification"
-        },
-        "webhookDebug": {
-          "label": "Webhook Debug Mode",
-          "advanced": true,
-          "help": "Enable only while diagnosing signature failures — leaks a 12-char HMAC prefix in logs and 401 bodies."
-        },
-        "webhookSilentDropUnsigned": {
-          "label": "Silently Drop Unsigned Pushes",
-          "advanced": true,
-          "help": "Workaround for a poisoned WCPPM retry queue. Turn on to drain, then turn off to restore strict signature verification."
-        },
-        "readOnly": {
-          "label": "Read-Only Mode",
-          "help": "Receive only; blocks all outbound sends (account safety)"
-        },
-        "maxMessageAge": {
-          "label": "Max Message Age (s)",
-          "advanced": true,
-          "help": "Drop messages older than this to avoid replaying stale history on reconnect"
+          "help": "Middleware account id to subscribe as (default \"default\")."
         },
         "dmSecurity": {
           "label": "DM Security Policy"
@@ -197,24 +66,6 @@
         "allowFrom": {
           "label": "DM Allowlist",
           "help": "wxids permitted to DM the bot (used when dmSecurity = allowlist)"
-        },
-        "allowMsgTypes": {
-          "label": "Allowed Message Types",
-          "advanced": true,
-          "help": "1=text, 3=image, 34=voice, 47=sticker, 48=location, 49=app"
-        },
-        "passRevokemsg": {
-          "label": "Pass Revoke Notifications"
-        },
-        "replyWithMention": {
-          "label": "Reply With @Mention",
-          "help": "In group chats, prefix replies with @sender"
-        },
-        "proxy": {
-          "label": "Proxy URL",
-          "placeholder": "socks5://user:pass@host:port",
-          "help": "Routes outbound HTTP + WebSocket through this proxy. Empty = direct (explicitly ignores any host env proxy). Supports http(s):// and socks5://.",
-          "advanced": true
         }
       }
     }
