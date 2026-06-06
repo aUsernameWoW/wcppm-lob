@@ -542,3 +542,44 @@ test("GET /contacts: returns [] when queryContacts dep is absent", async () => {
     await server.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Test 12: GET /history — defaults limit to 50 when omitted
+// ---------------------------------------------------------------------------
+
+test("GET /history: defaults limit to 50 when omitted", async () => {
+  const server = createBridgeServer(
+    makeDeps({
+      queryHistory: (account, chat, limit) => {
+        assert.equal(account, "default");
+        assert.equal(chat, undefined);
+        assert.equal(limit, 50);
+        return [];
+      },
+    }),
+  );
+  const port = await server.listen(0);
+  try {
+    const ok = await httpGet(port, "/history", "test-token");
+    assert.equal(ok.status, 200);
+    assert.deepEqual(ok.body, []);
+  } finally {
+    await server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Test 13: GET /history — returns [] when queryHistory dep is absent
+// ---------------------------------------------------------------------------
+
+test("GET /history: returns [] when queryHistory dep is absent", async () => {
+  const server = createBridgeServer(makeDeps()); // no queryHistory
+  const port = await server.listen(0);
+  try {
+    const ok = await httpGet(port, "/history?chat=wxid_li", "test-token");
+    assert.equal(ok.status, 200);
+    assert.deepEqual(ok.body, []);
+  } finally {
+    await server.close();
+  }
+});

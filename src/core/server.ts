@@ -204,7 +204,8 @@ export function createBridgeServer(deps: ServerDeps): BridgeServer {
       }
       const account = url.searchParams.get("account") || "default";
       const q = url.searchParams.get("q") || "";
-      const limit = Number(url.searchParams.get("limit")) || 50;
+      const limitRaw = Number(url.searchParams.get("limit"));
+      const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 50;
       sendJson(res, 200, deps.queryContacts?.(account, q, limit) ?? []);
       return;
     }
@@ -217,7 +218,8 @@ export function createBridgeServer(deps: ServerDeps): BridgeServer {
       }
       const account = url.searchParams.get("account") || "default";
       const chat = url.searchParams.get("chat") || undefined;
-      const limit = Number(url.searchParams.get("limit")) || 50;
+      const limitRaw = Number(url.searchParams.get("limit"));
+      const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 50;
       sendJson(res, 200, deps.queryHistory?.(account, chat, limit) ?? []);
       return;
     }
