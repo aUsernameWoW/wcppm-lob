@@ -113,3 +113,32 @@ test("bridge-client.send: a wrong token yields ok:false (server 401)", async () 
 
   await server.close();
 });
+
+test("getContacts/getHistory/getHealth hit the read-only endpoints", async () => {
+  const frame = { type: "message", id: "h1", account: "default", chatType: "direct",
+    from: { wxid: "wxid_li" }, chat: { id: "wxid_li" }, text: "hi", mentionedMe: false, ts: 10 };
+  const server = createBridgeServer({
+    token: "tkn",
+    db: { getUndelivered: () => [], markDelivered: () => {} },
+    send: async () => ({ ok: true }),
+    forceSync: async () => ({ ok: true }),
+    status: () => ({ wsUp: true, selfWxid: "wxid_self", lastMsgTs: 42 }),
+    selfWxid: () => "wxid_self",
+    queryContacts: () => [{ wxid: "wxid_li", name: "李四", type: "friend", updatedAt: 1 }],
+    queryHistory: () => [frame as unknown as Frame],
+  });
+  const port = await server.listen(0);
+  const client = createBridgeClient({ url: `ws://127.0.0.1:${port}`, token: "tkn", onMessage: () => {} });
+  try {
+    assert.deepEqual(await client.getContacts("li"), [
+      { wxid: "wxid_li", name: "李四", type: "friend", updatedAt: 1 },
+    ]);
+    assert.deepEqual(await client.getHistory({ chat: "wxid_li", limit: 5 }), [frame]);
+    const health = await client.getHealth();
+    assert.equal(health.wsUp, true);
+    assert.equal(health.selfWxid, "wxid_self");
+  } finally {
+    client.close();
+    await server.close();
+  }
+});

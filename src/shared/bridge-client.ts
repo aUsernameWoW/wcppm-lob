@@ -41,6 +41,9 @@ export interface BridgeClient {
   close(): void;
   send(req: SendRequest): Promise<{ ok: boolean; msgId?: string }>;
   forceSync(account?: string): Promise<{ ok: boolean; messages?: number; hasMore?: boolean }>;
+  getContacts(q: string): Promise<Array<{ wxid: string; name: string; type?: string; updatedAt: number }>>;
+  getHistory(opts: { chat?: string; limit?: number; account?: string }): Promise<Frame[]>;
+  getHealth(): Promise<{ wsUp: boolean; selfWxid?: string; lastMsgTs?: number }>;
 }
 
 export function createBridgeClient(opts: BridgeClientOpts): BridgeClient {
@@ -96,6 +99,21 @@ export function createBridgeClient(opts: BridgeClientOpts): BridgeClient {
     });
   }
 
+  async function getJson(path: string): Promise<unknown> {
+    try {
+      const res = await undiciFetch(`${httpBase}${path}`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${opts.token}` },
+        dispatcher,
+      });
+      if (!res.ok) return undefined;
+      return await res.json();
+    } catch (err) {
+      log?.error?.(`bridge-client GET ${path} failed:`, err);
+      return undefined;
+    }
+  }
+
   async function postJson(path: string, body: unknown): Promise<{ ok: boolean; [k: string]: unknown }> {
     try {
       const res = await undiciFetch(`${httpBase}${path}`, {
@@ -139,6 +157,26 @@ export function createBridgeClient(opts: BridgeClientOpts): BridgeClient {
         ok: r.ok,
         messages: typeof r.messages === "number" ? r.messages : undefined,
         hasMore: typeof r.hasMore === "boolean" ? r.hasMore : undefined,
+      };
+    },
+    async getContacts(q) {
+      const r = await getJson(`/contacts?q=${encodeURIComponent(q)}&account=${encodeURIComponent(account)}`);
+      return Array.isArray(r) ? (r as Array<{ wxid: string; name: string; type?: string; updatedAt: number }>) : [];
+    },
+    async getHistory(o) {
+      const params = new URLSearchParams({ account: o.account ?? account });
+      if (o.chat) params.set("chat", o.chat);
+      if (o.limit) params.set("limit", String(o.limit));
+      const r = await getJson(`/history?${params.toString()}`);
+      return Array.isArray(r) ? (r as Frame[]) : [];
+    },
+    async getHealth() {
+      const r = await getJson(`/healthz`);
+      const obj = (r ?? {}) as Record<string, unknown>;
+      return {
+        wsUp: obj.wsUp === true,
+        selfWxid: typeof obj.selfWxid === "string" ? obj.selfWxid : undefined,
+        lastMsgTs: typeof obj.lastMsgTs === "number" ? obj.lastMsgTs : undefined,
       };
     },
   };
