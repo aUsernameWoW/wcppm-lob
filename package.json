@@ -9,7 +9,8 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "test": "NODE_OPTIONS=--disable-warning=ExperimentalWarning npx tsx --test \"src/**/*.test.ts\"",
-    "debug": "npx tsx tools/debug.ts"
+    "debug": "npx tsx tools/debug.ts",
+    "console": "npx tsx src/console/main.ts"
   },
   "dependencies": {
     "fetch-socks": "^1.3.3",
