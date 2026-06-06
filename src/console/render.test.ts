@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import type { Frame } from "../shared/frame.js";
-import { initState, applyFrame, applyStatus, setFilter, setInput, setOverlay } from "./state.js";
+import { initState, applyFrame, applyStatus, setFilter, setInput, setOverlay, scroll, setStatusLine } from "./state.js";
 import { render } from "./render.js";
 
 function frame(over: Partial<Frame> = {}): Frame {
@@ -57,4 +57,36 @@ test("render: degrades gracefully on a tiny terminal", () => {
   const s = initState(10);
   const lines = render(s, { rows: 2, cols: 20 });
   assert.equal(lines.length, 2);
+});
+
+test("render: rows=4 is the minimum valid layout (header, 1 body line, footer, input)", () => {
+  let s = initState(10);
+  s = applyStatus(s, { wsUp: true, selfWxid: "wxid_self" });
+  const lines = render(s, { rows: 4, cols: 40 });
+  assert.equal(lines.length, 4);
+  assert.match(lines[0], /WS up/); // header
+  assert.match(lines[3], /^: /); // input line
+});
+
+test("render: rows=3 falls back to the too-small screen", () => {
+  const s = initState(10);
+  const lines = render(s, { rows: 3, cols: 20 });
+  assert.equal(lines.length, 3);
+  assert.match(lines.join("\n"), /too small/);
+});
+
+test("render: footer shows [scrolled] when not following", () => {
+  let s = initState(10);
+  for (let i = 0; i < 6; i++) s = applyFrame(s, frame({ text: `m${i}` }));
+  s = scroll(s, 3); // scroll up → follow=false
+  const footer = render(s, { rows: 8, cols: 60 })[6]; // rows-2 = footer index
+  assert.match(footer, /\[scrolled\]/);
+});
+
+test("render: statusLine overrides the stats footer", () => {
+  let s = initState(10);
+  s = setStatusLine(s, "✓ sent okay");
+  const footer = render(s, { rows: 8, cols: 60 })[6];
+  assert.match(footer, /✓ sent okay/);
+  assert.doesNotMatch(footer, /recv/);
 });
