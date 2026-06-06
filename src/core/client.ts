@@ -15,7 +15,7 @@ import WebSocket from "ws";
 import { fetch as undiciFetch } from "undici";
 import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createHmac, timingSafeEqual } from "node:crypto";
-import type { Logger } from "./shared/logger.js";
+import type { Logger } from "../shared/logger.js";
 import { buildProxyTransport, type ProxyTransport } from "./proxy.js";
 
 // ──────────────────────────────────────────────

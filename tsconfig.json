@@ -12,7 +12,7 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "paths": {
-      "openclaw/plugin-sdk/*": ["./src/shims/openclaw/*"]
+      "openclaw/plugin-sdk/*": ["./src/adapters/openclaw/shims/openclaw/*"]
     }
   },
   "include": ["src/**/*"],

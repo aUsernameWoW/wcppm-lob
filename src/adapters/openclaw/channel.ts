@@ -16,7 +16,7 @@ import {
   createPreCryptoDirectDmAuthorizer,
   resolveInboundDirectDmAccessWithRuntime,
 } from "openclaw/plugin-sdk/direct-dm-access";
-import { WcppClient, type NormalizedMessage } from "./client.js";
+import { WcppClient, type NormalizedMessage } from "../../core/client.js";
 import { dispatchInboundToOpenClaw, type WcppDmAuthorizer } from "./dispatch.js";
 
 // ──────────────────────────────────────────────

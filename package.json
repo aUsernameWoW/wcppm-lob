@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "type": "module",
   "description": "OpenClaw channel plugin for WeChatPadPro / WeChatPadProMax",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "dist/adapters/openclaw/index.js",
+  "types": "dist/adapters/openclaw/index.d.ts",
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
@@ -25,9 +25,9 @@
   },
   "openclaw": {
     "extensions": [
-      "./dist/index.js"
+      "./dist/adapters/openclaw/index.js"
     ],
-    "setupEntry": "./dist/setup-entry.js",
+    "setupEntry": "./dist/adapters/openclaw/setup-entry.js",
     "channel": {
       "id": "wechatpadpro",
       "label": "WeChatPadPro",
