@@ -31,3 +31,15 @@ test("parseCommand: unknown and empty are errors", () => {
   assert.equal(parseCommand("frobnicate x").kind, "error");
   assert.equal(parseCommand("   ").kind, "error");
 });
+
+test("parseCommand: arg-requiring commands error when the arg is missing", () => {
+  assert.equal(parseCommand("/filter").kind, "error");
+  assert.equal(parseCommand("/grep").kind, "error");
+  assert.equal(parseCommand("r").kind, "error");
+  assert.equal(parseCommand("who").kind, "error");
+});
+
+test("parseCommand: exit is an alias for quit; history n=0 falls back to 20", () => {
+  assert.deepEqual(parseCommand("exit"), { kind: "quit" });
+  assert.deepEqual(parseCommand("history wxid_li 0"), { kind: "history", chat: "wxid_li", limit: 20 });
+});

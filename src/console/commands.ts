@@ -59,7 +59,8 @@ export function parseCommand(line: string): Command {
     case "history": {
       const chat = rest[0];
       if (!chat) return { kind: "error", message: "usage: history <chat> [n]" };
-      const limit = Number(rest[1]) || 20;
+      const n = Number(rest[1]);
+      const limit = rest[1] !== undefined && Number.isFinite(n) && n > 0 ? n : 20;
       return { kind: "history", chat, limit };
     }
     case "status":
