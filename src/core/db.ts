@@ -104,7 +104,7 @@ export function openDb(path: string): Db {
   );
   const searchContactsStmt = db.prepare(
     "SELECT account, wxid, name, type, extra, updated_at FROM contacts" +
-      " WHERE account = ? AND (wxid LIKE ? OR name LIKE ?) ORDER BY updated_at DESC LIMIT ?",
+      " WHERE account = ? AND (wxid LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\') ORDER BY updated_at DESC LIMIT ?",
   );
   const recentInboundStmt = db.prepare(
     "SELECT id, account, ts, payload, delivered_at FROM inbound_log" +
@@ -139,7 +139,8 @@ export function openDb(path: string): Db {
       return getContactStmt.get(account, wxid) as ContactRow | undefined;
     },
     searchContacts(account, q, limit) {
-      const like = `%${q}%`;
+      const escaped = q.replace(/[\\%_]/g, "\\$&");
+      const like = `%${escaped}%`;
       return searchContactsStmt.all(account, like, like, limit) as unknown as ContactRow[];
     },
     recentInbound(account, limit) {

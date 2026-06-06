@@ -109,6 +109,22 @@ test("searchContacts: matches wxid or name substring, newest-updated first, resp
   db.close();
 });
 
+test("searchContacts: treats LIKE metacharacters in q as literals", () => {
+  const db = openDb(":memory:");
+  db.upsertContact({ account: "default", wxid: "wxid_li", name: "李四", updatedAt: 100 });
+  db.upsertContact({ account: "default", wxid: "wxidXli", name: "王五", updatedAt: 200 });
+
+  // "_" must be literal: only wxid_li matches, not wxidXli
+  const underscore = db.searchContacts("default", "wxid_li", 10);
+  assert.deepEqual(underscore.map((c) => c.wxid), ["wxid_li"]);
+
+  // "%" must be literal: nothing literally contains "%"
+  const percent = db.searchContacts("default", "%", 10);
+  assert.equal(percent.length, 0);
+
+  db.close();
+});
+
 test("recentInbound: newest-first rows scoped to account, respects limit", () => {
   const db = openDb(":memory:");
   db.recordInbound({ id: "a", account: "default", ts: 100, payload: '{"id":"a"}' });
