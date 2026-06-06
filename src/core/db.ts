@@ -6,6 +6,8 @@
  *   contacts    — contact/group name cache (rebuildable)
  */
 import { DatabaseSync } from "node:sqlite";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 
 export interface InboundEntry {
   id: string; // NewMsgId — globally unique
@@ -53,6 +55,10 @@ export interface Db {
 }
 
 export function openDb(path: string): Db {
+  // SQLite creates the db file but NOT its parent directory — ensure it exists.
+  if (path !== ":memory:") {
+    mkdirSync(dirname(path), { recursive: true });
+  }
   const db = new DatabaseSync(path);
   db.exec(`
     CREATE TABLE IF NOT EXISTS inbound_log (

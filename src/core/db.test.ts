@@ -1,7 +1,23 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { openDb } from "./db.js";
+
+test("openDb: creates missing parent directories for the db file", () => {
+  const root = join(tmpdir(), `wcppm-db-${process.pid}-${Date.now()}`);
+  const dbPath = join(root, "nested", "share", "state.db");
+  try {
+    const db = openDb(dbPath);
+    db.recordInbound({ id: "x", account: "a", ts: 1, payload: "{}" });
+    db.close();
+    assert.ok(existsSync(dbPath), "db file should exist under freshly-created dirs");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("recordInbound: a new id is inserted (true); the same id again is a duplicate (false)", () => {
   const db = openDb(":memory:");
