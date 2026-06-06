@@ -127,17 +127,20 @@ export interface SyncMessage {
 
 /**
  * WCPP MAX 20260411+ WebSocket envelope.
- * The server wraps SyncResponse in an outer envelope with two known shapes:
- *   - { Data: { syncData: SyncResponse, wxid, time } }
- *   - { Data: { data: SyncResponse, type: "sync_message", timestamp } }
+ *
+ * The outer wrapper is `{ Code, Success, Message, Data: { syncData | data, … } }`.
+ * Verified by live capture (2026-06-07): the inner `syncData` is the SyncResponse
+ * **Data payload directly** — `AddMsgs`/`ModContacts`/`ModUserInfos`/… sit at its
+ * top level and it carries NO `.Success`/`.Data` of its own. (An older shape
+ * nested a full `SyncResponse` under `data`; `handleWsMessage` tolerates both.)
  */
 interface MaxWsEnvelope {
   Code: number;
   Success: boolean;
   Message?: string;
   Data?: {
-    syncData?: SyncResponse;
-    data?: SyncResponse;
+    syncData?: SyncResponse["Data"] | SyncResponse;
+    data?: SyncResponse["Data"] | SyncResponse;
     wxid?: string;
     time?: string;
     type?: string;
@@ -150,6 +153,16 @@ interface MaxWsEnvelope {
 /**
  * Webhook push envelope from WCPP MAX.
  * POST'd to our local HTTP server when webhook mode is active.
+ *
+ * NOTE (verified by live capture 2026-06-07): the 0416 server's webhook is a
+ * signed **doorbell**, not a message carrier — it sends
+ * `{ MessageType: "sync_message", Data: {} }` with an EMPTY `Data` to signal
+ * "new messages available". The actual messages arrive over the WS push
+ * (`handleWsMessage`), so `Data.messages` is typically absent and
+ * `processWebhookMessages` is a no-op for it. We deliberately do NOT Sync in
+ * response (auto-dispatch with no demand is the banned ban-trigger pattern —
+ * see CLAUDE.md Account Safety). The `messages[]` shape below is the legacy
+ * inline-payload format kept for older server modes / `forge-webhook.mjs`.
  */
 interface WebhookEnvelope {
   MessageType: string;
@@ -158,7 +171,7 @@ interface WebhookEnvelope {
   Wxid: string;
   IsSelf: boolean;
   Data: {
-    messages: WebhookMessage[];
+    messages?: WebhookMessage[];
   };
 }
 
@@ -373,8 +386,8 @@ export class WcppClient {
     this.proxyTransport = buildProxyTransport(config.proxy);
     this.log.info(
       this.proxyTransport.kind === "direct"
-        ? "WCPP MAX: outbound = direct (no proxy; bypasses any ambient env proxy)"
-        : `WCPP MAX: outbound via ${this.proxyTransport.kind} proxy`,
+        ? "[net] outbound = direct (no proxy; bypasses any ambient env proxy)"
+        : `[net] outbound via ${this.proxyTransport.kind} proxy`,
     );
   }
 
@@ -431,18 +444,18 @@ export class WcppClient {
    */
   async login(): Promise<WcppCredentials | null> {
     if (!this.config.host) {
-      this.log.info("WCPPM: passive webhook-only mode (no host); skipping server verification");
+      this.log.info("[probe] passive webhook-only mode (no host); skipping server verification");
       return { authcode: this.config.authcode ?? "", wxid: this.wxid ?? "unknown" };
     }
 
     if (!this.config.authcode) {
-      this.log.error("WCPPM: authcode is required when host is set");
+      this.log.error("[probe] authcode is required when host is set");
       return null;
     }
 
     const testResult = await this.doSyncRequest();
     if (!testResult || !testResult.Success) {
-      this.log.error("WCPPM: sync probe failed, authcode may be invalid");
+      this.log.error("[probe] sync probe failed, authcode may be invalid");
       return null;
     }
 
@@ -455,12 +468,12 @@ export class WcppClient {
 
     if (testResult.Data?.ModUserInfos?.[0]) {
       this.wxid = testResult.Data.ModUserInfos[0].UserName.string;
-      this.log.info(`WCPPM: sync probe OK, wxid=${this.wxid}`);
+      this.log.info(`[probe] sync probe OK, wxid=${this.wxid}`);
       this.ingestContacts(testResult);
       return { authcode: this.config.authcode, wxid: this.wxid! };
     }
 
-    this.log.info("WCPPM: sync probe OK but no ModUserInfos");
+    this.log.info("[probe] sync probe OK but no ModUserInfos");
     return { authcode: this.config.authcode, wxid: this.wxid ?? "unknown" };
   }
 
@@ -486,12 +499,12 @@ export class WcppClient {
         body: JSON.stringify(payload),
       });
       if (!res.ok) {
-        this.log.error(`WCPP MAX: Sync HTTP ${res.status}`);
+        this.log.error(`[sync] HTTP ${res.status}`);
         return null;
       }
       return (await res.json()) as SyncResponse;
     } catch (e) {
-      this.log.error("WCPP MAX: Sync request error", e);
+      this.log.error("[sync] request error", e);
       return null;
     }
   }
@@ -530,7 +543,7 @@ export class WcppClient {
     // Extract self wxid from ModUserInfos if not set
     if (!this.wxid && inner.Data.ModUserInfos?.[0]) {
       this.wxid = inner.Data.ModUserInfos[0].UserName.string;
-      this.log.info(`WCPP MAX: detected wxid=${this.wxid} from sync`);
+      this.log.info(`[sync] detected wxid=${this.wxid}`);
     }
 
     // Process messages
@@ -936,7 +949,7 @@ export class WcppClient {
     if (resp.Data) this.processSyncResponse(resp);
     const messages = this.seenMsgIds.size - before;
     const hasMore = (resp.Data?.ContinueFlag ?? 0) !== 0;
-    this.log.info(`WCPPM: forceSync drained one round, ${messages} new message(s), hasMore=${hasMore}`);
+    this.log.info(`[sync] forceSync drained one round, ${messages} new message(s), hasMore=${hasMore}`);
     return { ok: true, messages, hasMore };
   }
 
@@ -953,7 +966,7 @@ export class WcppClient {
   connectMaxWebSocket(): void {
     const authcode = this.config.authcode;
     if (!authcode) {
-      this.log.error("WCPP MAX: cannot connect WS without authcode");
+      this.log.error("[ws] cannot connect without authcode");
       return;
     }
 
@@ -966,51 +979,22 @@ export class WcppClient {
 
     // Use custom wsUrl if provided, otherwise construct from host
     const wsUrl = this.config.wsUrl ?? `ws://${this.config.host}:8089/ws/sync?authcode=${authcode}`;
-    this.log.info(`WCPP MAX: connecting WebSocket to ${wsUrl.replace(/authcode=[^&]+/, "authcode=***")}`);
+    this.log.info(`[ws] connecting to ${wsUrl.replace(/authcode=[^&]+/, "authcode=***")}`);
 
     this.maxWs = this.proxyTransport.wsAgent
       ? new WebSocket(wsUrl, { agent: this.proxyTransport.wsAgent })
       : new WebSocket(wsUrl);
 
     this.maxWs.on("open", () => {
-      this.log.info("WCPP MAX: WebSocket connected");
+      this.log.info("[ws] connected");
       // Healthy connection — reset backoff so the next drop reconnects fast.
       this.maxWsReconnectAttempt = 0;
     });
 
-    this.maxWs.on("message", (raw: WebSocket.Data) => {
-      try {
-        const envelope = JSON.parse(raw.toString()) as MaxWsEnvelope;
-        if (!envelope.Success || !envelope.Data) return;
-
-        // Unwrap: 20260411+ wraps SyncResponse inside Data.syncData or Data.data
-        const inner: SyncResponse | undefined =
-          envelope.Data.syncData ?? envelope.Data.data ?? undefined;
-
-        if (!inner?.Success || !inner?.Data) {
-          this.log.debug("WCPP MAX: WS envelope has no recognizable inner SyncResponse");
-          return;
-        }
-
-        // Extract wxid from envelope-level field (available in syncData variant).
-        // The inner-SyncResponse path (ModUserInfos) is handled inside
-        // ingestSyncMessages; this envelope field is WS-specific.
-        if (!this.wxid && envelope.Data.wxid) {
-          this.wxid = envelope.Data.wxid;
-          this.log.info(`WCPP MAX: detected wxid=${this.wxid} from WS envelope`);
-        }
-
-        // Hand the unwrapped SyncResponse to the shared ingest pipeline
-        // (synckey update, contacts, wxid-from-ModUserInfos, filters, dedup,
-        // normalize, drop-own-DM, emit) — same path as Sync/webhook.
-        this.ingestSyncMessages(inner);
-      } catch (e) {
-        this.log.debug("WCPP MAX: WS message parse error", e);
-      }
-    });
+    this.maxWs.on("message", (raw: WebSocket.Data) => this.handleWsMessage(raw.toString()));
 
     this.maxWs.on("close", (code) => {
-      this.log.warn(`WCPP MAX: WebSocket closed (code=${code})`);
+      this.log.warn(`[ws] closed (code=${code})`);
       // Stop pinging the dead socket; connectMaxWebSocket will start a fresh
       // interval on the next connection.
       if (this.maxWsPingTimer) {
@@ -1020,7 +1004,7 @@ export class WcppClient {
       this.scheduleMaxWsReconnect();
     });
 
-    this.maxWs.on("error", (err) => this.log.error("WCPP MAX: WebSocket error", err));
+    this.maxWs.on("error", (err) => this.log.error("[ws] error", err));
 
     // Keepalive — single interval owned by this.maxWsPingTimer (cleared at the
     // top of connectMaxWebSocket, in 'close', and in disconnectMaxWebSocket) so
@@ -1035,6 +1019,53 @@ export class WcppClient {
     }, 30_000);
   }
 
+  /**
+   * Parse + ingest a single WCPPM WS push frame. Extracted from the socket
+   * 'message' handler so it can be unit-tested against real captured frames.
+   */
+  handleWsMessage(raw: string): void {
+    try {
+      const envelope = JSON.parse(raw) as MaxWsEnvelope;
+      if (!envelope.Success || !envelope.Data) return;
+
+      // Unwrap. The 0416 server nests the SyncResponse *Data* payload directly
+      // under Data.syncData (AddMsgs/ModContacts/… at its top level, no inner
+      // .Success/.Data). A legacy shape wrapped a full SyncResponse under
+      // Data.data — normalize both to a SyncResponse.Data payload.
+      const wrapped = envelope.Data.syncData ?? envelope.Data.data;
+      if (!wrapped || typeof wrapped !== "object") {
+        this.log.debug("[ws] envelope has no recognizable inner SyncResponse");
+        return;
+      }
+      const payload: SyncResponse["Data"] =
+        "AddMsgs" in wrapped ? wrapped : (wrapped as SyncResponse).Data;
+      if (!payload) {
+        this.log.debug("[ws] envelope has no recognizable inner SyncResponse");
+        return;
+      }
+
+      // Extract wxid from envelope-level field (available in syncData variant).
+      // The inner-SyncResponse path (ModUserInfos) is handled inside
+      // ingestSyncMessages; this envelope field is WS-specific.
+      if (!this.wxid && envelope.Data.wxid) {
+        this.wxid = envelope.Data.wxid;
+        this.log.info(`[ws] detected wxid=${this.wxid} from envelope`);
+      }
+
+      // Hand the normalized SyncResponse to the shared ingest pipeline
+      // (synckey update, contacts, wxid-from-ModUserInfos, filters, dedup,
+      // normalize, drop-own-DM, emit) — same path as Sync/webhook.
+      this.ingestSyncMessages({
+        Code: envelope.Code ?? 0,
+        Success: true,
+        Message: envelope.Message ?? "ws",
+        Data: payload,
+      });
+    } catch (e) {
+      this.log.debug("[ws] message parse error", e);
+    }
+  }
+
   private scheduleMaxWsReconnect(): void {
     if (this.maxWsReconnectTimer) return;
     // Exponential backoff with a cap + jitter — a tight fixed-interval
@@ -1044,7 +1075,7 @@ export class WcppClient {
     const jitter = base * (Math.random() * 0.4 - 0.2); // ±20%
     const delay = Math.max(0, Math.round(base + jitter));
     this.maxWsReconnectAttempt += 1;
-    this.log.warn(`WCPP MAX: reconnecting WebSocket in ${delay}ms (attempt ${this.maxWsReconnectAttempt})`);
+    this.log.warn(`[ws] reconnecting in ${delay}ms (attempt ${this.maxWsReconnectAttempt})`);
     this.maxWsReconnectTimer = setTimeout(() => {
       this.maxWsReconnectTimer = null;
       this.connectMaxWebSocket();
@@ -1072,6 +1103,13 @@ export class WcppClient {
   // ──────────────────────────────────────────────
 
   startWebhookServer(): void {
+    // Idempotent: connect() already owns webhook bring-up, so a second call here
+    // (e.g. from a bootstrap that also calls connect()) must NOT listen() the
+    // port again — that double-bind throws EADDRINUSE and crashes the process.
+    if (this.webhookServer) {
+      this.log.warn("[webhook] server already running; ignoring duplicate startWebhookServer()");
+      return;
+    }
     const host = this.config.webhookHost ?? "127.0.0.1";
     const port = this.config.webhookPort ?? 8000;
     const basePath = this.config.webhookPath ?? "/webhook";
@@ -1100,7 +1138,7 @@ export class WcppClient {
         bodyBytes += chunk.length;
         if (bodyBytes > MAX_BODY_BYTES) {
           bodyTooLarge = true;
-          this.log.warn(`WCPP MAX: webhook body exceeded ${MAX_BODY_BYTES} bytes, rejecting (413)`);
+          this.log.warn(`[webhook] body exceeded ${MAX_BODY_BYTES} bytes, rejecting (413)`);
           res.writeHead(413, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: false, error: "payload too large" }));
           req.destroy();
@@ -1124,7 +1162,7 @@ export class WcppClient {
               if (verdict.gotLen === 0 && this.config.webhookSilentDropUnsigned === true) {
                 const n = envelope.Data?.messages?.length ?? 0;
                 this.log.warn(
-                  `WCPP MAX: silently dropping unsigned push ` +
+                  `[webhook] silently dropping unsigned push ` +
                   `(ts=${envelope.Timestamp}, age=${Math.round(Date.now() / 1000 - envelope.Timestamp)}s, msgCount=${n})`
                 );
                 res.writeHead(200, { "Content-Type": "application/json" });
@@ -1140,7 +1178,7 @@ export class WcppClient {
                 const headerKeys = Object.keys(req.headers).join(",");
                 const sigHeader = req.headers["x-signature"] ?? req.headers["signature"] ?? "(none)";
                 this.log.warn(
-                  `WCPP MAX: webhook signature verification failed — ` +
+                  `[webhook] signature verification failed — ` +
                   `signingInput="${verdict.signingInput}" ` +
                   `expectedPrefix=${verdict.expectedPrefix} ` +
                   `gotPrefix=${verdict.gotPrefix} ` +
@@ -1153,7 +1191,7 @@ export class WcppClient {
                   `x-signature=${sigHeader}`
                 );
               } else {
-                this.log.warn("WCPP MAX: webhook signature verification failed (enable webhookDebug for details)");
+                this.log.warn("[webhook] signature verification failed (enable webhookDebug for details)");
               }
               // WCPPM's delivery log extracts `.message` for 4xx responses
               // (vs raw body for 5xx), so pack diagnostics into `message`
@@ -1183,7 +1221,7 @@ export class WcppClient {
 
           // Timestamp anti-replay check (15 minute window)
           if (Math.abs(Date.now() / 1000 - envelope.Timestamp) > 900) {
-            this.log.warn("WCPP MAX: webhook timestamp skew too large");
+            this.log.warn("[webhook] timestamp skew too large");
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ ok: false, warning: "timestamp skew" }));
             return;
@@ -1192,7 +1230,7 @@ export class WcppClient {
           // Learn wxid from envelope
           if (!this.wxid && envelope.Wxid) {
             this.wxid = envelope.Wxid;
-            this.log.info(`WCPP MAX: detected wxid=${this.wxid} from webhook`);
+            this.log.info(`[webhook] detected wxid=${this.wxid}`);
           }
 
           // Process messages through the standard pipeline
@@ -1201,7 +1239,7 @@ export class WcppClient {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true }));
         } catch (e) {
-          this.log.debug("WCPP MAX: webhook parse error", e);
+          this.log.debug("[webhook] parse error", e);
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: false, error: "invalid JSON" }));
         }
@@ -1209,7 +1247,7 @@ export class WcppClient {
     });
 
     this.webhookServer.listen(port, host, () => {
-      this.log.info(`WCPP MAX: webhook server listening on ${host}:${port}${basePath}`);
+      this.log.info(`[webhook] server listening on ${host}:${port}${basePath}`);
     });
   }
 
@@ -1217,7 +1255,7 @@ export class WcppClient {
     if (this.webhookServer) {
       this.webhookServer.close();
       this.webhookServer = null;
-      this.log.info("WCPP MAX: webhook server stopped");
+      this.log.info("[webhook] server stopped");
     }
   }
 
@@ -1306,7 +1344,7 @@ export class WcppClient {
 
     const url = this.config.webhookUrl;
     if (!url) {
-      this.log.error("WCPP MAX: webhookUrl is required to register webhook");
+      this.log.error("[webhook] webhookUrl is required to register");
       return false;
     }
 
@@ -1328,13 +1366,13 @@ export class WcppClient {
       });
       const data = (await res.json()) as any;
       if (data.Success) {
-        this.log.info(`WCPP MAX: webhook registered → ${url}`);
+        this.log.info(`[webhook] registered → ${url}`);
         return true;
       }
-      this.log.error(`WCPP MAX: failed to register webhook: ${data.Message}`);
+      this.log.error(`[webhook] failed to register: ${data.Message}`);
       return false;
     } catch (e) {
-      this.log.error("WCPP MAX: error registering webhook", e);
+      this.log.error("[webhook] error registering", e);
       return false;
     }
   }
@@ -1347,7 +1385,7 @@ export class WcppClient {
     if (!authcode) return;
     try {
       await this.httpFetch(`${this.baseUrl}/api/Webhook/Remove?authcode=${authcode}`, { method: "POST" });
-      this.log.info("WCPP MAX: webhook removed");
+      this.log.info("[webhook] removed");
     } catch {
       // Best-effort cleanup
     }
@@ -1373,9 +1411,9 @@ export class WcppClient {
       if (this.config.host && this.config.webhookUrl) {
         this.registerWebhook();
       } else if (this.config.host) {
-        this.log.info("WCPPM: webhookEnabled but no webhookUrl set; skipping /Webhook/Set (operator-managed)");
+        this.log.info("[webhook] webhookEnabled but no webhookUrl set; skipping /Webhook/Set (operator-managed)");
       } else {
-        this.log.info("WCPPM: passive webhook-only mode; /Webhook/Set is operator-managed (the push longlink comes up automatically at login — do NOT call /Login/Newinit)");
+        this.log.info("[webhook] passive webhook-only mode; /Webhook/Set is operator-managed (the push longlink comes up automatically at login — do NOT call /Login/Newinit)");
       }
     }
   }
@@ -1394,7 +1432,7 @@ export class WcppClient {
 
   async sendText(to: string, text: string): Promise<boolean> {
     if (this.config.readOnly) {
-      this.log.warn("WCPPM: read-only mode active, not sending message");
+      this.log.warn("[send] read-only mode active, not sending message");
       return false;
     }
 
@@ -1407,17 +1445,17 @@ export class WcppClient {
       });
       const data = (await res.json()) as any;
       if (data.Code === 0 || data.Code === 200) return true;
-      this.log.warn("WCPPM: SendTxt returned non-success", data);
+      this.log.warn("[send] SendTxt returned non-success", data);
       return false;
     } catch (e) {
-      this.log.error("WCPPM: error sending text", e);
+      this.log.error("[send] error sending text", e);
       return false;
     }
   }
 
   async sendImage(to: string, base64Data: string): Promise<boolean> {
     if (this.config.readOnly) {
-      this.log.warn("WCPPM: read-only mode active, not sending image");
+      this.log.warn("[send] read-only mode active, not sending image");
       return false;
     }
 
@@ -1436,7 +1474,7 @@ export class WcppClient {
       const data = (await res.json()) as any;
       return data.Code === 0 || data.Code === 200;
     } catch (e) {
-      this.log.error("WCPP: error sending image", e);
+      this.log.error("[send] error sending image", e);
       return false;
     }
   }
@@ -1671,7 +1709,7 @@ export class WcppClient {
    */
   async sendQuote(to: string, text: string, referMsgId: string, referToUserName?: string): Promise<boolean> {
     if (this.config.readOnly) {
-      this.log.warn("WCPP: read-only mode active, not sending quote");
+      this.log.warn("[send] read-only mode active, not sending quote");
       return false;
     }
 
@@ -1696,10 +1734,10 @@ export class WcppClient {
       });
       const data = (await res.json()) as any;
       if (data.Code === 0 || data.Code === 200) return true;
-      this.log.warn("WCPP: Quote API returned non-success", data);
+      this.log.warn("[send] Quote API returned non-success", data);
       return false;
     } catch (e) {
-      this.log.error("WCPP: error sending quote", e);
+      this.log.error("[send] error sending quote", e);
       return false;
     }
   }
