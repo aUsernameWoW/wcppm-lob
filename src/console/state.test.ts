@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import type { Frame } from "../shared/frame.js";
 import {
-  initState, applyFrame, applyStatus, setFilter, clearFilter,
+  initState, applyFrame, applyStatus, setConnected, setFilter, clearFilter,
   scroll, setInput, setStatusLine, setOverlay, clearOverlay, visibleMessages,
 } from "./state.js";
 
@@ -58,4 +58,14 @@ test("input, statusLine, overlay reducers", () => {
   assert.deepEqual(s.overlay, ["line a", "line b"]);
   s = clearOverlay(s);
   assert.equal(s.overlay, undefined);
+});
+
+test("applyStatus and setConnected update their fields", () => {
+  let s = initState(10);
+  s = applyStatus(s, { wsUp: true, selfWxid: "wxid_self", lastMsgTs: 42 });
+  assert.equal(s.status.wsUp, true);
+  assert.equal(s.status.selfWxid, "wxid_self");
+  assert.equal(s.status.lastMsgTs, 42);
+  s = setConnected(s, true);
+  assert.equal(s.connected, true);
 });
