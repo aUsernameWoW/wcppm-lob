@@ -457,3 +457,88 @@ test("GET /healthz: unauthenticated, returns 200 with deps.status() JSON", async
     await server.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// HTTP GET helper for read-only endpoints
+// ---------------------------------------------------------------------------
+
+async function httpGet(port: number, path: string, token?: string): Promise<{ status: number; body: any }> {
+  const headers: Record<string, string> = {};
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  const res = await fetch(`http://127.0.0.1:${port}${path}`, { headers });
+  return { status: res.status, body: await res.json() };
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: GET /contacts — auth + queryContacts delegation
+// ---------------------------------------------------------------------------
+
+test("GET /contacts: requires auth and returns queryContacts results", async () => {
+  const server = createBridgeServer(
+    makeDeps({
+      queryContacts: (account, q, limit) => {
+        assert.equal(account, "default");
+        assert.equal(q, "li");
+        assert.equal(limit, 50);
+        return [{ wxid: "wxid_li", name: "李四", type: "friend", updatedAt: 123 }];
+      },
+    }),
+  );
+  const port = await server.listen(0);
+  try {
+    const unauth = await httpGet(port, "/contacts?q=li");
+    assert.equal(unauth.status, 401);
+
+    const ok = await httpGet(port, "/contacts?q=li", "test-token");
+    assert.equal(ok.status, 200);
+    assert.deepEqual(ok.body, [{ wxid: "wxid_li", name: "李四", type: "friend", updatedAt: 123 }]);
+  } finally {
+    await server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Test 10: GET /history — auth + queryHistory delegation
+// ---------------------------------------------------------------------------
+
+test("GET /history: requires auth and returns queryHistory frames", async () => {
+  const frame = { type: "message", id: "h1", account: "default", chatType: "direct",
+    from: { wxid: "wxid_li" }, chat: { id: "wxid_li" }, text: "hi", mentionedMe: false, ts: 10 };
+  const server = createBridgeServer(
+    makeDeps({
+      queryHistory: (account, chat, limit) => {
+        assert.equal(account, "default");
+        assert.equal(chat, "wxid_li");
+        assert.equal(limit, 5);
+        return [frame as unknown as Frame];
+      },
+    }),
+  );
+  const port = await server.listen(0);
+  try {
+    const unauth = await httpGet(port, "/history?chat=wxid_li&limit=5");
+    assert.equal(unauth.status, 401);
+
+    const ok = await httpGet(port, "/history?chat=wxid_li&limit=5", "test-token");
+    assert.equal(ok.status, 200);
+    assert.deepEqual(ok.body, [frame]);
+  } finally {
+    await server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Test 11: GET /contacts — returns [] when queryContacts dep is absent
+// ---------------------------------------------------------------------------
+
+test("GET /contacts: returns [] when queryContacts dep is absent", async () => {
+  const server = createBridgeServer(makeDeps()); // no queryContacts
+  const port = await server.listen(0);
+  try {
+    const ok = await httpGet(port, "/contacts?q=li", "test-token");
+    assert.equal(ok.status, 200);
+    assert.deepEqual(ok.body, []);
+  } finally {
+    await server.close();
+  }
+});

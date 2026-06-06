@@ -48,6 +48,15 @@ export interface ServerDeps {
   ageWindowSeconds?: number;
   /** Injectable clock (ms since epoch). Default Date.now. Tests pass a fake. */
   now?: () => number;
+  /** Read-only contact-cache search for the console (GET /contacts). Optional. */
+  queryContacts?(account: string, q: string, limit: number): {
+    wxid: string;
+    name: string;
+    type?: string;
+    updatedAt: number;
+  }[];
+  /** Read-only recent-history query for the console (GET /history). Returns frames newest-first. Optional. */
+  queryHistory?(account: string, chat: string | undefined, limit: number): Frame[];
 }
 
 export interface BridgeServer {
@@ -184,6 +193,32 @@ export function createBridgeServer(deps: ServerDeps): BridgeServer {
       } catch (err) {
         sendJson(res, 500, { error: String(err) });
       }
+      return;
+    }
+
+    // GET /contacts?q=&account=&limit= — read-only contact-cache search
+    if (req.method === "GET" && path === "/contacts") {
+      if (!isAuthorized(req)) {
+        sendJson(res, 401, { error: "unauthorized" });
+        return;
+      }
+      const account = url.searchParams.get("account") || "default";
+      const q = url.searchParams.get("q") || "";
+      const limit = Number(url.searchParams.get("limit")) || 50;
+      sendJson(res, 200, deps.queryContacts?.(account, q, limit) ?? []);
+      return;
+    }
+
+    // GET /history?account=&chat=&limit= — read-only recent inbound frames
+    if (req.method === "GET" && path === "/history") {
+      if (!isAuthorized(req)) {
+        sendJson(res, 401, { error: "unauthorized" });
+        return;
+      }
+      const account = url.searchParams.get("account") || "default";
+      const chat = url.searchParams.get("chat") || undefined;
+      const limit = Number(url.searchParams.get("limit")) || 50;
+      sendJson(res, 200, deps.queryHistory?.(account, chat, limit) ?? []);
       return;
     }
 
