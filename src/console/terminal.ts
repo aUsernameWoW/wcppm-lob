@@ -123,8 +123,9 @@ export function startTerminal(getState: () => ConsoleState, handlers: TerminalHa
     out.write(CURSOR_SHOW + ALT_OFF);
   }
 
-  // Safety nets: restore the terminal no matter how we exit.
-  process.on("exit", close);
+  // Safety nets: restore the terminal no matter how we exit. once() avoids
+  // accumulating exit listeners across repeated startTerminal() calls.
+  process.once("exit", close);
 
   paint();
   return { schedulePaint, close };
