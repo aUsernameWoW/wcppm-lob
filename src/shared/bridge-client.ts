@@ -11,9 +11,9 @@
 import WebSocket from "ws";
 import { fetch as undiciFetch } from "undici";
 
-import { buildProxyTransport } from "../../core/proxy.js";
-import type { Frame } from "../../shared/frame.js";
-import type { Logger } from "../../shared/logger.js";
+import { buildProxyTransport } from "../core/proxy.js";
+import type { Frame } from "./frame.js";
+import type { Logger } from "./logger.js";
 
 export interface BridgeClientOpts {
   /** WS base URL of the middleware, e.g. ws://127.0.0.1:8077 */

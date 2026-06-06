@@ -22,7 +22,7 @@ import {
   resolveInboundDirectDmAccessWithRuntime,
 } from "openclaw/plugin-sdk/direct-dm-access";
 import type { Frame } from "../../shared/frame.js";
-import { createBridgeClient, type BridgeClient } from "./bridge-client.js";
+import { createBridgeClient, type BridgeClient } from "../../shared/bridge-client.js";
 import { dispatchInboundToOpenClaw, type WcppDmAuthorizer } from "./dispatch.js";
 
 // ──────────────────────────────────────────────

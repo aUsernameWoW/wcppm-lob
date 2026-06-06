@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { createBridgeServer, type ServerDeps } from "../../core/server.js";
-import type { Frame } from "../../shared/frame.js";
+import { createBridgeServer, type ServerDeps } from "../core/server.js";
+import type { Frame } from "./frame.js";
 import { createBridgeClient } from "./bridge-client.js";
 
 function deferred<T>() {
