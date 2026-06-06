@@ -1,0 +1,26 @@
+{
+  "_comment": "Middleware config — read by `node dist/core/main.js` (default path ~/.config/wcppm/config.json). The WeChat server connection lives HERE now, not in openclaw.json.",
+
+  "host": "100.64.0.8",
+  "port": 8062,
+  "authcode": "REPLACE_WITH_REAL_AUTHCODE",
+  "proxy": "",
+
+  "webhookEnabled": false,
+  "webhookHost": "127.0.0.1",
+  "webhookPort": 8000,
+  "webhookSecret": "",
+  "webhookUrl": "",
+
+  "readOnly": false,
+  "passRevokemsg": true,
+  "maxMessageAge": 180,
+
+  "_bridge_comment": "Downstream interface the OpenClaw adapter (and other bots) connect to.",
+  "account": "default",
+  "bridgeToken": "REPLACE_WITH_A_SHARED_SECRET",
+  "bridgeHost": "127.0.0.1",
+  "bridgePort": 8077,
+  "dbPath": "",
+  "ageWindowSeconds": 600
+}

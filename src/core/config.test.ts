@@ -42,3 +42,8 @@ test("resolveConfig: explicit values override defaults", () => {
 test("resolveConfig: a missing bridgeToken is rejected (it guards the downstream interface)", () => {
   assert.throws(() => resolveConfig({ host: "h" }), /bridgeToken/);
 });
+
+test("resolveConfig: an empty-string dbPath falls back to the default path", () => {
+  const cfg = resolveConfig({ host: "h", bridgeToken: "t", dbPath: "" });
+  assert.match(cfg.dbPath, /state\.db$/);
+});

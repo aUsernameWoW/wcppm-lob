@@ -80,11 +80,11 @@ export function resolveConfig(raw: RawConfig): MiddlewareConfig {
 
   return {
     wcpp,
-    account: raw.account ?? "default",
+    account: raw.account || "default",
     bridgeToken: raw.bridgeToken,
-    bridgeHost: raw.bridgeHost ?? "127.0.0.1",
+    bridgeHost: raw.bridgeHost || "127.0.0.1",
     bridgePort: raw.bridgePort ?? 8077,
-    dbPath: raw.dbPath ?? join(homedir(), ".local", "share", "wcppm", "state.db"),
+    dbPath: raw.dbPath || join(homedir(), ".local", "share", "wcppm", "state.db"),
     ageWindowSeconds: raw.ageWindowSeconds ?? 600,
     pruneIntervalMs: raw.pruneIntervalMs ?? 600_000,
   };

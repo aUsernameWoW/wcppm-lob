@@ -1,0 +1,28 @@
+# systemd --user unit for the WeChatPadPro middleware.
+#
+# Install:
+#   cp deploy/wcppm-middleware.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now wcppm-middleware
+#   journalctl --user -u wcppm-middleware -f
+#
+# NOTE: ExecStart hardcodes the absolute node path because systemd --user does
+# NOT inherit your interactive PATH (so a bare `node` / nvm shim won't resolve).
+# Update it to match `which node` after a Node upgrade.
+
+[Unit]
+Description=WeChatPadPro middleware (standalone WeChat <-> bridge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/wcppm-lob
+ExecStart=/home/radxa/.nvm/versions/node/v24.13.0/bin/node --disable-warning=ExperimentalWarning %h/wcppm-lob/dist/core/main.js
+# Config defaults to ~/.config/wcppm/config.json; pass an explicit path by
+# appending it to ExecStart if you keep it elsewhere.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
