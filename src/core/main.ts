@@ -89,20 +89,17 @@ async function main(): Promise<void> {
     }
   };
 
-  // Verify auth / pick up selfWxid. In passive mode (no host) this returns
-  // synthetic creds without contacting the server.
-  const creds = await client.login();
-  if (!creds) {
-    logger.error("login/auth verification failed — check authcode/host");
-    db.close();
-    process.exitCode = 1;
-    return;
-  }
-
-  // Bring up WeChat transports.
+  // Bring up WeChat transports PASSIVELY — no startup /Msg/Sync probe. The WS
+  // push longlink authenticates with the authcode itself and supplies self-wxid
+  // via its envelope; the SyncKey cursor isn't needed (forceSync's first call
+  // omits it). So there is no reason to actively pull on connect — keeping
+  // startup passive is better for account safety. (forceSync stays operator-only.)
   if (cfg.wcpp.host) {
     client.connect();
     wsUp = true;
+    logger.info(`WeChat: connecting WS push to ${cfg.wcpp.host} (passive; no startup Sync)`);
+  } else {
+    logger.info("WeChat: passive webhook-only mode (no host)");
   }
   if (cfg.wcpp.webhookEnabled) {
     client.startWebhookServer();
