@@ -3,7 +3,10 @@ import assert from "node:assert/strict";
 
 import { createBridgeServer, type ServerDeps } from "../core/server.js";
 import type { Frame } from "./frame.js";
+import type { Logger } from "./logger.js";
 import { createBridgeClient } from "./bridge-client.js";
+
+const noopLogger: Logger = { info() {}, warn() {}, error() {}, debug() {} };
 
 function deferred<T>() {
   let resolve!: (v: T) => void;
@@ -22,6 +25,7 @@ async function waitFor(pred: () => boolean, timeoutMs = 2000): Promise<void> {
 function fakeDeps(over: Partial<ServerDeps> = {}): ServerDeps {
   return {
     token: "tok",
+    log: noopLogger,
     db: { getUndelivered: () => [], markDelivered: () => {} },
     send: async () => ({ ok: true }),
     forceSync: async () => ({ ok: true }),
@@ -117,6 +121,7 @@ test("bridge-client.send: a wrong token yields ok:false (server 401)", async () 
 test("onDisconnect fires when the WS closes unexpectedly", async () => {
   const server = createBridgeServer({
     token: "tkn",
+    log: noopLogger,
     db: { getUndelivered: () => [], markDelivered: () => {} },
     send: async () => ({ ok: true }),
     forceSync: async () => ({ ok: true }),
@@ -144,6 +149,7 @@ test("getContacts/getHistory/getHealth hit the read-only endpoints", async () =>
     from: { wxid: "wxid_li" }, chat: { id: "wxid_li" }, text: "hi", mentionedMe: false, ts: 10 };
   const server = createBridgeServer({
     token: "tkn",
+    log: noopLogger,
     db: { getUndelivered: () => [], markDelivered: () => {} },
     send: async () => ({ ok: true }),
     forceSync: async () => ({ ok: true }),

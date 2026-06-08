@@ -3,8 +3,23 @@ import assert from "node:assert/strict";
 
 import type { NormalizedMessage } from "./client.js";
 import type { Frame } from "../shared/frame.js";
+import type { Logger } from "../shared/logger.js";
 import { openDb } from "./db.js";
 import { handleInbound } from "./ingest.js";
+
+const noopLogger: Logger = { info() {}, warn() {}, error() {}, debug() {} };
+
+interface SpyLogger extends Logger {
+  calls: { level: "info" | "warn" | "error" | "debug"; msg: string }[];
+}
+function spyLogger(): SpyLogger {
+  const calls: SpyLogger["calls"] = [];
+  const rec =
+    (level: SpyLogger["calls"][number]["level"]) =>
+    (...a: any[]) =>
+      calls.push({ level, msg: a.map(String).join(" ") });
+  return { calls, info: rec("info"), warn: rec("warn"), error: rec("error"), debug: rec("debug") };
+}
 
 function baseMsg(overrides: Partial<NormalizedMessage> = {}): NormalizedMessage {
   return {
@@ -35,6 +50,7 @@ test("handleInbound: a new message is recorded and broadcast (returns true)", ()
     account: "default",
     db,
     broadcast: (f) => sent.push(f),
+    log: noopLogger,
   });
 
   assert.equal(result, true);
@@ -48,12 +64,56 @@ test("handleInbound: a new message is recorded and broadcast (returns true)", ()
 test("handleInbound: a duplicate message is NOT broadcast (returns false)", () => {
   const db = openDb(":memory:");
   const sent: Frame[] = [];
-  const deps = { account: "default", db, broadcast: (f: Frame) => sent.push(f) };
+  const deps = { account: "default", db, broadcast: (f: Frame) => sent.push(f), log: noopLogger };
 
   assert.equal(handleInbound(baseMsg({ msgId: "dup" }), deps), true);
   assert.equal(handleInbound(baseMsg({ msgId: "dup" }), deps), false); // same id again
 
   assert.equal(sent.length, 1); // broadcast only once
+  db.close();
+});
+
+test("handleInbound: logs receipt and broadcast at debug for a new message", () => {
+  const db = openDb(":memory:");
+  const log = spyLogger();
+
+  handleInbound(baseMsg({ msgId: "n1" }), {
+    account: "default",
+    db,
+    broadcast: () => {},
+    log,
+  });
+
+  const debugs = log.calls.filter((c) => c.level === "debug").map((c) => c.msg);
+  assert.ok(
+    debugs.some((m) => m.includes("n1") && /recv/i.test(m)),
+    `expected a debug 'recv' log carrying the id; got ${JSON.stringify(debugs)}`,
+  );
+  assert.ok(
+    debugs.some((m) => m.includes("n1") && /broadcast/i.test(m)),
+    `expected a debug 'broadcast' log carrying the id; got ${JSON.stringify(debugs)}`,
+  );
+  db.close();
+});
+
+test("handleInbound: logs a dropped duplicate at debug and never logs a broadcast for it", () => {
+  const db = openDb(":memory:");
+  const log = spyLogger();
+  const deps = { account: "default", db, broadcast: () => {}, log };
+
+  handleInbound(baseMsg({ msgId: "d1" }), deps);
+  log.calls.length = 0; // focus assertions on the duplicate pass only
+  handleInbound(baseMsg({ msgId: "d1" }), deps);
+
+  const debugs = log.calls.filter((c) => c.level === "debug").map((c) => c.msg);
+  assert.ok(
+    debugs.some((m) => m.includes("d1") && /dup/i.test(m)),
+    `expected a debug 'dup' log for the duplicate; got ${JSON.stringify(debugs)}`,
+  );
+  assert.ok(
+    !debugs.some((m) => /broadcast/i.test(m)),
+    `a duplicate must not log a broadcast; got ${JSON.stringify(debugs)}`,
+  );
   db.close();
 });
 
@@ -67,11 +127,57 @@ test("handleInbound: resolveName enriches from.name (and chat.name for groups)",
       account: "default",
       db,
       broadcast: (f) => sent.push(f),
+      log: noopLogger,
       resolveName: (wxid) => (wxid === "wxid_alice" ? "Alice" : wxid === "g@chatroom" ? "The Group" : undefined),
     },
   );
 
   assert.equal(sent[0].from.name, "Alice");
   assert.equal(sent[0].chat.name, "The Group");
+  db.close();
+});
+
+test("handleInbound: an old message is still recorded but NOT broadcast when maxBroadcastAge is set", () => {
+  const db = openDb(":memory:");
+  const sent: Frame[] = [];
+  const now = 1_700_000_000_000; // fixed ms clock
+  const oldTs = now / 1000 - 600; // 600s old → past a 180s broadcast window
+
+  const result = handleInbound(baseMsg({ msgId: "old1", createTime: oldTs }), {
+    account: "default",
+    db,
+    broadcast: (f) => sent.push(f),
+    log: noopLogger,
+    maxBroadcastAge: 180,
+    now: () => now,
+  });
+
+  assert.equal(result, true, "an old-but-new message is still recorded (returns true)");
+  assert.equal(sent.length, 0, "an old message must NOT be dispatched to the agent");
+  assert.deepEqual(
+    db.getUndelivered("default", 0).map((r) => r.id),
+    ["old1"],
+    "but it IS persisted to the inbound_log",
+  );
+  db.close();
+});
+
+test("handleInbound: a recent message is still broadcast when maxBroadcastAge is set", () => {
+  const db = openDb(":memory:");
+  const sent: Frame[] = [];
+  const now = 1_700_000_000_000;
+  const recentTs = now / 1000 - 10; // 10s old → within the 180s window
+
+  handleInbound(baseMsg({ msgId: "recent1", createTime: recentTs }), {
+    account: "default",
+    db,
+    broadcast: (f) => sent.push(f),
+    log: noopLogger,
+    maxBroadcastAge: 180,
+    now: () => now,
+  });
+
+  assert.equal(sent.length, 1, "a recent message is broadcast as before");
+  assert.equal(sent[0].id, "recent1");
   db.close();
 });

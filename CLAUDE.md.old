@@ -17,12 +17,19 @@ These are the WeChatPadProMax server administrator's responsibility, configured 
 
 **Newinit vs. `/api/Msg/Sync` — keep these straight (corrected 2026-06-04):**
 - **`/Login/Newinit` is full re-initialization and is effectively deprecated / dangerous.** Official clients only fire it on first install or after being offline for weeks; calling it from a protocol stack is a textbook risk-control trigger (“环境异常 / 限制登录” → ban). **Do NOT call it — not on startup, not manually.** The WCPPM author's build has removed the auto-call entirely.
-- **Real-time push does NOT need Newinit.** On a normal scan-login, WCPPM auto-runs a *lightweight* init (undocumented endpoint): a `Scene=3` incremental sync to fetch the `SyncKey`, then it opens the TCP longlink to `long.weixin.qq.com`, sends `Identify` (CGI 138) to bind the account, and does one `postLonglinkSync` to activate the channel. **That** is what brings up real-time push — automatically, at login. New messages then arrive via a longlink wake-packet (`CmdId=24/318/353`) which triggers a short-link Sync pull, forwarded to subscribers (WS / Webhook / RabbitMQ).
+- **Real-time push does NOT need Newinit.** On a normal scan-login, WCPPM auto-runs a *lightweight* init (undocumented endpoint): a `Scene=3` incremental sync to fetch the `SyncKey`, then it opens the TCP longlink to `long.weixin.qq.com`, sends `Identify` (CGI 138) to bind the account, and does one `postLonglinkSync` to activate the channel. Server-side chain (author, confirmed 2026-06-05): `RestoreSessionByWxid`/`BootRestoreSessions` → `ensureSyncKeyReady` (the Scene=3 sync) → `EnsureLonglinkByWxid` → `Identify` → `postLonglinkSync`, with a **20s heartbeat** keeping the longlink alive. The incremental sync is the `newsync` CGI (`/cgi-bin/micromsg-bin/newsync`) — a *different* CGI from full-init Newinit; cross-checked against Wechaty / Tencent-mars docs. **That** is what brings up real-time push — automatically, at login. New messages then arrive via a longlink wake-packet (`CmdId=24/318/353`) which triggers a short-link Sync pull, forwarded to subscribers (WS / Webhook / RabbitMQ).
 - `/api/Msg/Sync` is a **separate on-demand pull**. Each call is a synchronous fetch — WCPPM asks Tencent for whatever's there and returns it. **Works regardless of the push path.**
 - So: `forceSync()` (which calls Sync) is independent of the longlink push path. If push is silent, the cause is login / `SyncKey` / `Identify` / webhook config — **never** "forgot Newinit."
 
 **Newinit history (was auto-called, now permanently removed):**
 - We briefly auto-called Newinit on startup. This was reverted in the transport refactor (the `newinitOnStart` flag was removed) — originally to respect `/Login/*` scope, but the stronger reason confirmed since: **full-init is a ban trigger.** It should never be called, by us or the operator.
+
+**Server-side anti-ban safeguards already in place (confirmed 2026-06-05 — don't reinvent or fight them):**
+- The server runs its own **30s+ short-link fallback poll** under the longlink, so a missed wake-packet self-heals — our side intentionally has no poll loop.
+- `Msg.Sync` is guarded server-side by a `syncInProgress` lock → our `forceSync` can't cause a concurrent-sync storm.
+- On restart the server staggers session restore by a random **2–5s** (`BootRestoreSessions`) to avoid a TCP-connect burst.
+- Device fingerprint sampling (`Algorithm/device_running_info_generator.go`, `wcstf`/`wcste`/`Count2`) already adds random jitter — server-internal, don't touch.
+- `StartAutoSync` is **not needed** on the modern build (login auto-establishes everything) — same don't-call rule as Newinit; activating it with no live downstream consumer is what caused the 2026-04-12 ban.
 
 **This plugin assumes:**
 - The WeChatPadProMax server is already logged in and online
@@ -165,6 +172,7 @@ The plugin supports WCPPM only. The legacy standard-WeChatPadPro path (`/ws/GetS
 - `WcppClient.forceSync()` does **exactly one** HTTP `POST /api/Msg/Sync`. The response (with any `AddMsgs`) is fed through the normal dedup + filter + normalize + dispatch pipeline, same as if it had arrived via WS push. Returns `{ ok, messages, hasMore }`.
 - **No loop on `ContinueFlag`.** Earlier impl looped until ContinueFlag === 0 and produced ~260 HTTP Sync requests in 118s on one trigger — exactly the high-frequency-sync pattern Tencent risk-flags (see "Account Safety Incident"). When `hasMore: true`, the **operator** decides to invoke forceSync again. Don't auto-loop.
 - **Request body must be `{ "Scene": 0 }` with `Synckey` omitted on the first call.** Sending an empty string (`""`), null, or a placeholder (`"string"`) returns no data — WCPPM treats it as a stale cursor and returns nothing useful. After a successful Sync we ingest `Data.KeyBuf.buffer` and pass it as `Synckey` on subsequent calls.
+- **`Scene` is cold-vs-incremental, not device-type.** `Scene=0` = cold/first pull (no SyncKey) — exactly our first forceSync call, and what the server's own `auto_sync` fires first (`Sync(0) → Sync(3) → … → Sync(3)`). `Scene=3` = incremental/push-triggered (has SyncKey). Production runs the **Mac protocol**; iPad and Mac are the *same* soft-protocol family (gRPC/MMTLS, ≠ PC-Hook), so the "iPad+Scene0 / PC+Scene3 mismatch" line from the author's messier notes doesn't apply to us — and is contradicted by the server using both scenes on every account. **Open question for the author:** should forceSync flip to `Scene=3` once it holds a SyncKey? If yes it's a one-line tweak at `src/client.ts:479` — an optimization, not a safety fix.
 - **Independent of the real-time push path.** Sync is an on-demand pull — WCPPM asks Tencent synchronously, doesn't need the longlink. So forceSync works even when push is silent (and has nothing to do with `/Login/Newinit`, which must not be called).
 - We did try sending a Sync request frame over the open `/ws/sync` WebSocket; WCPPM logged receipt but never pushed anything back. So `/ws/sync` is push-only from WCPPM's side and can't be used as a pull trigger — forceSync has to go through HTTP.
 - Operator-triggered via the gateway RPC method `wechatpadpro.forceSync` (registered in `src/index.ts:registerFull`). Reach it with `openclaw gateway call wechatpadpro.forceSync` — responds `{ ok: true, messages: N, hasMore: bool }` on success, `{ error: "channel not running" }` if the runtime isn't up.
@@ -318,7 +326,7 @@ Must split on first `:\n` to extract sender and text.
 - **Contact cache** built from `ModContacts` in Sync responses; used for sender name resolution
 - **Dedup by `NewMsgId`** (not `MsgId` — `MsgId` can repeat across sessions, `NewMsgId` is globally unique)
 - **`readOnly` mode** blocks all outbound sends — for account stability during initial period
-- **Age filter** drops messages older than `maxMessageAge` seconds (default 180) to avoid replaying stale history
+- **Age filter** drops messages older than `maxMessageAge` seconds (default 180) to avoid replaying stale history — ⚠️ **STALE (changed 2026-06-08):** the standalone middleware no longer drops by age at ingest. Every new message is persisted to SQLite regardless of age; `maxMessageAge` now gates only the *broadcast* to the agent (`IngestDeps.maxBroadcastAge`). See CLAUDE.md → Conventions ("Age gates broadcast, never storage").
 - **DM gate is plugin-local**, not framework-enforced — see "DM policy gate" under the Inbound pipeline. The `security.dm` block on the plugin is metadata only; the actual gate lives in `channel.ts:buildDmAuthorizer` + `dispatch.ts`.
 
 ## Config Reference

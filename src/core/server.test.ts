@@ -11,7 +11,22 @@ import WebSocket from "ws";
 
 import type { Frame } from "../shared/frame.js";
 import type { InboundRow } from "./db.js";
+import type { Logger } from "../shared/logger.js";
 import { createBridgeServer, type ServerDeps } from "./server.js";
+
+const noopLogger: Logger = { info() {}, warn() {}, error() {}, debug() {} };
+
+interface SpyLogger extends Logger {
+  calls: { level: "info" | "warn" | "error" | "debug"; msg: string }[];
+}
+function spyLogger(): SpyLogger {
+  const calls: SpyLogger["calls"] = [];
+  const rec =
+    (level: SpyLogger["calls"][number]["level"]) =>
+    (...a: any[]) =>
+      calls.push({ level, msg: a.map(String).join(" ") });
+  return { calls, info: rec("info"), warn: rec("warn"), error: rec("error"), debug: rec("debug") };
+}
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -34,6 +49,7 @@ function makeDeps(overrides: Partial<ServerDeps> = {}): ServerDeps {
     status: () => ({ wsUp: true, selfWxid: "wxid_test", lastMsgTs: FIXED_NOW_S }),
     selfWxid: () => "wxid_test",
     now: () => FIXED_NOW_MS,
+    log: noopLogger,
     ...overrides,
   };
 }
@@ -579,6 +595,93 @@ test("GET /history: returns [] when queryHistory dep is absent", async () => {
     const ok = await httpGet(port, "/history?chat=wxid_li", "test-token");
     assert.equal(ok.status, 200);
     assert.deepEqual(ok.body, []);
+  } finally {
+    await server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Test 14: downstream tracing — subscribe/replay, ack, and /send at debug
+// ---------------------------------------------------------------------------
+
+test("subscribe: connection and replay count are traced at debug", async () => {
+  const row: InboundRow = {
+    id: "r-1",
+    account: "default",
+    ts: FIXED_NOW_S - 10,
+    payload: JSON.stringify({ type: "message", id: "r-1", text: "x" }),
+    delivered_at: null,
+  };
+  const log = spyLogger();
+  const deps = makeDeps({
+    log,
+    db: { getUndelivered: () => [row], markDelivered: () => {} },
+  });
+  const server = createBridgeServer(deps);
+  const port = await server.listen(0);
+
+  try {
+    const cs = await connect(port, { token: "test-token", account: "default" });
+    await cs.nextMessage(); // ready
+    await cs.nextMessage(); // replayed row (guarantees the setImmediate block ran)
+
+    const debugs = log.calls.filter((c) => c.level === "debug").map((c) => c.msg);
+    assert.ok(
+      debugs.some((m) => /connect/i.test(m) && m.includes("default")),
+      `expected a debug connection trace; got ${JSON.stringify(debugs)}`,
+    );
+    assert.ok(
+      debugs.some((m) => /replay/i.test(m) && /\b1\b/.test(m)),
+      `expected a debug replay-count trace; got ${JSON.stringify(debugs)}`,
+    );
+    cs.close();
+  } finally {
+    await server.close();
+  }
+});
+
+test("ack: an inbound ack is traced at debug with the id", async () => {
+  const log = spyLogger();
+  const deps = makeDeps({ log, db: { getUndelivered: () => [], markDelivered: () => {} } });
+  const server = createBridgeServer(deps);
+  const port = await server.listen(0);
+
+  try {
+    const cs = await connect(port, { token: "test-token" });
+    await cs.nextMessage(); // ready
+    cs.send(JSON.stringify({ type: "ack", id: "ack-7" }));
+    await new Promise((r) => setTimeout(r, 50)); // let the server process the ack
+
+    const debugs = log.calls.filter((c) => c.level === "debug").map((c) => c.msg);
+    assert.ok(
+      debugs.some((m) => m.includes("ack-7") && /ack/i.test(m)),
+      `expected a debug ack trace; got ${JSON.stringify(debugs)}`,
+    );
+    cs.close();
+  } finally {
+    await server.close();
+  }
+});
+
+test("POST /send: the outbound call is traced at debug (target + result)", async () => {
+  const log = spyLogger();
+  const deps = makeDeps({ log, send: async () => ({ ok: true, msgId: "sent-9" }) });
+  const server = createBridgeServer(deps);
+  const port = await server.listen(0);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/send?token=test-token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ to: "wxid_bob", text: "hi" }),
+    });
+    assert.equal(res.status, 200);
+
+    const debugs = log.calls.filter((c) => c.level === "debug").map((c) => c.msg);
+    assert.ok(
+      debugs.some((m) => m.includes("wxid_bob") && /send/i.test(m)),
+      `expected a debug send trace carrying the target; got ${JSON.stringify(debugs)}`,
+    );
   } finally {
     await server.close();
   }

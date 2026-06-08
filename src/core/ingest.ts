@@ -9,20 +9,44 @@
 import type { NormalizedMessage } from "./client.js";
 import type { Frame } from "../shared/frame.js";
 import type { Db } from "./db.js";
+import type { Logger } from "../shared/logger.js";
 import { buildFrame } from "./frame.js";
 
 export interface IngestDeps {
   account: string;
   db: Pick<Db, "recordInbound" | "upsertContact">;
   broadcast: (frame: Frame) => void;
+  log: Logger;
   /** Optional name lookup (real impl wraps client.getContact). */
   resolveName?: (wxid: string) => string | undefined;
+  /**
+   * Max message age (seconds) eligible for *broadcast* to subscribers. Every new
+   * message is still persisted regardless of age; this only gates the agent
+   * dispatch so a backlog redelivery / cold-Sync history batch is stored without
+   * replaying stale messages as live auto-replies. Undefined → dispatch all.
+   */
+  maxBroadcastAge?: number;
+  /** Clock (ms epoch) for the broadcast-age check; defaults to Date.now. Injectable for tests. */
+  now?: () => number;
 }
 
-/** Returns true if the message was new (recorded + broadcast), false if it was a duplicate. */
+/**
+ * Returns true if the message was new (recorded — and broadcast when recent
+ * enough), false if it was a duplicate. A new-but-too-old message is persisted
+ * and returns true, but is not broadcast (see maxBroadcastAge).
+ */
 export function handleInbound(msg: NormalizedMessage, deps: IngestDeps): boolean {
-  const { account, db, broadcast, resolveName } = deps;
+  const { account, db, broadcast, resolveName, log, maxBroadcastAge, now } = deps;
   const frame = buildFrame(msg, { account });
+
+  // Per-message trace (debug-only; the steady-state inbound path is otherwise
+  // silent at info). Logged before dedup so every message that reaches the
+  // pipeline leaves a footprint regardless of outcome.
+  log.debug(
+    `[in] recv id=${frame.id} ${frame.chatType} from=${frame.from.wxid}` +
+      (frame.chatType === "group" ? ` chat=${frame.chat.id}` : "") +
+      (frame.media ? ` media=${frame.media.kind}` : ""),
+  );
 
   // Fill names from the contact cache only where buildFrame didn't already
   // derive one from pushContent (pushContent takes precedence, as before).
@@ -43,7 +67,10 @@ export function handleInbound(msg: NormalizedMessage, deps: IngestDeps): boolean
     ts: frame.ts,
     payload: JSON.stringify(frame),
   });
-  if (!isNew) return false;
+  if (!isNew) {
+    log.debug(`[in] dup id=${frame.id}, dropping`);
+    return false;
+  }
 
   // Cache the sender (and the group, for group chats) for future name resolution.
   db.upsertContact({
@@ -63,6 +90,18 @@ export function handleInbound(msg: NormalizedMessage, deps: IngestDeps): boolean
     });
   }
 
+  // Recency gate: the message is already persisted above. Only dispatch it to
+  // subscribers if it is recent enough — so backlog redeliveries / cold-Sync
+  // history are stored losslessly without firing stale auto-replies downstream.
+  if (maxBroadcastAge !== undefined) {
+    const ageSec = (now ? now() : Date.now()) / 1000 - frame.ts;
+    if (ageSec > maxBroadcastAge) {
+      log.debug(`[in] stored id=${frame.id} age=${Math.round(ageSec)}s > ${maxBroadcastAge}s; persisted, not dispatched`);
+      return true;
+    }
+  }
+
   broadcast(frame);
+  log.debug(`[in] broadcast id=${frame.id}`);
   return true;
 }

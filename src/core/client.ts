@@ -85,23 +85,33 @@ export interface SyncResponse {
   Success: boolean;
   Message: string;
   Data?: {
-    AddMsgs: SyncMessage[];
-    ModContacts: SyncContact[];
-    ModUserInfos: SyncUserInfo[];
-    ModUserImgs: unknown[];
-    DelContacts: unknown[] | null;
-    FunctionSwitchs: unknown[];
-    Remarks: unknown[];
-    UserInfoExts: unknown[];
+    // All payload arrays are OPTIONAL: the "当前未有新消息" (no new messages)
+    // response omits every one of them and instead carries `CmdList:{Count:0}`.
+    AddMsgs?: SyncMessage[];
+    ModContacts?: SyncContact[];
+    ModUserInfos?: SyncUserInfo[];
+    ModUserImgs?: unknown[];
+    DelContacts?: unknown[] | null;
+    FunctionSwitchs?: unknown[];
+    Remarks?: unknown[];
+    UserInfoExts?: unknown[];
+    /** Empty-batch marker on a "no new messages" response (no AddMsgs present). */
+    CmdList?: { Count: number };
+    Ret?: number;
     /** Base64-encoded protobuf — this IS the Synckey for next request */
-    KeyBuf: { iLen: number; buffer: string };
-    /** Continuation cookie — non-zero means more data to fetch */
-    Continue: number | null;
-    ContinueFlag: number | null;
-    Status: number | null;
-    /** Server timestamp */
-    Time: number | null;
-    UnknownCmdId: string | null;
+    KeyBuf?: { iLen: number; buffer: string };
+    Continue?: number | null;
+    /**
+     * A status bitmask, NOT a reliable "more data" signal: the empty
+     * "no new messages" response still sets it non-zero (e.g. 256). Treat it
+     * as "more backlog" only when the same response actually carried AddMsgs
+     * (see forceSync's hasMore).
+     */
+    ContinueFlag?: number | null;
+    Status?: number | null;
+    /** Server timestamp. Capital `Time` on full responses; lowercase `time` on the empty one. */
+    Time?: number | null;
+    UnknownCmdId?: string | null;
   };
   Data62?: string;
   CodeValue?: string;
@@ -523,7 +533,9 @@ export class WcppClient {
    * handler (after it unwraps the 20260411+ envelope to the inner
    * SyncResponse). Holds: synckey update from KeyBuf, contact caching,
    * self-wxid detection from ModUserInfos, then the per-message
-   * MsgType/age filters, dedup, normalize, drop-own-DM, and emit.
+   * MsgType filter, dedup, normalize, drop-own-DM, and emit. (No CreateTime
+   * age filter — every message is surfaced so the downstream pipeline can
+   * persist it; broadcast recency is gated later in ingest.ts.)
    *
    * Own-message policy: drop own DMs (`senderWxid === this.wxid && !isGroup`)
    * but KEEP own group messages — unified across all transports here so the
@@ -549,7 +561,6 @@ export class WcppClient {
     // Process messages
     const allowTypes = this.config.allowMsgTypes ?? [1, 3, 34, 47, 48, 49];
     const passRevoke = this.config.passRevokemsg ?? true;
-    const maxAge = this.config.maxMessageAge ?? 180;
 
     for (const msg of inner.Data.AddMsgs ?? []) {
       // Use MsgId as dedup key — NewMsgId can lose precision via JSON.parse
@@ -569,8 +580,12 @@ export class WcppClient {
         continue;
       }
 
-      // Age filter
-      if (Date.now() / 1000 - msg.CreateTime > maxAge) continue;
+      // NOTE: no CreateTime age filter here. The middleware persists every
+      // new (by stable-id dedup) message to SQLite regardless of age — so a
+      // backlog redelivery / brief downtime gap is captured losslessly. Whether
+      // an old message is *dispatched* to the agent is decided downstream in
+      // ingest.ts (maxBroadcastAge), so we never replay stale history as live
+      // auto-replies. See db.ts/ingest.ts for the durable dedup.
 
       // Mark seen
       this.seenMsgIds.add(dedupKey);
@@ -948,7 +963,12 @@ export class WcppClient {
     }
     if (resp.Data) this.processSyncResponse(resp);
     const messages = this.seenMsgIds.size - before;
-    const hasMore = (resp.Data?.ContinueFlag ?? 0) !== 0;
+    // hasMore must reflect "more backlog to drain", not a raw flag bit. The
+    // "当前未有新消息" empty response carries CmdList:{Count:0} (no AddMsgs) yet a
+    // non-zero ContinueFlag (e.g. 256) — a status bitmask, not a continuation.
+    // Only claim more when this round actually delivered a batch.
+    const batchSize = resp.Data?.AddMsgs?.length ?? 0;
+    const hasMore = batchSize > 0 && (resp.Data?.ContinueFlag ?? 0) !== 0;
     this.log.info(`[sync] forceSync drained one round, ${messages} new message(s), hasMore=${hasMore}`);
     return { ok: true, messages, hasMore };
   }
@@ -1219,9 +1239,15 @@ export class WcppClient {
             }
           }
 
-          // Timestamp anti-replay check (15 minute window)
+          // Timestamp anti-replay check (15 minute window). In 0416 the webhook
+          // is an empty doorbell, so a stale one carries no message and is just
+          // a backlog redelivery being flushed — benign. Drop it (200 so WCPPM
+          // drains its retry queue), but log at debug, not warn: it needs no
+          // attention. Real messages flow over the WS push and are persisted
+          // there regardless of age (see ingestSyncMessages).
           if (Math.abs(Date.now() / 1000 - envelope.Timestamp) > 900) {
-            this.log.warn("[webhook] timestamp skew too large");
+            const ageSec = Math.round(Date.now() / 1000 - envelope.Timestamp);
+            this.log.debug(`[webhook] dropping stale doorbell (ts=${envelope.Timestamp}, age=${ageSec}s)`);
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ ok: false, warning: "timestamp skew" }));
             return;

@@ -58,6 +58,7 @@ async function main(): Promise<void> {
   const send = createSendHandler(client);
   const deps: ServerDeps = {
     token: cfg.bridgeToken,
+    log: logger,
     ageWindowSeconds: cfg.ageWindowSeconds,
     db: {
       getUndelivered: (account, sinceTs) => db.getUndelivered(account, sinceTs),
@@ -105,8 +106,13 @@ async function main(): Promise<void> {
       handleInbound(msg, {
         account: cfg.account,
         db,
+        log: logger,
         broadcast: (frame) => server.broadcast(frame),
         resolveName: (wxid) => client.getContact(wxid)?.NickName?.string || undefined,
+        // Persist every new message regardless of age, but only dispatch recent
+        // ones to the agent — so a backlog redelivery / brief downtime gap is
+        // captured in SQLite without replaying stale messages as auto-replies.
+        maxBroadcastAge: cfg.wcpp.maxMessageAge ?? 180,
       });
     } catch (err) {
       logger.error("handleInbound failed:", err);

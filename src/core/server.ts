@@ -18,6 +18,7 @@ import { createServer as createHttpServer, type IncomingMessage, type ServerResp
 import { WebSocketServer, WebSocket } from "ws";
 import type { Frame } from "../shared/frame.js";
 import type { InboundRow } from "./db.js";
+import type { Logger } from "../shared/logger.js";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -26,6 +27,8 @@ import type { InboundRow } from "./db.js";
 export interface ServerDeps {
   /** Shared bearer token required on every WS and HTTP request. */
   token: string;
+  /** Structured logger. Downstream activity is traced at debug. */
+  log: Logger;
   /** Replay/ack store (subset of Db). */
   db: {
     getUndelivered(account: string, sinceTs: number): InboundRow[];
@@ -92,6 +95,7 @@ interface SubscriberMeta {
 export function createBridgeServer(deps: ServerDeps): BridgeServer {
   const now = deps.now ?? (() => Date.now());
   const ageWindowSeconds = deps.ageWindowSeconds ?? 600;
+  const log = deps.log;
 
   // Map from WebSocket instance to its metadata (account).
   const subscribers = new Map<WebSocket, SubscriberMeta>();
@@ -170,10 +174,15 @@ export function createBridgeServer(deps: ServerDeps): BridgeServer {
         return;
       }
       try {
-        const body = await readBody(req);
-        const result = await deps.send(body as Parameters<typeof deps.send>[0]);
+        const body = (await readBody(req)) as Parameters<typeof deps.send>[0];
+        const result = await deps.send(body);
+        log.debug(
+          `[send] to=${body.to} replyTo=${body.replyTo ?? "-"} ok=${result.ok}` +
+            (result.msgId ? ` msgId=${result.msgId}` : ""),
+        );
         sendJson(res, 200, result);
       } catch (err) {
+        log.error("[send] failed:", err);
         sendJson(res, 500, { error: String(err) });
       }
       return;
@@ -189,8 +198,13 @@ export function createBridgeServer(deps: ServerDeps): BridgeServer {
         const body = (await readBody(req)) as Record<string, unknown>;
         const account = typeof body.account === "string" ? body.account : undefined;
         const result = await deps.forceSync(account);
+        log.debug(
+          `[sync] forceSync account=${account ?? "default"} → ok=${result.ok}` +
+            ` messages=${result.messages ?? 0} hasMore=${result.hasMore ?? false}`,
+        );
         sendJson(res, 200, result);
       } catch (err) {
+        log.error("[sync] forceSync failed:", err);
         sendJson(res, 500, { error: String(err) });
       }
       return;
@@ -284,6 +298,7 @@ export function createBridgeServer(deps: ServerDeps): BridgeServer {
     const sinceTs = sinceParam ? Number(sinceParam) : undefined;
 
     subscribers.set(ws, { account });
+    log.debug(`[sub] connected account=${account} total=${subscribers.size}`);
 
     // Defer the initial ready + replay sends so they happen after the
     // current I/O cycle. This avoids a race where the server sends the
@@ -304,6 +319,7 @@ export function createBridgeServer(deps: ServerDeps): BridgeServer {
       for (const row of undelivered) {
         ws.send(row.payload);
       }
+      log.debug(`[sub] ready+replay account=${account} undelivered=${undelivered.length}`);
     });
 
     // 3. Handle inbound messages from subscriber (acks, etc.)
@@ -323,12 +339,14 @@ export function createBridgeServer(deps: ServerDeps): BridgeServer {
       ) {
         const id = (msg as Record<string, unknown>).id as string;
         deps.db.markDelivered(id, now());
+        log.debug(`[sub] ack id=${id}`);
       }
     });
 
     // 4. Clean up on disconnect
     ws.on("close", () => {
       subscribers.delete(ws);
+      log.debug(`[sub] disconnected account=${account} total=${subscribers.size}`);
     });
   });
 
