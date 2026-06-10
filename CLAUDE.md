@@ -63,7 +63,7 @@ remote WCPPM (Tailscale)  ──WS push / webhook──►  [ MIDDLEWARE: own pr
 
 **Config split (two sides):**
 - Middleware: `~/.config/wcppm/config.json` — WeChat `host`/`port`/`authcode`/`webhook*` **and** the bridge `bridgeToken`/`bridgePort`. See `config.example.json`.
-- Adapter: `openclaw.json` → `channels.wechatpadpro` — only `bridgeUrl`, `bridgeToken`, `account`, `dmSecurity`, `allowFrom`.
+- Adapter: `openclaw.json` → `channels.wechatpadpro` — only `bridgeUrl`, `bridgeToken`, `account`, `dmSecurity`, `allowFrom`, `groupAllowFrom`. `dmSecurity`/`allowFrom` gate **DMs only**; groups are gated separately by `groupAllowFrom` (empty = block all groups, `"*"` = allow all) and self-echoed frames are dropped — both enforced in `adapters/openclaw/gate.ts` *before* the agent pipeline, so non-allowlisted traffic costs zero tokens.
 
 ## Account Safety — HARD RULES (load-bearing, not derivable from code)
 

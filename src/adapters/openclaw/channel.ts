@@ -24,6 +24,7 @@ import {
 import type { Frame } from "../../shared/frame.js";
 import { createBridgeClient, type BridgeClient } from "../../shared/bridge-client.js";
 import { dispatchInboundToOpenClaw, type WcppDmAuthorizer } from "./dispatch.js";
+import { evaluateInboundFrame } from "./gate.js";
 
 // ──────────────────────────────────────────────
 // Account resolution
@@ -38,6 +39,8 @@ export interface ResolvedAccount {
   /** Middleware account id to subscribe as (default "default"). */
   account: string;
   allowFrom: string[];
+  /** Group ids (…@chatroom) whose messages may reach the agent. Empty = block all groups; "*" = allow all. */
+  groupAllowFrom: string[];
   dmPolicy: string | undefined;
 }
 
@@ -59,6 +62,7 @@ function resolveAccount(
     bridgeToken: section.bridgeToken,
     account: section.account ?? DEFAULT_ACCOUNT_ID,
     allowFrom: section.allowFrom ?? [],
+    groupAllowFrom: section.groupAllowFrom ?? [],
     dmPolicy: section.dmSecurity,
   };
 }
@@ -371,14 +375,30 @@ export function startWcppRuntime(
     raw: any;
   }) => Promise<void>,
 ): void {
+  let selfWxid: string | null = null;
   bridge = createBridgeClient({
     url: account.bridgeUrl,
     token: account.bridgeToken!,
     account: account.account,
     log,
-    onReady: (selfWxid) =>
-      log.info(`WeChatPadPro: bridge ready (selfWxid=${selfWxid || "unknown"})`),
+    onReady: (wxid) => {
+      selfWxid = wxid || null;
+      log.info(`WeChatPadPro: bridge ready (selfWxid=${selfWxid ?? "unknown"})`);
+    },
     onMessage: (frame: Frame) => {
+      // Token-burn gate, BEFORE the agent pipeline: drop our own echoed
+      // messages and messages from non-allowlisted groups (the DM gate in
+      // dispatch.ts covers DMs only).
+      const verdict = evaluateInboundFrame(frame, {
+        selfWxid,
+        groupAllowFrom: account.groupAllowFrom,
+      });
+      if (verdict.action === "drop") {
+        log.debug(
+          `wechatpadpro: dropped frame ${frame.id} from ${frame.chat.id} (${verdict.reason})`,
+        );
+        return;
+      }
       // Append quote context as a suffix, matching the QQ/Telegram convention.
       let bodyText = frame.text;
       if (frame.quote) {

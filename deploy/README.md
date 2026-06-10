@@ -52,7 +52,8 @@ old WeChat-server fields to the bridge fields:
       "bridgeToken": "<same secret as the middleware>",
       "account": "default",
       "dmSecurity": "allowlist",
-      "allowFrom": ["wxid_xxx"]
+      "allowFrom": ["wxid_xxx"],
+      "groupAllowFrom": []
     }
   }
 }

@@ -41,6 +41,11 @@
             "type": "array",
             "items": { "type": "string" },
             "description": "List of wxid allowed to DM the bot (used when dmSecurity = allowlist)."
+          },
+          "groupAllowFrom": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Group ids (…@chatroom) whose messages may reach the agent. Empty or absent = block all groups; \"*\" = allow all groups."
           }
         }
       },
@@ -66,6 +71,10 @@
         "allowFrom": {
           "label": "DM Allowlist",
           "help": "wxids permitted to DM the bot (used when dmSecurity = allowlist)"
+        },
+        "groupAllowFrom": {
+          "label": "Group Allowlist",
+          "help": "Group ids (…@chatroom) the agent may listen to. Empty = no groups; \"*\" = all groups."
         }
       }
     }
