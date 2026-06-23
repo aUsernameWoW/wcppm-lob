@@ -118,14 +118,27 @@ systemctl --user restart wcppm-middleware
 
 ### 4. Verify the cadence has widened and is jittered
 
-Query Redis to confirm the heartbeat intervals are now adaptive (≥210 s) and jittered, not the exact 60 s metronome:
+**Primary verification: inspect the OBSERVABLE heartbeat log** (proof of the real on-the-wire cadence):
+
+```bash
+# Query the heartbeat log in the WCPPM account's Redis db
+# (the db holding that account's PERM:* keys — e.g. db0 or db1 — NOT db15):
+redis-cli -h <wcppm-redis-host> -n <account_db> LRANGE heartbeatlog:<wxid> -6 -1
+
+# Output: each entry is "[wxid_xxx] 心跳成功 <timestamp>"
+# After cutover, consecutive timestamps should be ≥210 s apart and irregular (jittered) — 
+# no longer exact 60 s intervals.
+```
+
+**Supplementary verification: check the conductor's internal learned state** (in db15, shows the intended interval):
 
 ```bash
 # On the WCPPM Redis server or via the middleware box with redis-cli:
 redis-cli -n 15
 > GET hbconductor:<authcode>:<net_label>
 
-# Look for: "cur_heart" ≥ 210000 (milliseconds), jitter applied (not exact multiples of 60 s)
+# Look for: "curHeart" ≥ 210000 (milliseconds), jitter applied (not exact multiples of 60 s)
+# Note: this is the algorithm's intended interval; the actual observed cadence is in heartbeatlog (above).
 ```
 
 You can also tail the middleware logs to observe the conductor state transitions:
@@ -134,4 +147,4 @@ You can also tail the middleware logs to observe the conductor state transitions
 WCPPM_DEBUG=1 journalctl --user -u wcppm-middleware -f | grep -i heartbeat
 ```
 
-Expected behaviour: intervals lengthen adaptively from 210 s, backoff on consecutive failures, and shorten again on success — never exact 60 s, with ±5–8 % random jitter applied on each cycle.
+Expected behaviour: intervals lengthen adaptively from 210 s, backoff on consecutive failures, and shorten again on success — never exact 60 s, with ±jitterPct (default 7%, per the config example above) random jitter applied on each cycle.
