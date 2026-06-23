@@ -40,7 +40,7 @@ export function startHeartbeatConductor(
   wcpp: { host?: string; port: number; authcode?: string; proxy?: string },
   log: Logger,
 ): { stop(): Promise<void> } | null {
-  if (!cfg.enabled) { log.info("[hb] conductor disabled (heartbeat.enabled=false)"); return null; }
+  if (!cfg.enabled) { log.debug("[hb] conductor disabled (heartbeat.enabled=false)"); return null; }
   if (!wcpp.host || !wcpp.authcode) { log.error("[hb] cannot start: host/authcode required"); return null; }
 
   const baseUrl = `http://${wcpp.host}:${wcpp.port}`;
