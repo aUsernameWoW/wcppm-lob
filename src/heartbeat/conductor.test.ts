@@ -21,13 +21,13 @@ function fakeStore(initial = freshNetInfo("test")) {
   };
 }
 
-/** A clock whose sleep resolves immediately but records the requested ms. */
+/** A clock whose sleep resolves immediately, advancing internal time by ms. */
 function fakeClock() {
   let t = 0;
   return {
     sleeps: [] as number[],
     now() { return t; },
-    async sleep(ms: number) { this.sleeps.push(ms); t += ms; },
+    async sleep(ms: number, _signal?: AbortSignal) { this.sleeps.push(ms); t += ms; },
   };
 }
 
@@ -77,12 +77,79 @@ test("stops after maxConsecutiveFailures without tight-retrying", async () => {
 
 test("feeds results into SmartHeartbeat and persists", async () => {
   const store = fakeStore();
-  const deps = baseDeps(() => ({ success: true, failOfTimeout: false }));
-  deps.store = store as any;
-  const c = new HeartbeatConductor(
-    { authcode: "AC", netDetail: "test", jitterPct: 0, hardFloorMs: 60000, maxPerHour: 5, maxConsecutiveFailures: 99 },
+  const clock = fakeClock();
+  let beats = 0;
+  let conductor!: HeartbeatConductor;
+  const deps: ConductorDeps = {
+    client: {
+      async sendHeartbeat() {
+        beats++;
+        if (beats >= 3) conductor.stop();
+        return { success: true, failOfTimeout: false };
+      },
+    },
+    store: store as any,
+    clock: clock as any,
+    log: silentLog(),
+    rng: () => 0,
+  };
+  conductor = new HeartbeatConductor(
+    { authcode: "AC", netDetail: "test", jitterPct: 0, hardFloorMs: 60000, maxPerHour: 9999, maxConsecutiveFailures: 99 },
     deps,
   );
-  await c.start();
+  await conductor.start();
   assert.ok(store.saved.length > 0);
+});
+
+// ---------------------------------------------------------------------------
+// Regression test for Finding 1: maxPerHour is a rolling-hour cap, not a
+// lifetime budget. Drive the loop past 2 hours of fake-clock time and assert
+// that total beats exceed maxPerHour.
+// ---------------------------------------------------------------------------
+test("maxPerHour rolls per hour — beats exceed cap across multiple hours", async () => {
+  const maxPerHour = 3;
+  // Each fake sleep advances time by hardFloorMs (60 s). With maxPerHour=3 and
+  // hardFloor=60 s, one hour fits exactly 60 beats, so the cap kicks in once per
+  // hour. We stop once fake-clock time has advanced past 2.1 hours (7_560_000 ms).
+  const STOP_AT_MS = 7_560_000; // 2.1 hours
+  let totalBeats = 0;
+  let conductor!: HeartbeatConductor;
+
+  const clock = fakeClock();
+
+  const deps: ConductorDeps = {
+    client: {
+      async sendHeartbeat() {
+        totalBeats++;
+        if (clock.now() >= STOP_AT_MS) conductor.stop();
+        return { success: true, failOfTimeout: false };
+      },
+    },
+    store: fakeStore() as any,
+    clock: clock as any,
+    log: silentLog(),
+    rng: () => 0,
+  };
+
+  conductor = new HeartbeatConductor(
+    {
+      authcode: "AC",
+      netDetail: "test",
+      jitterPct: 0,
+      hardFloorMs: 60_000,
+      maxPerHour,
+      maxConsecutiveFailures: 9999,
+    },
+    deps,
+  );
+
+  await conductor.start();
+
+  // With a rolling-hour cap of 3 beats/hour, across >2 hours we must see more
+  // than maxPerHour total beats. If the bug were present (lifetime budget),
+  // the loop would exit after exactly 3 beats.
+  assert.ok(
+    totalBeats > maxPerHour,
+    `expected totalBeats (${totalBeats}) > maxPerHour (${maxPerHour}) — cap must roll per hour`,
+  );
 });

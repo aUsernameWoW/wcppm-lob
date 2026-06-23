@@ -100,9 +100,7 @@ Deploy the middleware with `heartbeat.enabled=true` in `~/.config/wcppm/config.j
     "enabled": true,
     "redisUrl": "redis://100.64.0.8:6379",
     "redisDb": 15,
-    "activeWindowMs": 120000,
     "jitterPct": 0.07,
-    "onlineCheckIntervalMs": 600000,
     "maxConsecutiveFailures": 4,
     "hardFloorMs": 60000,
     "maxPerHour": 30

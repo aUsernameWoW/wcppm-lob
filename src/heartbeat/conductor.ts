@@ -29,6 +29,10 @@ export interface ConductorDeps {
   rng?: () => number;
 }
 
+// Not yet user-configurable: activity wiring (activeWindowMs / onlineCheckIntervalMs) is
+// deferred to v1. When that lands, this will move into ConductorOptions.
+const ACTIVE_WINDOW_MS = 120_000;
+
 export class HeartbeatConductor {
   private readonly ac = new AbortController();
   private sh!: SmartHeartbeat;
@@ -49,39 +53,60 @@ export class HeartbeatConductor {
     const last = this.deps.getLastActivityMs?.() ?? null;
     // v1: no activity wiring → always idle (safe; keeps the longer adaptive intervals)
     if (last === null) return false;
-    return this.deps.clock.now() - last < 120000;
+    return this.deps.clock.now() - last < ACTIVE_WINDOW_MS;
   }
 
   stop(): void { this.ac.abort(); }
 
   async start(): Promise<void> {
     const { authcode, netDetail } = this.opts;
+    const signal = this.ac.signal;
     const loaded = (await this.deps.store.load(authcode, netDetail)) ?? freshNetInfo(netDetail);
     this.sh = new SmartHeartbeat(loaded, () => Math.floor(this.deps.clock.now() / 1000));
 
     let fails = 0;
-    let beatsThisHour = 0;
+    // Rolling-hour rate cap: tracks beats within the current 1-hour window.
+    let windowStart = this.deps.clock.now();
+    let beatsInWindow = 0;
 
-    while (!this.ac.signal.aborted && beatsThisHour < this.opts.maxPerHour) {
+    while (!signal.aborted) {
+      // Roll the window if an hour has passed.
+      if (this.deps.clock.now() - windowStart >= 3_600_000) {
+        windowStart = this.deps.clock.now();
+        beatsInWindow = 0;
+      }
+
+      // Backstop: if the cap is exhausted, sleep until the window rolls.
+      if (beatsInWindow >= this.opts.maxPerHour) {
+        const msUntilRoll = windowStart + 3_600_000 - this.deps.clock.now();
+        try {
+          await this.deps.clock.sleep(msUntilRoll, signal);
+        } catch {
+          break;
+        }
+        // After waking, the top of the loop will roll the window.
+        continue;
+      }
+
       this.sh.setActive(this.isActive());
       const interval = this.sh.getNextHeartbeatInterval();
       const sleepMs = this.computeSleep(interval);
 
       try {
-        await this.deps.clock.sleep(sleepMs, this.ac.signal);
+        await this.deps.clock.sleep(sleepMs, signal);
       } catch {
         // AbortSignal triggered — exit cleanly
         break;
       }
 
-      if (this.ac.signal.aborted) break;
+      if (signal.aborted) break;
 
       this.sh.onHeartbeatStart();
       const res = await this.deps.client.sendHeartbeat();
       this.sh.onHeartResult(res.success, res.failOfTimeout);
       await this.deps.store.save(authcode, this.sh.getNetInfo());
-      // Failed beats also count toward the hourly cap by design (an absolute backstop).
-      beatsThisHour++;
+      // Count this beat (both success and failure) toward the rolling-hour cap.
+      beatsInWindow++;
 
       if (res.success) {
         fails = 0;
