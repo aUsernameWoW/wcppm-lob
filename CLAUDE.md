@@ -72,6 +72,8 @@ remote WCPPM (Tailscale)  ──WS push / webhook──►  [ MIDDLEWARE: own pr
 - **`forceSync` is operator-only** (gateway RPC `wechatpadpro.forceSync` → middleware `POST /forceSync`): it performs **exactly one** `/api/Msg/Sync`, with **no `ContinueFlag` loop**, and the first call **omits `Synckey`** (`Scene 0`). Never auto-loop it.
 - Prefer passive receive paths; avoid unnecessary active operations (account nurturing).
 
+**2026-06-23 follow-up:** the **heartbeat surface** is now actively driven by the conductor in `src/heartbeat/` per spec `docs/superpowers/specs/2026-06-23-mars-heartbeat-conductor-design.md`. The "fully passive / never touch `/Login/*`" rule **no longer applies to `/Login/HeartBeat`** specifically — the conductor calls it on the Mars smart-heartbeat cadence (210–600 s adaptive, jittered). `/Login/Newinit`, `StartAutoSync`, and active `/Msg/Sync` remain **forbidden** (still ban triggers). The conductor **reads but never acts on** the heartbeat `Selector` field (no Sync triggered).
+
 ## Scope Boundary (do not expand)
 
 All `/Login/*`, `/User/*`, `/Admin/*` operations are the **WCPPM server operator's** responsibility, configured out-of-band. If messages don't arrive, the cause is login / `SyncKey` / `Identify` / webhook config — a server-side issue. **Do not "fix" it by adding active calls into those surfaces.**
