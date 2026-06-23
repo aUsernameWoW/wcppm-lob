@@ -80,6 +80,7 @@ export class HeartbeatConductor {
       const res = await this.deps.client.sendHeartbeat();
       this.sh.onHeartResult(res.success, res.failOfTimeout);
       await this.deps.store.save(authcode, this.sh.getNetInfo());
+      // Failed beats also count toward the hourly cap by design (an absolute backstop).
       beatsThisHour++;
 
       if (res.success) {

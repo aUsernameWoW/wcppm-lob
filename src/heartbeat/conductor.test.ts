@@ -28,7 +28,6 @@ function fakeClock() {
     sleeps: [] as number[],
     now() { return t; },
     async sleep(ms: number) { this.sleeps.push(ms); t += ms; },
-    advance(ms: number) { t += ms; },
   };
 }
 
@@ -73,7 +72,7 @@ test("stops after maxConsecutiveFailures without tight-retrying", async () => {
   await c.start();
   // every sleep is >= hardFloor; never a zero-ms tight retry.
   assert.ok(clock.sleeps.every((s) => s >= 60000));
-  assert.ok(calls >= 4);
+  assert.equal(calls, 4);
 });
 
 test("feeds results into SmartHeartbeat and persists", async () => {
