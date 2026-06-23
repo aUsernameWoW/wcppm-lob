@@ -162,6 +162,48 @@ test("handleInbound: an old message is still recorded but NOT broadcast when max
   db.close();
 });
 
+test("handleInbound: a new image message persists a lazy-fetch media descriptor", () => {
+  const db = openDb(":memory:");
+  const sent: Frame[] = [];
+
+  handleInbound(
+    baseMsg({
+      msgId: "img-9",
+      msgType: 3,
+      fromUser: "wxid_peer",
+      content: "<msg><img aeskey='K' cdnbigimgurl='U'/></msg>",
+      text: "[图片]",
+    }),
+    { account: "default", db, broadcast: (f) => sent.push(f), log: noopLogger },
+  );
+
+  // The broadcast frame advertises the image (metadata only, no bytes).
+  assert.equal(sent[0].media?.kind, "image");
+  assert.equal(sent[0].media?.localPath, undefined);
+
+  // A descriptor sufficient to re-run the download was persisted under the msg id.
+  const media = db.getMedia("default", "img-9");
+  assert.equal(media?.kind, "image");
+  const desc = JSON.parse(media!.descriptor);
+  assert.equal(desc.msgId, "img-9");
+  assert.equal(desc.msgType, 3);
+  assert.equal(desc.fromUser, "wxid_peer");
+  assert.match(desc.content, /aeskey/);
+  db.close();
+});
+
+test("handleInbound: a non-media message persists NO media descriptor", () => {
+  const db = openDb(":memory:");
+  handleInbound(baseMsg({ msgId: "txt-1", msgType: 1 }), {
+    account: "default",
+    db,
+    broadcast: () => {},
+    log: noopLogger,
+  });
+  assert.equal(db.getMedia("default", "txt-1"), undefined);
+  db.close();
+});
+
 test("handleInbound: a recent message is still broadcast when maxBroadcastAge is set", () => {
   const db = openDb(":memory:");
   const sent: Frame[] = [];

@@ -31,3 +31,59 @@ export function createSendHandler(
     return { ok };
   };
 }
+
+// ---------------------------------------------------------------------------
+// Lazy media fetch
+// ---------------------------------------------------------------------------
+
+interface ResolvedMediaLike {
+  kind: string;
+  materialize(dir?: string): Promise<{ filePath: string; mimeType: string; fileName: string }>;
+}
+
+export interface MediaCapableClient {
+  /** Re-resolves a media message into a downloadable handle (see WcppClient.resolveMedia). */
+  resolveMedia(message: any): ResolvedMediaLike | null;
+}
+
+export interface MediaDescriptorStore {
+  /** Returns the stored lazy-fetch descriptor for a media message, or undefined. */
+  getMedia(account: string, id: string): { kind: string; descriptor: string } | undefined;
+}
+
+export interface MediaFetchResult {
+  ok: boolean;
+  localPath?: string;
+  mimeType?: string;
+  fileName?: string;
+}
+
+/**
+ * Build the `fetchMedia` handler for ServerDeps: look up the descriptor stored
+ * at ingest time, reconstruct the minimal message, download the bytes to a
+ * local file, and return its path. Any miss or download error degrades to
+ * { ok: false } so a failed image never blocks the (already-delivered) text.
+ *
+ * `opts.dir` is the download directory; when omitted the client's materialize
+ * default (an OS-tmp subdir) is used — fine because the middleware and the
+ * subscriber share a filesystem (same box).
+ */
+export function createMediaFetcher(
+  client: MediaCapableClient,
+  store: MediaDescriptorStore,
+  opts: { dir?: string } = {},
+): (account: string, id: string) => Promise<MediaFetchResult> {
+  return async (account, id) => {
+    const row = store.getMedia(account, id);
+    if (!row) return { ok: false };
+    try {
+      const message = JSON.parse(row.descriptor);
+      const resolved = client.resolveMedia(message);
+      if (!resolved) return { ok: false };
+      const m = await resolved.materialize(opts.dir);
+      return { ok: true, localPath: m.filePath, mimeType: m.mimeType, fileName: m.fileName };
+    } catch {
+      return { ok: false };
+    }
+  };
+}

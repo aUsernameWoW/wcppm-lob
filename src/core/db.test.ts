@@ -29,6 +29,45 @@ test("recordInbound: a new id is inserted (true); the same id again is a duplica
   db.close();
 });
 
+test("recordMedia/getMedia: stores a lazy-fetch descriptor keyed by message id", () => {
+  const db = openDb(":memory:");
+  assert.equal(db.getMedia("default", "img-1"), undefined);
+
+  const inserted = db.recordMedia({
+    id: "img-1",
+    account: "default",
+    kind: "image",
+    descriptor: '{"msgId":"img-1","msgType":3}',
+    ts: 1000,
+  });
+  assert.equal(inserted, true);
+
+  const row = db.getMedia("default", "img-1");
+  assert.equal(row?.kind, "image");
+  assert.equal(row?.descriptor, '{"msgId":"img-1","msgType":3}');
+
+  // Same id again is an INSERT OR IGNORE no-op (mirrors inbound dedup).
+  assert.equal(db.recordMedia({ id: "img-1", account: "default", kind: "image", descriptor: "{}", ts: 2000 }), false);
+  assert.equal(db.getMedia("default", "img-1")?.descriptor, '{"msgId":"img-1","msgType":3}');
+
+  // Account-scoped: wrong account → miss.
+  assert.equal(db.getMedia("other", "img-1"), undefined);
+
+  db.close();
+});
+
+test("pruneMedia: deletes rows older than the cutoff, returns the count", () => {
+  const db = openDb(":memory:");
+  db.recordMedia({ id: "old", account: "default", kind: "image", descriptor: "{}", ts: 100 });
+  db.recordMedia({ id: "new", account: "default", kind: "image", descriptor: "{}", ts: 500 });
+
+  assert.equal(db.pruneMedia(300), 1);
+  assert.equal(db.getMedia("default", "old"), undefined);
+  assert.ok(db.getMedia("default", "new"));
+
+  db.close();
+});
+
 test("getUndelivered: returns un-acked rows in the account within the age window, oldest first", () => {
   const db = openDb(":memory:");
   db.recordInbound({ id: "a", account: "default", ts: 100, payload: "A" });

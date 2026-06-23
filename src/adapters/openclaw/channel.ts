@@ -208,6 +208,8 @@ const wechatpadproBase = {
           allowFrom: account.allowFrom,
           log,
         }),
+        fetchMedia: (id: string) =>
+          bridge ? bridge.fetchMedia(id, account.account) : Promise.resolve(null),
       };
       startWcppRuntime(account, log, async (msg) => {
         await dispatchInboundToOpenClaw(dispatchCtx, {
@@ -220,6 +222,7 @@ const wechatpadproBase = {
           isAtBot: msg.isAtBot,
           replyToBody: msg.replyToBody,
           replyToSender: msg.replyToSender,
+          mediaKind: msg.mediaKind,
         });
       });
 
@@ -372,6 +375,7 @@ export function startWcppRuntime(
     replyToId?: string;
     replyToBody?: string;
     replyToSender?: string;
+    mediaKind?: "image" | "voice" | "video";
     raw: any;
   }) => Promise<void>,
 ): void {
@@ -413,6 +417,7 @@ export function startWcppRuntime(
         text: bodyText,
         groupId: frame.chatType === "group" ? frame.chat.id : undefined,
         isAtBot: frame.mentionedMe,
+        ...(frame.media && { mediaKind: frame.media.kind }),
         ...(frame.quote && {
           replyToId: frame.quote.id,
           replyToBody: frame.quote.summary,

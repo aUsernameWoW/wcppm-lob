@@ -20,6 +20,23 @@ export interface InboundRow extends InboundEntry {
   delivered_at: number | null;
 }
 
+export interface MediaEntry {
+  id: string; // message id (NewMsgId) — same key space as inbound_log
+  account: string;
+  kind: string; // "image" | "voice" | "video"
+  /** JSON descriptor sufficient to re-run the WeChat media download on demand. */
+  descriptor: string;
+  ts: number; // server time (seconds), for retention pruning
+}
+
+export interface MediaRow {
+  id: string;
+  account: string;
+  kind: string;
+  descriptor: string;
+  ts: number;
+}
+
 export interface ContactEntry {
   account: string;
   wxid: string;
@@ -47,6 +64,12 @@ export interface Db {
   getUndelivered(account: string, sinceTs: number): InboundRow[];
   /** Retention: delete inbound rows with ts < cutoff. Returns how many were removed. */
   pruneInbound(cutoffTs: number): number;
+  /** INSERT OR IGNORE a media descriptor (lazy-fetch). Returns true if newly inserted. */
+  recordMedia(entry: MediaEntry): boolean;
+  /** Look up a media descriptor by (account, id), or undefined if unknown/pruned. */
+  getMedia(account: string, id: string): MediaRow | undefined;
+  /** Retention: delete media rows with ts < cutoff. Returns how many were removed. */
+  pruneMedia(cutoffTs: number): number;
   /** Insert or update a cached contact/group, keyed by (account, wxid). */
   upsertContact(contact: ContactEntry): void;
   /** Look up a cached contact/group, or undefined if not cached. */
@@ -74,6 +97,15 @@ export function openDb(path: string): Db {
     );
     CREATE INDEX IF NOT EXISTS idx_inbound_replay ON inbound_log (account, delivered_at, ts);
 
+    CREATE TABLE IF NOT EXISTS media (
+      id         TEXT PRIMARY KEY,
+      account    TEXT NOT NULL,
+      kind       TEXT NOT NULL,
+      descriptor TEXT NOT NULL,
+      ts         INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_media_ts ON media (ts);
+
     CREATE TABLE IF NOT EXISTS contacts (
       account    TEXT NOT NULL,
       wxid       TEXT NOT NULL,
@@ -94,6 +126,13 @@ export function openDb(path: string): Db {
       " WHERE account = ? AND delivered_at IS NULL AND ts >= ? ORDER BY ts ASC",
   );
   const pruneStmt = db.prepare("DELETE FROM inbound_log WHERE ts < ?");
+  const insertMediaStmt = db.prepare(
+    "INSERT OR IGNORE INTO media (id, account, kind, descriptor, ts) VALUES (?, ?, ?, ?, ?)",
+  );
+  const getMediaStmt = db.prepare(
+    "SELECT id, account, kind, descriptor, ts FROM media WHERE account = ? AND id = ?",
+  );
+  const pruneMediaStmt = db.prepare("DELETE FROM media WHERE ts < ?");
   const upsertContactStmt = db.prepare(
     "INSERT INTO contacts (account, wxid, name, type, extra, updated_at) VALUES (?, ?, ?, ?, ?, ?)" +
       " ON CONFLICT(account, wxid) DO UPDATE SET" +
@@ -124,6 +163,16 @@ export function openDb(path: string): Db {
     },
     pruneInbound(cutoffTs) {
       return Number(pruneStmt.run(cutoffTs).changes);
+    },
+    recordMedia(entry) {
+      const r = insertMediaStmt.run(entry.id, entry.account, entry.kind, entry.descriptor, entry.ts);
+      return Number(r.changes) === 1;
+    },
+    getMedia(account, id) {
+      return getMediaStmt.get(account, id) as MediaRow | undefined;
+    },
+    pruneMedia(cutoffTs) {
+      return Number(pruneMediaStmt.run(cutoffTs).changes);
     },
     upsertContact(contact) {
       upsertContactStmt.run(

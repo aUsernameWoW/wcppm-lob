@@ -452,6 +452,71 @@ test("POST /forceSync: valid token calls deps.forceSync with body.account", asyn
 });
 
 // ---------------------------------------------------------------------------
+// Test 7b: POST /media — lazy media fetch (auth + delegates to deps.fetchMedia)
+// ---------------------------------------------------------------------------
+
+test("POST /media: valid token calls deps.fetchMedia with {account,id}; wrong token → 401", async () => {
+  let gotAccount: string | undefined;
+  let gotId: string | undefined;
+
+  const deps = makeDeps({
+    fetchMedia: async (account, id) => {
+      gotAccount = account;
+      gotId = id;
+      return { ok: true, localPath: "/tmp/wcppm/x.jpg", mimeType: "image/jpeg", fileName: "x.jpg" };
+    },
+  });
+
+  const server = createBridgeServer(deps);
+  const port = await server.listen(0);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/media`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer test-token" },
+      body: JSON.stringify({ account: "default", id: "img-9" }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), {
+      ok: true,
+      localPath: "/tmp/wcppm/x.jpg",
+      mimeType: "image/jpeg",
+      fileName: "x.jpg",
+    });
+    assert.equal(gotAccount, "default");
+    assert.equal(gotId, "img-9");
+
+    // Without token → 401, handler not invoked.
+    gotId = undefined;
+    const res401 = await fetch(`http://127.0.0.1:${port}/media`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: "img-9" }),
+    });
+    assert.equal(res401.status, 401);
+    assert.equal(gotId, undefined);
+  } finally {
+    await server.close();
+  }
+});
+
+test("POST /media: returns {ok:false} when no fetchMedia dep is wired", async () => {
+  const server = createBridgeServer(makeDeps());
+  const port = await server.listen(0);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/media`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer test-token" },
+      body: JSON.stringify({ id: "img-9" }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { ok: false });
+  } finally {
+    await server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Test 8: GET /healthz — unauthenticated, returns status JSON
 // ---------------------------------------------------------------------------
 

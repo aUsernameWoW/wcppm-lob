@@ -11,15 +11,15 @@
  *
  * Run: node dist/core/main.js [configPath]   (default ~/.config/wcppm/config.json)
  */
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { readFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { resolveConfig, type RawConfig } from "./config.js";
 import { openDb } from "./db.js";
 import { WcppClient } from "./client.js";
 import { createBridgeServer, type ServerDeps } from "./server.js";
-import { createSendHandler } from "./wiring.js";
+import { createSendHandler, createMediaFetcher } from "./wiring.js";
 import { handleInbound } from "./ingest.js";
 import { startHeartbeatConductor } from "../heartbeat/runtime.js";
 import type { Logger } from "../shared/logger.js";
@@ -33,6 +33,28 @@ const logger: Logger = {
     if (process.env.WCPPM_DEBUG) console.debug("[wcppm]", ...a);
   },
 };
+
+/**
+ * Delete media files in `dir` whose mtime is older than `cutoffMs`. Best-effort
+ * and silent on a missing dir (nothing downloaded yet). Keeps the lazy-download
+ * scratch dir bounded; the DB descriptor rows are pruned separately.
+ */
+function pruneMediaFiles(dir: string, cutoffMs: number): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return; // dir not created yet (no media downloaded) — nothing to do
+  }
+  for (const name of entries) {
+    const full = join(dir, name);
+    try {
+      if (statSync(full).mtimeMs < cutoffMs) unlinkSync(full);
+    } catch {
+      /* ignore individual file errors (race with a concurrent download, etc.) */
+    }
+  }
+}
 
 function loadRawConfig(path: string): RawConfig {
   try {
@@ -53,6 +75,10 @@ async function main(): Promise<void> {
   const db = openDb(cfg.dbPath);
   const client = new WcppClient(cfg.wcpp, logger);
 
+  // Lazy media download directory. Shared filesystem with the adapter (same
+  // box/user), so the localPath we return is directly readable downstream.
+  const mediaDir = join(tmpdir(), "wcppm-lob-media");
+
   let lastMsgTs: number | undefined;
   let wsUp = false;
 
@@ -70,6 +96,10 @@ async function main(): Promise<void> {
       const r = await client.forceSync();
       return { ok: r.ok, messages: r.messages, hasMore: r.hasMore };
     },
+    // Lazy media fetch: the adapter calls POST /media after its gate; we download
+    // the bytes (operator-safe — /Tools/DownloadImg, not a /Login or /Msg/Sync
+    // call) to mediaDir and hand back the local path.
+    fetchMedia: createMediaFetcher(client, db, { dir: mediaDir }),
     status: () => ({ wsUp, selfWxid: client.wxid ?? undefined, lastMsgTs }),
     selfWxid: () => client.wxid ?? undefined,
     queryContacts: (account, q, limit) =>
@@ -151,7 +181,13 @@ async function main(): Promise<void> {
     try {
       const cutoff = Math.floor(Date.now() / 1000) - retentionSec;
       const removed = db.pruneInbound(cutoff);
-      if (removed > 0) logger.debug(`pruned ${removed} inbound rows (> ${retentionSec}s old)`);
+      const removedMedia = db.pruneMedia(cutoff);
+      if (removed > 0 || removedMedia > 0) {
+        logger.debug(`pruned ${removed} inbound + ${removedMedia} media rows (> ${retentionSec}s old)`);
+      }
+      // Sweep downloaded media files older than the retention window so the
+      // lazy-download dir doesn't grow without bound.
+      pruneMediaFiles(mediaDir, Date.now() - retentionSec * 1000);
     } catch (err) {
       logger.error("prune failed:", err);
     }

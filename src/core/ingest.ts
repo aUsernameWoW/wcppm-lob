@@ -14,7 +14,7 @@ import { buildFrame } from "./frame.js";
 
 export interface IngestDeps {
   account: string;
-  db: Pick<Db, "recordInbound" | "upsertContact">;
+  db: Pick<Db, "recordInbound" | "upsertContact" | "recordMedia">;
   broadcast: (frame: Frame) => void;
   log: Logger;
   /** Optional name lookup (real impl wraps client.getContact). */
@@ -87,6 +87,26 @@ export function handleInbound(msg: NormalizedMessage, deps: IngestDeps): boolean
       name: frame.chat.name ?? frame.chat.id,
       type: "group",
       updatedAt: frame.ts,
+    });
+  }
+
+  // Persist a lazy-fetch descriptor for media frames so a subscriber can pull
+  // the bytes on demand (POST /media) AFTER its gate — only images we'd actually
+  // dispatch get downloaded. Stored regardless of the broadcast-age gate below
+  // so a replayed-undelivered media frame remains fetchable after a reconnect.
+  // The descriptor carries exactly what WcppClient.downloadImage re-extracts.
+  if (frame.media) {
+    db.recordMedia({
+      id: frame.id,
+      account,
+      kind: frame.media.kind,
+      descriptor: JSON.stringify({
+        msgId: msg.msgId,
+        fromUser: msg.fromUser,
+        msgType: msg.msgType,
+        content: msg.content,
+      }),
+      ts: frame.ts,
     });
   }
 

@@ -107,3 +107,33 @@ test("buildFrame: media descriptor in opts is attached to the frame", () => {
   assert.equal(frame.media?.kind, "image");
   assert.equal(frame.media?.url, "https://cdn/x");
 });
+
+test("buildFrame: image message (msgType 3) derives media metadata (no bytes — lazy fetch)", () => {
+  const msg = baseMsg({ msgId: "img-7", msgType: 3, text: "[图片]" });
+
+  const frame = buildFrame(msg, { account: "default" });
+
+  assert.equal(frame.media?.kind, "image");
+  assert.equal(frame.media?.mimeType, "image/jpeg");
+  assert.equal(frame.media?.fileName, "wechat-image-img-7.jpg");
+  // Lazy: the broadcast frame carries metadata only — no URL, no local path.
+  // The subscriber fetches the bytes on demand via POST /media after its gate.
+  assert.equal(frame.media?.url, undefined);
+  assert.equal(frame.media?.localPath, undefined);
+  // The display text placeholder is preserved as the message body.
+  assert.equal(frame.text, "[图片]");
+});
+
+test("buildFrame: opts.media takes precedence over intrinsic image detection", () => {
+  const msg = baseMsg({ msgType: 3, text: "[图片]" });
+  const frame = buildFrame(msg, {
+    account: "default",
+    media: { kind: "image", localPath: "/tmp/already.jpg" },
+  });
+  assert.equal(frame.media?.localPath, "/tmp/already.jpg");
+});
+
+test("buildFrame: non-media message has no media", () => {
+  const frame = buildFrame(baseMsg({ msgType: 1 }), { account: "default" });
+  assert.equal(frame.media, undefined);
+});

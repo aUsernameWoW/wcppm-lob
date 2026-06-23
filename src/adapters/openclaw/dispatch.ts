@@ -51,6 +51,12 @@ export type WcppDispatchContext = {
    * "allow everything" so DMs don't silently vanish.
    */
   authorizeDm?: WcppDmAuthorizer;
+  /**
+   * Lazy media fetch (wraps bridge.fetchMedia). Called only after the gate, for
+   * messages that carry a media marker, so non-dispatched traffic never triggers
+   * a download. Absent in tests / text-only paths → media is skipped silently.
+   */
+  fetchMedia?: (id: string) => Promise<{ ok: boolean; localPath?: string } | null>;
 };
 
 export type WcppInboundMessage = {
@@ -64,6 +70,8 @@ export type WcppInboundMessage = {
   isAtBot: boolean;
   replyToBody?: string;
   replyToSender?: string;
+  /** Set when the frame carries a lazily-fetchable attachment (image, …). */
+  mediaKind?: "image" | "voice" | "video";
 };
 
 function buildFromTag(msg: WcppInboundMessage): string {
@@ -93,6 +101,24 @@ export async function dispatchInboundToOpenClaw(
         `wechatpadpro: DM from ${msg.senderWxid} → ${decision} (skipping agent dispatch)`,
       );
       return;
+    }
+  }
+
+  // Lazy media fetch — only now that the message has cleared the gate. The
+  // middleware downloads the bytes to a shared-filesystem path we hand the
+  // agent as MediaPath. A miss/failure degrades gracefully: the text still
+  // dispatches without the image.
+  let mediaPath: string | undefined;
+  if (msg.mediaKind && ctx.fetchMedia) {
+    try {
+      const m = await ctx.fetchMedia(msg.msgId);
+      if (m?.ok && m.localPath) {
+        mediaPath = m.localPath;
+      } else {
+        ctx.log.warn(`wechatpadpro: media fetch for ${msg.msgId} returned no path (${msg.mediaKind})`);
+      }
+    } catch (err) {
+      ctx.log.warn(`wechatpadpro: media fetch for ${msg.msgId} failed: ${String(err)}`);
     }
   }
 
@@ -133,6 +159,7 @@ export async function dispatchInboundToOpenClaw(
     WasMentioned: msg.chatType === "group" ? msg.isAtBot : undefined,
     ReplyToBody: msg.replyToBody,
     ReplyToSender: msg.replyToSender,
+    ...(mediaPath ? { MediaPath: mediaPath } : {}),
     Timestamp: Math.floor(Date.now() / 1000),
   });
 

@@ -43,6 +43,12 @@ export interface BridgeClient {
   close(): void;
   send(req: SendRequest): Promise<{ ok: boolean; msgId?: string }>;
   forceSync(account?: string): Promise<{ ok: boolean; messages?: number; hasMore?: boolean }>;
+  /**
+   * Lazily fetch the bytes for a media frame (image, …). The middleware
+   * downloads them to a local path on the shared filesystem and returns it.
+   * Call this AFTER the inbound gate so only media we'll dispatch is downloaded.
+   */
+  fetchMedia(id: string, account?: string): Promise<{ ok: boolean; localPath?: string; mimeType?: string; fileName?: string }>;
   getContacts(q: string): Promise<Array<{ wxid: string; name: string; type?: string; updatedAt: number }>>;
   getHistory(opts: { chat?: string; limit?: number; account?: string }): Promise<Frame[]>;
   getHealth(): Promise<{ wsUp: boolean; selfWxid?: string; lastMsgTs?: number }>;
@@ -160,6 +166,15 @@ export function createBridgeClient(opts: BridgeClientOpts): BridgeClient {
         ok: r.ok,
         messages: typeof r.messages === "number" ? r.messages : undefined,
         hasMore: typeof r.hasMore === "boolean" ? r.hasMore : undefined,
+      };
+    },
+    async fetchMedia(id, acct) {
+      const r = await postJson("/media", { id, account: acct ?? account });
+      return {
+        ok: r.ok,
+        localPath: typeof r.localPath === "string" ? r.localPath : undefined,
+        mimeType: typeof r.mimeType === "string" ? r.mimeType : undefined,
+        fileName: typeof r.fileName === "string" ? r.fileName : undefined,
       };
     },
     async getContacts(q) {

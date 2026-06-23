@@ -16,6 +16,20 @@ export interface BuildFrameOpts {
 }
 
 /**
+ * Intrinsic media metadata derived purely from the message type (no I/O, no
+ * download). For lazy fetch the broadcast frame carries only this metadata —
+ * the subscriber pulls the bytes on demand via the bridge `POST /media`
+ * endpoint after passing its own gate. Mirrors WcppClient.buildAttachmentCandidate.
+ * v1 covers images (MsgType 3); voice/video are stored but not yet fetchable.
+ */
+function intrinsicMedia(msg: NormalizedMessage): FrameMedia | undefined {
+  if (msg.msgType === 3) {
+    return { kind: "image", mimeType: "image/jpeg", fileName: `wechat-image-${msg.msgId}.jpg` };
+  }
+  return undefined;
+}
+
+/**
  * Best-effort sender display name from WeChat's pushContent, which looks like
  * "Nickname : message text" or "Nickname sent you a ...". Returns "" if no
  * name can be extracted. (Contact-cache resolution is layered on in ingest.)
@@ -56,6 +70,9 @@ export function buildFrame(msg: NormalizedMessage, opts: BuildFrameOpts): Frame 
       senderWxid: msg.quote.referSenderWxid,
     };
   }
-  if (opts.media) frame.media = opts.media;
+  // Caller-supplied media (e.g. pre-resolved) wins; otherwise derive metadata
+  // from the message type so image frames advertise a lazily-fetchable attachment.
+  const media = opts.media ?? intrinsicMedia(msg);
+  if (media) frame.media = media;
   return frame;
 }

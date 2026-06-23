@@ -43,6 +43,19 @@ export interface ServerDeps {
   }): Promise<{ ok: boolean; msgId?: string }>;
   /** One-shot catch-up (real impl wraps WcppClient.forceSync). */
   forceSync(account?: string): Promise<{ ok: boolean; messages?: number; hasMore?: boolean }>;
+  /**
+   * Lazy media fetch: download the bytes for a previously-broadcast media frame
+   * and return a local path the subscriber (on the same host) can read. Called
+   * by the adapter AFTER its gate so only media we'd actually dispatch is
+   * downloaded. Optional — absent in tests / text-only deployments; the handler
+   * then returns { ok: false }.
+   */
+  fetchMedia?(account: string, id: string): Promise<{
+    ok: boolean;
+    localPath?: string;
+    mimeType?: string;
+    fileName?: string;
+  }>;
   /** Liveness/status for /healthz. */
   status(): { wsUp: boolean; selfWxid?: string; lastMsgTs?: number };
   /** selfWxid for the ready frame (may be undefined early). */
@@ -205,6 +218,33 @@ export function createBridgeServer(deps: ServerDeps): BridgeServer {
         sendJson(res, 200, result);
       } catch (err) {
         log.error("[sync] forceSync failed:", err);
+        sendJson(res, 500, { error: String(err) });
+      }
+      return;
+    }
+
+    // POST /media — lazy media fetch (download bytes for a broadcast media frame)
+    if (req.method === "POST" && path === "/media") {
+      if (!isAuthorized(req)) {
+        sendJson(res, 401, { error: "unauthorized" });
+        return;
+      }
+      try {
+        const body = (await readBody(req)) as { account?: string; id?: string };
+        const account = typeof body.account === "string" ? body.account : "default";
+        const id = typeof body.id === "string" ? body.id : "";
+        if (!deps.fetchMedia) {
+          sendJson(res, 200, { ok: false });
+          return;
+        }
+        const result = await deps.fetchMedia(account, id);
+        log.debug(
+          `[media] account=${account} id=${id} → ok=${result.ok}` +
+            (result.localPath ? ` path=${result.localPath}` : ""),
+        );
+        sendJson(res, 200, result);
+      } catch (err) {
+        log.error("[media] fetch failed:", err);
         sendJson(res, 500, { error: String(err) });
       }
       return;

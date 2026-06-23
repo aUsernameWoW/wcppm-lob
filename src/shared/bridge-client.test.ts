@@ -68,6 +68,37 @@ test("bridge-client: receives a broadcast frame via onMessage and auto-acks it",
   await server.close();
 });
 
+test("bridge-client: fetchMedia POSTs to /media and returns the local path", async () => {
+  let gotAccount: string | undefined;
+  let gotId: string | undefined;
+  const server = createBridgeServer(
+    fakeDeps({
+      fetchMedia: async (account, id) => {
+        gotAccount = account;
+        gotId = id;
+        return { ok: true, localPath: "/tmp/wcppm-lob-media/wechat-image-m1.jpg", mimeType: "image/jpeg" };
+      },
+    }),
+  );
+  const port = await server.listen(0);
+
+  const client = createBridgeClient({
+    url: `ws://127.0.0.1:${port}`,
+    token: "tok",
+    account: "acct1",
+    onMessage: () => {},
+  });
+
+  const r = await client.fetchMedia("m1");
+  assert.equal(r.ok, true);
+  assert.equal(r.localPath, "/tmp/wcppm-lob-media/wechat-image-m1.jpg");
+  assert.equal(gotId, "m1");
+  assert.equal(gotAccount, "acct1"); // defaults to the client's account
+
+  client.close();
+  await server.close();
+});
+
 test("bridge-client: onReady fires with selfWxid on connect", async () => {
   const server = createBridgeServer(fakeDeps({ selfWxid: () => "wxid_bot" }));
   const port = await server.listen(0);
