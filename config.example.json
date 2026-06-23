@@ -23,6 +23,8 @@
   "bridgePort": 8077,
   "dbPath": "",
   "ageWindowSeconds": 600,
+  "_mediaDir_comment": "Where inbound images are downloaded for the agent. For the OpenClaw adapter this MUST be under an allowed media root (a subdir of /tmp/openclaw or <stateDir>/media) or the agent's image tool rejects the path. Default: <tmp>/wcppm-lob-media.",
+  "mediaDir": "/tmp/openclaw/wcppm-media",
 
   "_heartbeat_comment": "Heartbeat conductor (default-off). Enable to keep the WCPPM longlink alive via periodic /api/Login/HeartBeat calls.",
   "heartbeat": {

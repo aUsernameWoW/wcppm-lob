@@ -12,7 +12,7 @@
  * Run: node dist/core/main.js [configPath]   (default ~/.config/wcppm/config.json)
  */
 import { readFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { resolveConfig, type RawConfig } from "./config.js";
@@ -77,7 +77,9 @@ async function main(): Promise<void> {
 
   // Lazy media download directory. Shared filesystem with the adapter (same
   // box/user), so the localPath we return is directly readable downstream.
-  const mediaDir = join(tmpdir(), "wcppm-lob-media");
+  // Must be under an OpenClaw-allowed media root (config.mediaDir) or the
+  // agent's image tool rejects the path.
+  const mediaDir = cfg.mediaDir;
 
   let lastMsgTs: number | undefined;
   let wsUp = false;

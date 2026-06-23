@@ -361,40 +361,11 @@ export type ResolvedMedia =
 // ──────────────────────────────────────────────
 
 /**
- * Build the `/api/Tools/DownloadImg` request body. The MAX server binds the Go
- * `DownloadParam` struct: `{ ToWxid, MsgId, DataLen, Section{StartPos,DataLen},
- * CompressType }` (see docs/api-reference/docs/7471819m0.md — the working video
- * downloader). The swagger's flat `sectionStart`/`sectionLen` is a doc-only DTO;
- * we send BOTH the nested `section` and the flat fields so whichever the server
- * actually binds is populated (Go ignores unknown JSON fields).
- *
- * `msgId` MUST be the small int32 `MsgId` (NOT the 64-bit NewMsgId) — extracted
- * from the raw message. `dataLen` is the image size from the message XML.
- */
-export function buildImageDownloadPayload(info: {
-  fromUserName: string;
-  msgId: number;
-  fileLength: number | null;
-  compressType?: number;
-}): Record<string, unknown> {
-  const dataLen = info.fileLength ?? 0;
-  const compressType = info.compressType ?? 0;
-  return {
-    toWxid: info.fromUserName,
-    msgId: info.msgId,
-    dataLen,
-    compressType,
-    section: { startPos: 0, dataLen },
-    sectionStart: 0,
-    sectionLen: dataLen,
-  };
-}
-
-/**
  * Extract the binary payload from the MAX server's unified download JSON. The
- * bytes land at varying depths across endpoints (`Data.data.buffer`,
- * `Data.buffer`, …) as a base64 string or a numeric byte array — so we
- * deep-scan for the first `buffer`/`base64` key. Returns null if none found.
+ * bytes land at varying depths/keys across endpoints — CdnDownloadImage returns
+ * base64 at `Data.Image`, others at `Data.data.buffer` — so we deep-scan for the
+ * first `image`/`buffer`/`base64` key (base64 string or numeric byte array).
+ * Returns null if none found.
  */
 export function extractDownloadBuffer(json: unknown): Buffer | null {
   const seen = new Set<object>();
@@ -404,7 +375,7 @@ export function extractDownloadBuffer(json: unknown): Buffer | null {
     seen.add(node as object);
     for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
       const key = k.toLowerCase();
-      if ((key === "buffer" || key === "base64") && typeof v === "string" && v.length > 32 && /^[A-Za-z0-9+/=\r\n]+$/.test(v)) {
+      if ((key === "image" || key === "buffer" || key === "base64") && typeof v === "string" && v.length > 32 && /^[A-Za-z0-9+/=\r\n]+$/.test(v)) {
         return Buffer.from(v.replace(/\s+/g, ""), "base64");
       }
       if (key === "buffer" && Array.isArray(v) && v.length > 0) {
@@ -839,10 +810,13 @@ export class WcppClient {
     return {
       msgId: Number.isFinite(msgId) ? msgId : null,
       fromUserName,
-      aesKey: pick(/<aeskey><!\[CDATA\[(.*?)\]\]><\/aeskey>/i, /<aeskey>([^<]+)<\/aeskey>/i),
-      cdnMidImgUrl: pick(/<cdnmidimgurl><!\[CDATA\[(.*?)\]\]><\/cdnmidimgurl>/i, /<cdnmidimgurl>([^<]+)<\/cdnmidimgurl>/i),
-      cdnBigImgUrl: pick(/<cdnbigimgurl><!\[CDATA\[(.*?)\]\]><\/cdnbigimgurl>/i, /<cdnbigimgurl>([^<]+)<\/cdnbigimgurl>/i),
-      cdnThumbUrl: pick(/<cdnthumburl><!\[CDATA\[(.*?)\]\]><\/cdnthumburl>/i, /<cdnthumburl>([^<]+)<\/cdnthumburl>/i),
+      // Image XML carries these as <img> ATTRIBUTES (aeskey="…" cdnbigimgurl="…"),
+      // not child elements — match the attribute form (plus element/CDATA forms
+      // for safety across message variants).
+      aesKey: pick(/<aeskey><!\[CDATA\[(.*?)\]\]><\/aeskey>/i, /<aeskey>([^<]+)<\/aeskey>/i, /aeskey="([^"]+)"/i),
+      cdnMidImgUrl: pick(/<cdnmidimgurl><!\[CDATA\[(.*?)\]\]><\/cdnmidimgurl>/i, /<cdnmidimgurl>([^<]+)<\/cdnmidimgurl>/i, /cdnmidimgurl="([^"]+)"/i),
+      cdnBigImgUrl: pick(/<cdnbigimgurl><!\[CDATA\[(.*?)\]\]><\/cdnbigimgurl>/i, /<cdnbigimgurl>([^<]+)<\/cdnbigimgurl>/i, /cdnbigimgurl="([^"]+)"/i),
+      cdnThumbUrl: pick(/<cdnthumburl><!\[CDATA\[(.*?)\]\]><\/cdnthumburl>/i, /<cdnthumburl>([^<]+)<\/cdnthumburl>/i, /cdnthumburl="([^"]+)"/i),
       md5: pick(/<md5>([^<]+)<\/md5>/i, /md5="([^"]+)"/i),
       fileLength: fileLengthRaw ? Number(fileLengthRaw) : null,
       rawXml,
@@ -1618,9 +1592,22 @@ export class WcppClient {
       await fs.writeFile(filePath, result.buffer);
     }
 
+    // Guard against false success: if the endpoint returned 200 but no bytes
+    // (e.g. a WeChat-level ret error with an empty buffer), the file was never
+    // written — surface it instead of handing back a path to a missing file.
+    if (!result.outputPath && !result.buffer) {
+      throw new Error("WCPP: media download returned no bytes (server error or empty response)");
+    }
+
     return {
       filePath,
-      mimeType: result.contentType ?? attachment.mimeType,
+      // The bytes may arrive base64-wrapped in a JSON envelope (e.g.
+      // CdnDownloadImage), so the HTTP content-type is application/json — not the
+      // media type. Prefer it only when it's a real media content-type.
+      mimeType:
+        result.contentType && !result.contentType.includes("application/json")
+          ? result.contentType
+          : attachment.mimeType,
       fileName: attachment.fileName,
     };
   }
@@ -1703,20 +1690,18 @@ export class WcppClient {
     if (!info) {
       throw new Error("WCPP: message is not an image message (MsgType 3)");
     }
-    if (!info.fromUserName || info.msgId == null) {
-      throw new Error("WCPP: image message is missing required fields (fromUserName/msgId)");
+    // Received images are CDN-hosted (the XML carries aeskey + cdn*imgurl), so
+    // download via `/api/Tools/CdnDownloadImage` ({ fileAesKey, fileNo }) — the
+    // cache-based `/Tools/DownloadImg` returns ret=-104 "cacheSize do not equal
+    // totalLen" because the server has nothing cached for the message. fileNo is
+    // the CDN file id (the cdn*imgurl value); bytes come back base64 at Data.Image.
+    const fileNo = info.cdnBigImgUrl ?? info.cdnMidImgUrl ?? info.cdnThumbUrl;
+    if (!info.aesKey || !fileNo) {
+      throw new Error("WCPP: image message is missing CDN download fields (aeskey/cdn url)");
     }
 
-    // MAX `/api/Tools/DownloadImg` (高清图片下载) binds the Go DownloadParam
-    // struct — msgId/toWxid/dataLen/section/compressType — NOT the old CDN-url +
-    // aesKey shape (that was a different endpoint / older protocol).
-    const payload = buildImageDownloadPayload({
-      fromUserName: info.fromUserName,
-      msgId: info.msgId,
-      fileLength: info.fileLength,
-    });
-
-    return this.downloadMediaEndpoint("/Tools/DownloadImg", payload, outputPath);
+    const payload = { fileAesKey: info.aesKey, fileNo };
+    return this.downloadMediaEndpoint("/Tools/CdnDownloadImage", payload, outputPath);
   }
 
   async downloadVideo(message: SyncMessage | NormalizedMessage, outputPath?: string): Promise<MediaDownloadResult> {

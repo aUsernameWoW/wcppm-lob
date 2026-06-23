@@ -5,7 +5,7 @@
  * ~/.config/wcppm/config.json) and splits it into the WeChat-client config
  * (passed to WcppClient) and the downstream-bridge config (server + db).
  */
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { WcppConfig } from "./client.js";
@@ -41,6 +41,13 @@ export interface RawConfig {
   dbPath?: string;
   ageWindowSeconds?: number;
   pruneIntervalMs?: number;
+  /**
+   * Directory for lazily-downloaded inbound media. Must be readable by the
+   * subscriber and — for the OpenClaw adapter — under one of OpenClaw's allowed
+   * media roots (e.g. a subdir of /tmp/openclaw or <stateDir>/media), else the
+   * agent's image tool rejects the path. Default: <tmp>/wcppm-lob-media.
+   */
+  mediaDir?: string;
   // Heartbeat conductor (middleware-only, not in openclaw.plugin.json schema)
   heartbeat?: Partial<HeartbeatConfig>;
 }
@@ -54,6 +61,7 @@ export interface MiddlewareConfig {
   dbPath: string;
   ageWindowSeconds: number;
   pruneIntervalMs: number;
+  mediaDir: string;
   heartbeat: HeartbeatConfig;
 }
 
@@ -92,6 +100,7 @@ export function resolveConfig(raw: RawConfig): MiddlewareConfig {
     dbPath: raw.dbPath || join(homedir(), ".local", "share", "wcppm", "state.db"),
     ageWindowSeconds: raw.ageWindowSeconds ?? 600,
     pruneIntervalMs: raw.pruneIntervalMs ?? 600_000,
+    mediaDir: raw.mediaDir || join(tmpdir(), "wcppm-lob-media"),
     heartbeat: resolveHeartbeatConfig(raw.heartbeat),
   };
 }

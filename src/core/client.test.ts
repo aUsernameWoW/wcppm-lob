@@ -15,22 +15,38 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 
-import { WcppClient, type WcppConfig, buildImageDownloadPayload, extractDownloadBuffer } from "./client.js";
+import { WcppClient, type WcppConfig, extractDownloadBuffer } from "./client.js";
 import type { NormalizedMessage } from "./client.js";
 import type { Logger } from "../shared/logger.js";
 
 // --- media download helpers ------------------------------------------------
 
-test("buildImageDownloadPayload: matches the MAX DownloadParam struct (msgId + nested section)", () => {
-  const p = buildImageDownloadPayload({ fromUserName: "wxid_peer", msgId: 1681019322, fileLength: 54321 });
-  assert.equal(p.toWxid, "wxid_peer");
-  assert.equal(p.msgId, 1681019322); // small int32 MsgId, NOT NewMsgId
-  assert.equal(p.dataLen, 54321);
-  assert.equal(p.compressType, 0);
-  assert.deepEqual(p.section, { startPos: 0, dataLen: 54321 });
-  // flat fields sent too (hedge: server may bind the doc-style flat schema)
-  assert.equal(p.sectionStart, 0);
-  assert.equal(p.sectionLen, 54321);
+test("extractImageMessageInfo: parses attribute-form image XML (aeskey/cdn urls as <img> attrs)", () => {
+  const client = new WcppClient({ host: "", port: 8062, authcode: "x" } as WcppConfig, {
+    info() {}, warn() {}, error() {}, debug() {},
+  } as Logger);
+  const xml =
+    '<msg><img aeskey="AESKEY123" encryver="1" cdnthumburl="THUMB" cdnmidimgurl="MID" length="121781" cdnbigimgurl="BIG" hdlength="1675551" md5="MD5HASH"/></msg>';
+  const info = client.extractImageMessageInfo({
+    MsgId: 1056300438,
+    MsgType: 3,
+    FromUserName: { string: "gxnnycz" },
+    Content: { string: xml },
+  } as any);
+  assert.ok(info);
+  assert.equal(info!.aesKey, "AESKEY123");
+  assert.equal(info!.cdnBigImgUrl, "BIG");
+  assert.equal(info!.cdnMidImgUrl, "MID");
+  assert.equal(info!.fileLength, 121781);
+  assert.equal(info!.msgId, 1056300438); // small MsgId (not NewMsgId)
+});
+
+test("extractDownloadBuffer: finds CdnDownloadImage bytes at Data.Image (base64)", () => {
+  const want = Buffer.from("a fake jpeg payload long enough to clear the length guard", "utf8");
+  const json = { Code: 0, Success: true, Data: { Image: want.toString("base64") } };
+  const got = extractDownloadBuffer(json);
+  assert.ok(got);
+  assert.equal(got!.toString("utf8"), want.toString("utf8"));
 });
 
 test("extractDownloadBuffer: finds bytes at the nested Data.data.buffer (base64)", () => {
