@@ -1082,6 +1082,10 @@ export class WcppClient {
    * 'message' handler so it can be unit-tested against real captured frames.
    */
   handleWsMessage(raw: string): void {
+    // Trace: the COMPLETE raw push frame, verbatim. At debug this is the single
+    // most useful line for diagnosing inbound issues (empty image bodies, new
+    // MsgTypes, envelope-shape drift) — never guess at the wire, read it.
+    this.log.debug(`[ws] raw ${raw}`);
     try {
       const envelope = JSON.parse(raw) as MaxWsEnvelope;
       if (!envelope.Success || !envelope.Data) return;
@@ -1206,6 +1210,8 @@ export class WcppClient {
       });
       req.on("end", () => {
         if (bodyTooLarge) return;
+        // Trace: the COMPLETE raw webhook body, verbatim (see the [ws] raw note).
+        this.log.debug(`[webhook] raw ${body}`);
         try {
           const envelope = JSON.parse(body) as WebhookEnvelope;
 
@@ -1701,7 +1707,17 @@ export class WcppClient {
     }
 
     const payload = { fileAesKey: info.aesKey, fileNo };
-    return this.downloadMediaEndpoint("/Tools/CdnDownloadImage", payload, outputPath);
+
+    // The CDN object isn't always ready the instant the push arrives: a fetch in
+    // the same second returns 200 with an empty Data.Image, while a retry a beat
+    // later succeeds (confirmed live). Retry with backoff until bytes appear.
+    let result = await this.downloadMediaEndpoint("/Tools/CdnDownloadImage", payload, outputPath);
+    for (let attempt = 1; attempt < 5 && !(result.buffer && result.buffer.length > 0); attempt++) {
+      this.log.debug(`[media] CdnDownloadImage returned no bytes (attempt ${attempt}); retrying in 1.5s`);
+      await new Promise((r) => setTimeout(r, 1500));
+      result = await this.downloadMediaEndpoint("/Tools/CdnDownloadImage", payload, outputPath);
+    }
+    return result;
   }
 
   async downloadVideo(message: SyncMessage | NormalizedMessage, outputPath?: string): Promise<MediaDownloadResult> {
