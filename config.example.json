@@ -16,6 +16,15 @@
   "passRevokemsg": true,
   "maxMessageAge": 180,
 
+  "_imageRetry_comment": "Randomized retry for the CDN image download (the object isn't always ready the instant the push arrives). Total attempts are random in [minAttempts,maxAttempts]; each backoff = baseDelayMs × (1 ± jitterPct). Leave randomSeed null in production (unpredictable cadence); set a number/string ONLY to reproduce a run while debugging.",
+  "imageRetry": {
+    "minAttempts": 4,
+    "maxAttempts": 7,
+    "baseDelayMs": 1500,
+    "jitterPct": 0.3,
+    "randomSeed": null
+  },
+
   "_bridge_comment": "Downstream interface the OpenClaw adapter (and other bots) connect to.",
   "account": "default",
   "bridgeToken": "REPLACE_WITH_A_SHARED_SECRET",

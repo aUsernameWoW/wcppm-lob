@@ -17,10 +17,32 @@ import { createServer, type Server as HttpServer, type IncomingMessage, type Ser
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Logger } from "../shared/logger.js";
 import { buildProxyTransport, type ProxyTransport } from "./proxy.js";
+import { makeRng } from "./rng.js";
 
 // ──────────────────────────────────────────────
 // Config
 // ──────────────────────────────────────────────
+
+/**
+ * Randomized retry policy for the CDN image download (`/Tools/CdnDownloadImage`).
+ * The CDN object isn't always ready the instant the push arrives, so we retry a
+ * randomized number of times with a jittered backoff. A fixed `randomSeed`
+ * reproduces the exact sequence (debugging only — production should leave it
+ * unset so the cadence is unpredictable). All fields are resolved (no optionals)
+ * by config.ts before reaching the client.
+ */
+export interface ImageRetryConfig {
+  /** Lower bound (inclusive) of total attempts, counting the first try. */
+  minAttempts: number;
+  /** Upper bound (inclusive) of total attempts; the count is random in [min,max]. */
+  maxAttempts: number;
+  /** Backoff baseline in ms, before jitter. */
+  baseDelayMs: number;
+  /** Per-retry delay = baseDelayMs × (1 ± jitterPct). e.g. 0.3 → ±30%. */
+  jitterPct: number;
+  /** Seed for reproducible runs; null/undefined → Math.random (unpredictable). */
+  randomSeed?: number | string | null;
+}
 
 export interface WcppConfig {
   /** WCPPM server host. Required for outbound + WS; may be empty for passive webhook-only receivers. */
@@ -69,7 +91,18 @@ export interface WcppConfig {
   allowMsgTypes?: number[];
   passRevokemsg?: boolean;
   maxMessageAge?: number;
+  /** Randomized CDN image-download retry policy (resolved by config.ts). */
+  imageRetry?: ImageRetryConfig;
 }
+
+/** Built-in defaults for ImageRetryConfig — used when config omits the block. */
+export const DEFAULT_IMAGE_RETRY: ImageRetryConfig = {
+  minAttempts: 4,
+  maxAttempts: 7,
+  baseDelayMs: 1500,
+  jitterPct: 0.3,
+  randomSeed: null,
+};
 
 export interface WcppCredentials {
   authcode: string;
@@ -416,6 +449,10 @@ export class WcppClient {
   private _onMessage: MessageHandler | null = null;
   private config: WcppConfig;
 
+  // Randomized CDN image-download retry policy + its [0,1) generator.
+  private imageRetry: ImageRetryConfig;
+  private imageRng: () => number;
+
   // Outbound proxy transport (direct unless `proxy` is configured)
   private proxyTransport: ProxyTransport;
 
@@ -424,6 +461,8 @@ export class WcppClient {
     private log: Logger,
   ) {
     this.config = config;
+    this.imageRetry = config.imageRetry ?? DEFAULT_IMAGE_RETRY;
+    this.imageRng = makeRng(this.imageRetry.randomSeed);
     this.wxid = config.wxid ?? null;
     this.baseUrl = config.host ? `http://${config.host}:${config.port}` : "";
     this.synckey = ""; // empty until we ingest a real KeyBuf cursor; doSyncRequest omits Synckey while empty
@@ -1710,11 +1749,16 @@ export class WcppClient {
 
     // The CDN object isn't always ready the instant the push arrives: a fetch in
     // the same second returns 200 with an empty Data.Image, while a retry a beat
-    // later succeeds (confirmed live). Retry with backoff until bytes appear.
+    // later succeeds (confirmed live). Retry with a jittered backoff until bytes
+    // appear. Total attempts + each delay are randomized (see ImageRetryConfig):
+    // a fixed randomSeed reproduces the sequence, otherwise it's unpredictable.
+    const { minAttempts, maxAttempts, baseDelayMs, jitterPct } = this.imageRetry;
+    const maxTries = minAttempts + Math.floor(this.imageRng() * (maxAttempts - minAttempts + 1));
     let result = await this.downloadMediaEndpoint("/Tools/CdnDownloadImage", payload, outputPath);
-    for (let attempt = 1; attempt < 5 && !(result.buffer && result.buffer.length > 0); attempt++) {
-      this.log.debug(`[media] CdnDownloadImage returned no bytes (attempt ${attempt}); retrying in 1.5s`);
-      await new Promise((r) => setTimeout(r, 1500));
+    for (let attempt = 1; attempt < maxTries && !(result.buffer && result.buffer.length > 0); attempt++) {
+      const delay = Math.max(0, Math.round(baseDelayMs * (1 + (this.imageRng() * 2 - 1) * jitterPct)));
+      this.log.debug(`[media] CdnDownloadImage returned no bytes (attempt ${attempt}/${maxTries}); retrying in ${delay}ms`);
+      await new Promise((r) => setTimeout(r, delay));
       result = await this.downloadMediaEndpoint("/Tools/CdnDownloadImage", payload, outputPath);
     }
     return result;

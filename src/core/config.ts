@@ -8,7 +8,8 @@
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { WcppConfig } from "./client.js";
+import type { WcppConfig, ImageRetryConfig } from "./client.js";
+import { DEFAULT_IMAGE_RETRY } from "./client.js";
 import { resolveHeartbeatConfig } from "../heartbeat/runtime.js";
 import type { HeartbeatConfig } from "../heartbeat/runtime.js";
 
@@ -33,6 +34,8 @@ export interface RawConfig {
   allowMsgTypes?: number[];
   passRevokemsg?: boolean;
   maxMessageAge?: number;
+  /** Randomized CDN image-download retry policy (all fields optional; see ImageRetryConfig). */
+  imageRetry?: Partial<ImageRetryConfig>;
   // Downstream bridge
   account?: string;
   bridgeToken?: string;
@@ -65,6 +68,27 @@ export interface MiddlewareConfig {
   heartbeat: HeartbeatConfig;
 }
 
+/** Apply defaults to the (optional) imageRetry block and sanity-check the bounds. */
+export function resolveImageRetryConfig(raw?: Partial<ImageRetryConfig>): ImageRetryConfig {
+  const cfg: ImageRetryConfig = {
+    minAttempts: raw?.minAttempts ?? DEFAULT_IMAGE_RETRY.minAttempts,
+    maxAttempts: raw?.maxAttempts ?? DEFAULT_IMAGE_RETRY.maxAttempts,
+    baseDelayMs: raw?.baseDelayMs ?? DEFAULT_IMAGE_RETRY.baseDelayMs,
+    jitterPct: raw?.jitterPct ?? DEFAULT_IMAGE_RETRY.jitterPct,
+    randomSeed: raw?.randomSeed ?? DEFAULT_IMAGE_RETRY.randomSeed,
+  };
+  if (cfg.minAttempts < 1) {
+    throw new Error("config: imageRetry.minAttempts must be >= 1 (the first try always runs)");
+  }
+  if (cfg.maxAttempts < cfg.minAttempts) {
+    throw new Error("config: imageRetry.maxAttempts must be >= minAttempts");
+  }
+  if (cfg.baseDelayMs < 0 || cfg.jitterPct < 0) {
+    throw new Error("config: imageRetry.baseDelayMs and jitterPct must be >= 0");
+  }
+  return cfg;
+}
+
 export function resolveConfig(raw: RawConfig): MiddlewareConfig {
   if (!raw.bridgeToken) {
     throw new Error("config: bridgeToken is required (it is the bearer token guarding the downstream WS/HTTP interface)");
@@ -89,6 +113,7 @@ export function resolveConfig(raw: RawConfig): MiddlewareConfig {
     allowMsgTypes: raw.allowMsgTypes,
     passRevokemsg: raw.passRevokemsg,
     maxMessageAge: raw.maxMessageAge,
+    imageRetry: resolveImageRetryConfig(raw.imageRetry),
   };
 
   return {
