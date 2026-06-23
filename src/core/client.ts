@@ -689,7 +689,12 @@ export class WcppClient {
 
   private extractXmlTag(content: string, tag: string): string | null {
     const match = content.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, "i"));
-    return match?.[1]?.trim() || null;
+    let inner = match?.[1]?.trim();
+    if (!inner) return null;
+    // Unwrap a CDATA section if the whole value is one (e.g. <url><![CDATA[…]]></url>).
+    const cdata = inner.match(/^<!\[CDATA\[([\s\S]*?)\]\]>$/);
+    if (cdata) inner = cdata[1].trim();
+    return inner || null;
   }
 
   /**
@@ -924,11 +929,10 @@ export class WcppClient {
     if (msgType === 49) {
       const title = this.extractXmlTag(content, "title");
       const appType = this.extractXmlTag(content, "type");
-      const url = this.extractXmlTag(content, "url");
       // Quote/reply: <title> is the user's actual reply text — return it as-is.
       // The quoted context is attached separately via NormalizedMessage.quote.
       if (appType === "57") return title ?? "";
-      if (appType === "5") return title ? `[链接] ${title}` : (url ? `[链接] ${url}` : "[链接]");
+      if (appType === "5") return this.formatLinkCard(content);
       if (title) return `[卡片] ${title}`;
       return "[卡片消息]";
     }
@@ -940,6 +944,37 @@ export class WcppClient {
     }
 
     return content;
+  }
+
+  /**
+   * Format an inbound link/article share card (MsgType 49, appType 5) into a
+   * richer multi-line display string, so the downstream agent sees the source
+   * app, title, description and URL — not just the old flat `[链接] 标题`.
+   *
+   *   [小红书] 被人捏胸
+   *   #健身  #要做一个有胸肌的男人  #肌肉的重要性  #真拿你没办法
+   *   🔗 https://www.xiaohongshu.com/discovery/item/6a37?…
+   *
+   * Missing fields are simply omitted: a card with only a title collapses to a
+   * single `[链接] 标题` line, matching the previous behaviour.
+   */
+  formatLinkCard(content: string): string {
+    const title = this.extractXmlTag(content, "title");
+    const des = this.extractXmlTag(content, "des");
+    const rawUrl = this.extractXmlTag(content, "url");
+    const url = rawUrl ? this.unescapeXmlEntities(rawUrl) : null;
+    // Source app: <appinfo><appname>…</appname>, or the legacy <sourcedisplayname>.
+    const source =
+      this.extractXmlTag(content, "appname") ||
+      this.extractXmlTag(content, "sourcedisplayname") ||
+      "链接";
+
+    const headline = title || url;
+    const lines = [headline ? `[${source}] ${headline}` : `[${source}]`];
+    if (des) lines.push(des);
+    // Only append the URL line when it isn't already the headline (title-less card).
+    if (url && url !== headline) lines.push(`🔗 ${url}`);
+    return lines.join("\n");
   }
 
   /**

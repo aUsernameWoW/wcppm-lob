@@ -67,6 +67,25 @@ const LINK_CARD_XML = `<?xml version="1.0"?>
   </appmsg>
 </msg>`;
 
+// A rich MsgType-49 appType-5 link card in its real (小红书) shape: it carries
+// <des>, an <appinfo><appname>, and a <url> with HTML-entity-escaped ampersands.
+const XHS_CARD_XML = `<?xml version="1.0"?>
+<msg>
+	<appmsg appid="wxd8a2750ce9d46980">
+		<title>被人捏胸</title>
+		<des>#健身  #要做一个有胸肌的男人  #肌肉的重要性  #真拿你没办法</des>
+		<type>5</type>
+		<url>https://www.xiaohongshu.com/discovery/item/6a37?app_platform=android&amp;type=normal</url>
+		<appattach>
+			<cdnthumburl>305f0201THUMB...</cdnthumburl>
+		</appattach>
+	</appmsg>
+	<appinfo>
+		<version>46</version>
+		<appname>小红书</appname>
+	</appinfo>
+</msg>`;
+
 // MsgType-34 voice XML.
 // Note: the extractor's `bufid`/`voicelength`/`length` regexes accept the
 // attribute form, but `aeskey`/`voiceurl`/`filename` are only matched as
@@ -133,6 +152,56 @@ test("parseQuoteMessage: non-quote appType-5 link card → null", () => {
 test("parseQuoteMessage: plain text (no <type>57>) → null", () => {
   const client = makeClient();
   assert.equal(client.parseQuoteMessage("just some plain text, not xml"), null);
+});
+
+// ──────────────────────────────────────────────
+// formatLinkCard
+// ──────────────────────────────────────────────
+
+test("formatLinkCard: 小红书 card → [appname] title / des / 🔗 url (entities decoded)", () => {
+  const client = makeClient();
+  const lines = client.formatLinkCard(XHS_CARD_XML).split("\n");
+
+  assert.equal(lines[0], "[小红书] 被人捏胸");
+  assert.equal(lines[1], "#健身  #要做一个有胸肌的男人  #肌肉的重要性  #真拿你没办法");
+  // &amp; in the URL is decoded to a bare & so the link is usable.
+  assert.equal(
+    lines[2],
+    "🔗 https://www.xiaohongshu.com/discovery/item/6a37?app_platform=android&type=normal",
+  );
+  assert.equal(lines.length, 3);
+});
+
+test("formatLinkCard: minimal card (no appname/des) → [链接] title + url", () => {
+  const client = makeClient();
+  const lines = client.formatLinkCard(LINK_CARD_XML).split("\n");
+
+  // Source app falls back to the generic 链接 label when no appname is present.
+  assert.equal(lines[0], "[链接] 分享的文章标题");
+  assert.equal(lines[1], "🔗 https://example.com/article");
+  assert.equal(lines.length, 2);
+});
+
+test("formatLinkCard: CDATA-wrapped title/url are unwrapped and decoded", () => {
+  const client = makeClient();
+  const xml =
+    "<msg><appmsg><title><![CDATA[标题]]></title><type>5</type>" +
+    "<url><![CDATA[https://x.com/a?b=1&amp;c=2]]></url></appmsg></msg>";
+  const lines = client.formatLinkCard(xml).split("\n");
+
+  assert.equal(lines[0], "[链接] 标题");
+  assert.equal(lines[1], "🔗 https://x.com/a?b=1&c=2");
+  assert.equal(lines.length, 2);
+});
+
+test("formatLinkCard: no title → headline falls back to the url (not duplicated)", () => {
+  const client = makeClient();
+  const xml =
+    "<msg><appmsg><type>5</type><url>https://example.com/x</url></appmsg></msg>";
+  const lines = client.formatLinkCard(xml).split("\n");
+
+  assert.equal(lines[0], "[链接] https://example.com/x");
+  assert.equal(lines.length, 1);
 });
 
 // ──────────────────────────────────────────────
