@@ -15,9 +15,36 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 
-import { WcppClient, type WcppConfig } from "./client.js";
+import { WcppClient, type WcppConfig, buildImageDownloadPayload, extractDownloadBuffer } from "./client.js";
 import type { NormalizedMessage } from "./client.js";
 import type { Logger } from "../shared/logger.js";
+
+// --- media download helpers ------------------------------------------------
+
+test("buildImageDownloadPayload: matches the MAX DownloadParam struct (msgId + nested section)", () => {
+  const p = buildImageDownloadPayload({ fromUserName: "wxid_peer", msgId: 1681019322, fileLength: 54321 });
+  assert.equal(p.toWxid, "wxid_peer");
+  assert.equal(p.msgId, 1681019322); // small int32 MsgId, NOT NewMsgId
+  assert.equal(p.dataLen, 54321);
+  assert.equal(p.compressType, 0);
+  assert.deepEqual(p.section, { startPos: 0, dataLen: 54321 });
+  // flat fields sent too (hedge: server may bind the doc-style flat schema)
+  assert.equal(p.sectionStart, 0);
+  assert.equal(p.sectionLen, 54321);
+});
+
+test("extractDownloadBuffer: finds bytes at the nested Data.data.buffer (base64)", () => {
+  const want = Buffer.from("hello image bytes that are long enough to pass the guard", "utf8");
+  const json = { Code: 0, Success: true, Data: { msgId: 1, totalLen: 10, startPos: 0, data: { buffer: want.toString("base64") } } };
+  const got = extractDownloadBuffer(json);
+  assert.ok(got);
+  assert.equal(got!.toString("utf8"), want.toString("utf8"));
+});
+
+test("extractDownloadBuffer: supports a numeric byte array and returns null when absent", () => {
+  assert.deepEqual([...extractDownloadBuffer({ Data: { data: { buffer: [104, 105] } } })!], [104, 105]);
+  assert.equal(extractDownloadBuffer({ Data: { msgId: 1, ok: true } }), null);
+});
 
 // --- helpers ---------------------------------------------------------------
 

@@ -99,7 +99,7 @@ async function main(): Promise<void> {
     // Lazy media fetch: the adapter calls POST /media after its gate; we download
     // the bytes (operator-safe — /Tools/DownloadImg, not a /Login or /Msg/Sync
     // call) to mediaDir and hand back the local path.
-    fetchMedia: createMediaFetcher(client, db, { dir: mediaDir }),
+    fetchMedia: createMediaFetcher(client, db, { dir: mediaDir, log: logger }),
     status: () => ({ wsUp, selfWxid: client.wxid ?? undefined, lastMsgTs }),
     selfWxid: () => client.wxid ?? undefined,
     queryContacts: (account, q, limit) =>

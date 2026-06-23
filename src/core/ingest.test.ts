@@ -168,11 +168,12 @@ test("handleInbound: a new image message persists a lazy-fetch media descriptor"
 
   handleInbound(
     baseMsg({
-      msgId: "img-9",
+      msgId: "img-9", // stable id (NewMsgId) — used only as the frame/db key
       msgType: 3,
       fromUser: "wxid_peer",
-      content: "<msg><img aeskey='K' cdnbigimgurl='U'/></msg>",
+      content: "<msg><img aeskey='K' cdnbigimgurl='U' length='4242'/></msg>",
       text: "[图片]",
+      raw: { MsgId: 1681019322 }, // the small int32 MsgId the download API needs
     }),
     { account: "default", db, broadcast: (f) => sent.push(f), log: noopLogger },
   );
@@ -181,14 +182,15 @@ test("handleInbound: a new image message persists a lazy-fetch media descriptor"
   assert.equal(sent[0].media?.kind, "image");
   assert.equal(sent[0].media?.localPath, undefined);
 
-  // A descriptor sufficient to re-run the download was persisted under the msg id.
+  // A SyncMessage-shaped descriptor was persisted under the (NewMsgId) frame id,
+  // carrying the SMALL MsgId so extractImageMessageInfo downloads with the right id.
   const media = db.getMedia("default", "img-9");
   assert.equal(media?.kind, "image");
   const desc = JSON.parse(media!.descriptor);
-  assert.equal(desc.msgId, "img-9");
-  assert.equal(desc.msgType, 3);
-  assert.equal(desc.fromUser, "wxid_peer");
-  assert.match(desc.content, /aeskey/);
+  assert.equal(desc.MsgId, 1681019322);
+  assert.equal(desc.MsgType, 3);
+  assert.equal(desc.FromUserName.string, "wxid_peer");
+  assert.match(desc.Content.string, /aeskey/);
   db.close();
 });
 

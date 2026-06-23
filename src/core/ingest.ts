@@ -96,15 +96,20 @@ export function handleInbound(msg: NormalizedMessage, deps: IngestDeps): boolean
   // so a replayed-undelivered media frame remains fetchable after a reconnect.
   // The descriptor carries exactly what WcppClient.downloadImage re-extracts.
   if (frame.media) {
+    // Store a SyncMessage-shaped descriptor: extractImageMessageInfo then reads
+    // the small int32 `MsgId` (the download API rejects the 64-bit NewMsgId that
+    // NormalizedMessage.msgId resolves to). The raw MsgId lives on msg.raw.
+    const raw = msg.raw as { MsgId?: number } | null | undefined;
+    const rawMsgId = raw && typeof raw === "object" ? raw.MsgId : undefined;
     db.recordMedia({
       id: frame.id,
       account,
       kind: frame.media.kind,
       descriptor: JSON.stringify({
-        msgId: msg.msgId,
-        fromUser: msg.fromUser,
-        msgType: msg.msgType,
-        content: msg.content,
+        MsgId: rawMsgId,
+        MsgType: msg.msgType,
+        FromUserName: { string: msg.fromUser },
+        Content: { string: msg.content },
       }),
       ts: frame.ts,
     });

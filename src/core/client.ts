@@ -357,6 +357,70 @@ export type ResolvedMedia =
     };
 
 // ──────────────────────────────────────────────
+// Pure media-download helpers (exported for unit tests)
+// ──────────────────────────────────────────────
+
+/**
+ * Build the `/api/Tools/DownloadImg` request body. The MAX server binds the Go
+ * `DownloadParam` struct: `{ ToWxid, MsgId, DataLen, Section{StartPos,DataLen},
+ * CompressType }` (see docs/api-reference/docs/7471819m0.md — the working video
+ * downloader). The swagger's flat `sectionStart`/`sectionLen` is a doc-only DTO;
+ * we send BOTH the nested `section` and the flat fields so whichever the server
+ * actually binds is populated (Go ignores unknown JSON fields).
+ *
+ * `msgId` MUST be the small int32 `MsgId` (NOT the 64-bit NewMsgId) — extracted
+ * from the raw message. `dataLen` is the image size from the message XML.
+ */
+export function buildImageDownloadPayload(info: {
+  fromUserName: string;
+  msgId: number;
+  fileLength: number | null;
+  compressType?: number;
+}): Record<string, unknown> {
+  const dataLen = info.fileLength ?? 0;
+  const compressType = info.compressType ?? 0;
+  return {
+    toWxid: info.fromUserName,
+    msgId: info.msgId,
+    dataLen,
+    compressType,
+    section: { startPos: 0, dataLen },
+    sectionStart: 0,
+    sectionLen: dataLen,
+  };
+}
+
+/**
+ * Extract the binary payload from the MAX server's unified download JSON. The
+ * bytes land at varying depths across endpoints (`Data.data.buffer`,
+ * `Data.buffer`, …) as a base64 string or a numeric byte array — so we
+ * deep-scan for the first `buffer`/`base64` key. Returns null if none found.
+ */
+export function extractDownloadBuffer(json: unknown): Buffer | null {
+  const seen = new Set<object>();
+  const walk = (node: unknown): Buffer | null => {
+    if (node === null || typeof node !== "object") return null;
+    if (seen.has(node as object)) return null;
+    seen.add(node as object);
+    for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+      const key = k.toLowerCase();
+      if ((key === "buffer" || key === "base64") && typeof v === "string" && v.length > 32 && /^[A-Za-z0-9+/=\r\n]+$/.test(v)) {
+        return Buffer.from(v.replace(/\s+/g, ""), "base64");
+      }
+      if (key === "buffer" && Array.isArray(v) && v.length > 0) {
+        return Buffer.from((v as unknown[]).map((x) => Number(x) & 0xff));
+      }
+    }
+    for (const v of Object.values(node as Record<string, unknown>)) {
+      const r = walk(v);
+      if (r) return r;
+    }
+    return null;
+  };
+  return walk(json);
+}
+
+// ──────────────────────────────────────────────
 // Client
 // ──────────────────────────────────────────────
 
@@ -1566,7 +1630,10 @@ export class WcppClient {
     payload: Record<string, unknown>,
     outputPath?: string,
   ): Promise<MediaDownloadResult> {
-    const url = `${this.baseUrl}${endpoint}?${this.authQuery()}`;
+    // All MAX endpoints live under /api (the swagger basePath); the Tools paths
+    // are passed in WITHOUT it (e.g. "/Tools/DownloadImg") — prefix it here.
+    // Omitting /api is a route miss → "404 nomatch".
+    const url = `${this.baseUrl}/api${endpoint}?${this.authQuery()}`;
 
     const res = await this.httpFetch(url, {
       method: "POST",
@@ -1576,31 +1643,24 @@ export class WcppClient {
 
     const contentType = res.headers.get("content-type");
     if (!res.ok) {
-      throw new Error(`WCPP: ${endpoint} HTTP ${res.status}`);
+      // Surface the server's body — it carries the actual reason (route miss,
+      // bad param, …) and is otherwise swallowed by the lazy-fetch catch.
+      let detail = "";
+      try {
+        detail = (await res.text()).slice(0, 300);
+      } catch {
+        /* ignore */
+      }
+      throw new Error(`WCPP: /api${endpoint} HTTP ${res.status}${detail ? ` — ${detail}` : ""}`);
     }
 
     let buffer: Buffer | null = null;
     let responseJson: unknown;
 
     if (contentType?.includes("application/json")) {
-      const data = await res.json() as any;
+      const data = (await res.json()) as unknown;
       responseJson = data;
-
-      const candidates = [
-        data?.Data,
-        data?.data,
-        data?.Data?.buffer,
-        data?.Data?.base64,
-        data?.Data?.Base64,
-        data?.buffer,
-        data?.base64,
-        data?.Base64,
-      ].filter(Boolean);
-
-      const base64Candidate = candidates.find((v: unknown) => typeof v === "string" && /^[A-Za-z0-9+/=\r\n]+$/.test(v as string));
-      if (typeof base64Candidate === "string") {
-        buffer = Buffer.from(base64Candidate.replace(/\s+/g, ""), "base64");
-      }
+      buffer = extractDownloadBuffer(data);
     } else {
       buffer = Buffer.from(await res.arrayBuffer());
     }
@@ -1647,16 +1707,14 @@ export class WcppClient {
       throw new Error("WCPP: image message is missing required fields (fromUserName/msgId)");
     }
 
-    const payload: Record<string, unknown> = {
+    // MAX `/api/Tools/DownloadImg` (高清图片下载) binds the Go DownloadParam
+    // struct — msgId/toWxid/dataLen/section/compressType — NOT the old CDN-url +
+    // aesKey shape (that was a different endpoint / older protocol).
+    const payload = buildImageDownloadPayload({
       fromUserName: info.fromUserName,
       msgId: info.msgId,
-    };
-    if (info.aesKey) payload.aesKey = info.aesKey;
-    if (info.cdnMidImgUrl) payload.cdnMidImgUrl = info.cdnMidImgUrl;
-    if (info.cdnBigImgUrl) payload.cdnBigImgUrl = info.cdnBigImgUrl;
-    if (info.cdnThumbUrl) payload.cdnThumbUrl = info.cdnThumbUrl;
-    if (info.md5) payload.md5 = info.md5;
-    if (info.fileLength != null) payload.length = info.fileLength;
+      fileLength: info.fileLength,
+    });
 
     return this.downloadMediaEndpoint("/Tools/DownloadImg", payload, outputPath);
   }

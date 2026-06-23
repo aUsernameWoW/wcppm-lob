@@ -71,18 +71,30 @@ export interface MediaFetchResult {
 export function createMediaFetcher(
   client: MediaCapableClient,
   store: MediaDescriptorStore,
-  opts: { dir?: string } = {},
+  opts: { dir?: string; log?: { warn: (...a: unknown[]) => void; debug: (...a: unknown[]) => void } } = {},
 ): (account: string, id: string) => Promise<MediaFetchResult> {
+  const log = opts.log;
   return async (account, id) => {
     const row = store.getMedia(account, id);
-    if (!row) return { ok: false };
+    if (!row) {
+      // No descriptor: pruned, never stored, or unknown id. Visible at debug —
+      // this is an expected outcome (e.g. fetching an aged-out media frame).
+      log?.debug(`[media] no descriptor for account=${account} id=${id}`);
+      return { ok: false };
+    }
     try {
       const message = JSON.parse(row.descriptor);
       const resolved = client.resolveMedia(message);
-      if (!resolved) return { ok: false };
+      if (!resolved) {
+        log?.warn(`[media] descriptor for ${id} did not resolve to downloadable media (kind=${row.kind})`);
+        return { ok: false };
+      }
       const m = await resolved.materialize(opts.dir);
       return { ok: true, localPath: m.filePath, mimeType: m.mimeType, fileName: m.fileName };
-    } catch {
+    } catch (err) {
+      // Log the REAL reason at warn (HTTP 404, bad param, …) — the download
+      // error is otherwise swallowed and the agent just silently loses the image.
+      log?.warn(`[media] fetch failed for ${id}: ${String(err)}`);
       return { ok: false };
     }
   };

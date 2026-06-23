@@ -18,6 +18,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/wcppm-lob
+# WCPPM_DEBUG=1 surfaces the per-event hot-path traces ([in]/[media]/[sub]/[send]).
+# Drop it once steady-state to keep logs quiet (genuine failures log at warn/error regardless).
+Environment=WCPPM_DEBUG=1
 ExecStart=/home/radxa/.nvm/versions/node/v24.13.0/bin/node --disable-warning=ExperimentalWarning %h/wcppm-lob/dist/core/main.js
 # Config defaults to ~/.config/wcppm/config.json; pass an explicit path by
 # appending it to ExecStart if you keep it elsewhere.
