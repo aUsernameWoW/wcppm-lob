@@ -22,5 +22,16 @@
   "bridgeHost": "127.0.0.1",
   "bridgePort": 8077,
   "dbPath": "",
-  "ageWindowSeconds": 600
+  "ageWindowSeconds": 600,
+
+  "_heartbeat_comment": "Heartbeat conductor (default-off). Enable to keep the WCPPM longlink alive via periodic /api/Login/HeartBeat calls.",
+  "heartbeat": {
+    "enabled": false,
+    "redisUrl": "redis://100.64.0.8:6379",
+    "redisDb": 15,
+    "jitterPct": 0.07,
+    "hardFloorMs": 60000,
+    "maxPerHour": 30,
+    "maxConsecutiveFailures": 4
+  }
 }

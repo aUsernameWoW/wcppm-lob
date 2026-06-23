@@ -9,6 +9,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import type { WcppConfig } from "./client.js";
+import { resolveHeartbeatConfig } from "../heartbeat/runtime.js";
+import type { HeartbeatConfig } from "../heartbeat/runtime.js";
 
 /** Loose shape of the on-disk config file. */
 export interface RawConfig {
@@ -39,6 +41,8 @@ export interface RawConfig {
   dbPath?: string;
   ageWindowSeconds?: number;
   pruneIntervalMs?: number;
+  // Heartbeat conductor (middleware-only, not in openclaw.plugin.json schema)
+  heartbeat?: Partial<HeartbeatConfig>;
 }
 
 export interface MiddlewareConfig {
@@ -50,6 +54,7 @@ export interface MiddlewareConfig {
   dbPath: string;
   ageWindowSeconds: number;
   pruneIntervalMs: number;
+  heartbeat: HeartbeatConfig;
 }
 
 export function resolveConfig(raw: RawConfig): MiddlewareConfig {
@@ -87,5 +92,6 @@ export function resolveConfig(raw: RawConfig): MiddlewareConfig {
     dbPath: raw.dbPath || join(homedir(), ".local", "share", "wcppm", "state.db"),
     ageWindowSeconds: raw.ageWindowSeconds ?? 600,
     pruneIntervalMs: raw.pruneIntervalMs ?? 600_000,
+    heartbeat: resolveHeartbeatConfig(raw.heartbeat),
   };
 }

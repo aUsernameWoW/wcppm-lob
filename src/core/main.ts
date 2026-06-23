@@ -21,6 +21,7 @@ import { WcppClient } from "./client.js";
 import { createBridgeServer, type ServerDeps } from "./server.js";
 import { createSendHandler } from "./wiring.js";
 import { handleInbound } from "./ingest.js";
+import { startHeartbeatConductor } from "../heartbeat/runtime.js";
 import type { Logger } from "../shared/logger.js";
 import type { Frame } from "../shared/frame.js";
 
@@ -141,6 +142,9 @@ async function main(): Promise<void> {
   const port = await server.listen(cfg.bridgePort, cfg.bridgeHost);
   logger.info(`bridge up: ws://${cfg.bridgeHost}:${port}/subscribe · http://${cfg.bridgeHost}:${port}`);
 
+  // Start the heartbeat conductor if enabled (default-off; existing deployments unaffected).
+  const hb = startHeartbeatConductor(cfg.heartbeat, cfg.wcpp, logger);
+
   // Retention: prune inbound_log rows older than max(maxMessageAge, 1h).
   const retentionSec = Math.max(cfg.wcpp.maxMessageAge ?? 180, 3600);
   const pruneTimer = setInterval(() => {
@@ -168,6 +172,11 @@ async function main(): Promise<void> {
     }
     try {
       await server.close();
+    } catch {
+      /* ignore */
+    }
+    try {
+      await hb?.stop();
     } catch {
       /* ignore */
     }
