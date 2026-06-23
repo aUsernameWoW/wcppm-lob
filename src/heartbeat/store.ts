@@ -8,6 +8,14 @@ export interface RedisLike {
   quit(): Promise<unknown>;
 }
 
+/**
+ * Heartbeat persistence contract.
+ *
+ * Key derivation: entries are keyed by (authcode, netDetail).
+ * - save() derives the key from info.netDetail
+ * - load(authcode, netDetail) must pass the same netDetail as the saved info,
+ *   otherwise load will return null (the entry exists but under a different key).
+ */
 export interface HeartbeatStore {
   load(authcode: string, netDetail: string): Promise<NetHeartbeatInfo | null>;
   save(authcode: string, info: NetHeartbeatInfo): Promise<void>;
@@ -24,7 +32,7 @@ export class RedisHeartbeatStore implements HeartbeatStore {
 
   constructor(opts: { url: string; db: number; prefix?: string }, redis?: RedisLike) {
     this.prefix = opts.prefix ?? "hbconductor:";
-    this.redis = redis ?? new Redis(opts.url, { db: opts.db, lazyConnect: false });
+    this.redis = redis ?? new Redis(opts.url, { db: opts.db });
   }
 
   async load(authcode: string, netDetail: string): Promise<NetHeartbeatInfo | null> {
