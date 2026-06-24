@@ -350,7 +350,7 @@ export function startWcppRuntime(
     replyToId?: string;
     replyToBody?: string;
     replyToSender?: string;
-    mediaKind?: "image" | "voice" | "video";
+    mediaKind?: "image" | "voice" | "video" | "file";
     raw: any;
   }) => Promise<void>,
 ): void {

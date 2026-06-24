@@ -132,8 +132,30 @@ test("bridge-client.send: POSTs to /send with the bearer token and returns the r
   const client = createBridgeClient({ url: `ws://127.0.0.1:${port}`, token: "tok", onMessage: () => {} });
   const r = await client.send({ to: "wxid_x", text: "hello", replyTo: "m9" });
 
-  assert.deepEqual(received, { to: "wxid_x", text: "hello", replyTo: "m9" });
+  // account defaults to the client's configured account ("default" here).
+  assert.deepEqual(received, { to: "wxid_x", text: "hello", replyTo: "m9", account: "default" });
   assert.deepEqual(r, { ok: true, msgId: "sent-1" });
+
+  await server.close();
+});
+
+test("bridge-client.send: defaults account to the connection's account (multi-instance routing fix)", async () => {
+  let received: { account?: string } = {};
+  const server = createBridgeServer(
+    fakeDeps({
+      send: async (req) => {
+        received = req;
+        return { ok: true };
+      },
+    }),
+  );
+  const port = await server.listen(0);
+
+  // No account on the send() call — the bridge must fill in its own account so
+  // the middleware can route the reply (else "no instance for account=undefined").
+  const client = createBridgeClient({ url: `ws://127.0.0.1:${port}`, token: "tok", account: "acct2", onMessage: () => {} });
+  await client.send({ to: "wxid_x", text: "hi" });
+  assert.equal(received.account, "acct2");
 
   await server.close();
 });
