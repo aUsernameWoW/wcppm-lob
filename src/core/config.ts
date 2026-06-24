@@ -10,8 +10,15 @@ import { join } from "node:path";
 
 import type { WcppConfig, ImageRetryConfig } from "./client.js";
 import { DEFAULT_IMAGE_RETRY } from "./client.js";
+import { DEFAULT_OUTBOUND_PACER } from "./outbound-pacer.js";
+import type { OutboundPacerConfig, QuietHoursConfig } from "./outbound-pacer.js";
 import { resolveHeartbeatConfig } from "../heartbeat/runtime.js";
 import type { HeartbeatConfig } from "../heartbeat/runtime.js";
+
+/** Raw (all-optional) outbound-pacer block as it appears on disk. */
+export interface RawOutboundPacerConfig extends Partial<Omit<OutboundPacerConfig, "quietHours">> {
+  quietHours?: Partial<QuietHoursConfig>;
+}
 
 /**
  * Per-WeChat-instance fields. In a multi-instance config these live inside each
@@ -40,6 +47,12 @@ export interface RawInstanceConfig {
    * an `instances[]` entry it OVERRIDES (field-by-field) the global for that instance.
    */
   heartbeat?: Partial<HeartbeatConfig>;
+  /**
+   * Outbound humanizing pacer. Same global/override scoping as `heartbeat`: the
+   * top-level block is the default, a per-instance block overrides it field-by-field.
+   * Disabled by default (transparent pass-through).
+   */
+  outboundPacer?: RawOutboundPacerConfig;
 }
 
 /** Loose shape of the on-disk config file. */
@@ -78,6 +91,8 @@ export interface InstanceConfig {
   wcpp: WcppConfig;
   /** Per-instance heartbeat config (global heartbeat with this instance's overrides applied). */
   heartbeat: HeartbeatConfig;
+  /** Per-instance outbound pacer config (global pacer with this instance's overrides applied). */
+  outboundPacer: OutboundPacerConfig;
 }
 
 /** The shared webhook listener: one port, signature-verified, routed by Wxid. */
@@ -126,6 +141,52 @@ export function resolveImageRetryConfig(raw?: Partial<ImageRetryConfig>): ImageR
 }
 
 /**
+ * Apply defaults to the outbound-pacer block. `global` is the top-level block; `inst`
+ * is the per-instance override; either may be absent. Resolution is field-by-field
+ * (instance wins over global wins over built-in default), including inside quietHours.
+ */
+export function resolveOutboundPacerConfig(
+  global?: RawOutboundPacerConfig,
+  inst?: RawOutboundPacerConfig,
+): OutboundPacerConfig {
+  const g = global ?? {};
+  const i = inst ?? {};
+  const d = DEFAULT_OUTBOUND_PACER;
+  const gq = g.quietHours ?? {};
+  const iq = i.quietHours ?? {};
+  const cfg: OutboundPacerConfig = {
+    enabled: i.enabled ?? g.enabled ?? d.enabled,
+    firstReplyBaseMs: i.firstReplyBaseMs ?? g.firstReplyBaseMs ?? d.firstReplyBaseMs,
+    firstReplyPerCharMs: i.firstReplyPerCharMs ?? g.firstReplyPerCharMs ?? d.firstReplyPerCharMs,
+    firstReplyMaxMs: i.firstReplyMaxMs ?? g.firstReplyMaxMs ?? d.firstReplyMaxMs,
+    jitterPct: i.jitterPct ?? g.jitterPct ?? d.jitterPct,
+    minGapMs: i.minGapMs ?? g.minGapMs ?? d.minGapMs,
+    idleResetMs: i.idleResetMs ?? g.idleResetMs ?? d.idleResetMs,
+    hardFloorMs: i.hardFloorMs ?? g.hardFloorMs ?? d.hardFloorMs,
+    maxQueueDepth: i.maxQueueDepth ?? g.maxQueueDepth ?? d.maxQueueDepth,
+    ceilingPerMinute: i.ceilingPerMinute ?? g.ceilingPerMinute ?? d.ceilingPerMinute,
+    ceilingPerHour: i.ceilingPerHour ?? g.ceilingPerHour ?? d.ceilingPerHour,
+    quietHours: {
+      enabled: iq.enabled ?? gq.enabled ?? d.quietHours.enabled,
+      timezone: iq.timezone ?? gq.timezone ?? d.quietHours.timezone,
+      ranges: iq.ranges ?? gq.ranges ?? d.quietHours.ranges,
+      delayMultiplier: iq.delayMultiplier ?? gq.delayMultiplier ?? d.quietHours.delayMultiplier,
+      ceilingPerMinute: iq.ceilingPerMinute ?? gq.ceilingPerMinute ?? d.quietHours.ceilingPerMinute,
+    },
+  };
+  if (cfg.firstReplyMaxMs < cfg.firstReplyBaseMs) {
+    throw new Error("config: outboundPacer.firstReplyMaxMs must be >= firstReplyBaseMs");
+  }
+  if (cfg.maxQueueDepth < 1) {
+    throw new Error("config: outboundPacer.maxQueueDepth must be >= 1");
+  }
+  if (cfg.ceilingPerMinute < 1 || cfg.ceilingPerHour < 1) {
+    throw new Error("config: outboundPacer ceilings must be >= 1");
+  }
+  return cfg;
+}
+
+/**
  * Resolve one raw instance entry into an InstanceConfig. `index` is only used for
  * error messages. `globalHeartbeat` is the top-level heartbeat block that this
  * instance's own `heartbeat` overrides field-by-field. The webhook* fields are
@@ -136,6 +197,7 @@ function resolveInstance(
   raw: RawInstanceConfig,
   index: number,
   globalHeartbeat: Partial<HeartbeatConfig> | undefined,
+  globalPacer: RawOutboundPacerConfig | undefined,
 ): InstanceConfig {
   const account = (raw.account || "").trim();
   if (!account) {
@@ -158,7 +220,8 @@ function resolveInstance(
   };
   // Per-instance heartbeat = global defaults with this instance's overrides on top.
   const heartbeat = resolveHeartbeatConfig({ ...(globalHeartbeat ?? {}), ...(raw.heartbeat ?? {}) });
-  return { account, wcpp, heartbeat };
+  const outboundPacer = resolveOutboundPacerConfig(globalPacer, raw.outboundPacer);
+  return { account, wcpp, heartbeat, outboundPacer };
 }
 
 export function resolveConfig(raw: RawConfig): MiddlewareConfig {
@@ -172,7 +235,7 @@ export function resolveConfig(raw: RawConfig): MiddlewareConfig {
   const rawInstances: RawInstanceConfig[] =
     raw.instances && raw.instances.length > 0 ? raw.instances : [{ ...raw, account: raw.account || "default" }];
 
-  const instances = rawInstances.map((ri, i) => resolveInstance(ri, i, raw.heartbeat));
+  const instances = rawInstances.map((ri, i) => resolveInstance(ri, i, raw.heartbeat, raw.outboundPacer));
 
   const seen = new Set<string>();
   for (const inst of instances) {

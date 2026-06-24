@@ -26,6 +26,7 @@ import { openDb } from "./db.js";
 import { WcppClient, type WcppConfig } from "./client.js";
 import { createBridgeServer, type ServerDeps } from "./server.js";
 import { createSendHandler, createMediaFetcher } from "./wiring.js";
+import { createOutboundPacer, type OutboundPacer } from "./outbound-pacer.js";
 import { createWebhookListener, type WebhookSink } from "./webhook-listener.js";
 import { handleInbound } from "./ingest.js";
 import { startHeartbeatConductor } from "../heartbeat/runtime.js";
@@ -46,7 +47,10 @@ interface Instance {
   /** Per-instance logger (root.child(account)) — auto-tags every line `[account]`. */
   log: Logger;
   client: WcppClient;
+  /** Outbound send, paced through the humanizing pacer (pass-through when disabled). */
   send: ReturnType<typeof createSendHandler>;
+  /** The pacer wrapping `send`; stopped on shutdown so its timers don't linger. */
+  pacer: OutboundPacer;
   fetchMedia: ReturnType<typeof createMediaFetcher>;
   hb?: { stop(): Promise<void> | void } | null;
   wsUp: boolean;
@@ -105,13 +109,30 @@ async function main(): Promise<void> {
   for (const inst of cfg.instances) {
     const log = logger.child(inst.account);
     const client = new WcppClient(inst.wcpp, log);
+    // Raw outbound send (text/quote/media). The pacer wraps it to humanize timing;
+    // when outboundPacer.enabled is false the pacer is a transparent pass-through.
+    const rawSend = createSendHandler(client, (referMsgId) => {
+      // Recover the quoted message's sender + text from the stored inbound
+      // frame so /Msg/Quote can render the grey quoted block. A miss (pruned /
+      // unknown id) degrades to a bare quote.
+      const row = db.getInbound(inst.account, referMsgId);
+      if (!row) return undefined;
+      try {
+        const frame = JSON.parse(row.payload) as { from?: { wxid?: string; name?: string }; text?: string };
+        return { senderWxid: frame.from?.wxid, displayName: frame.from?.name, quotedContent: frame.text };
+      } catch {
+        return undefined;
+      }
+    });
+    const pacer = createOutboundPacer(rawSend, inst.outboundPacer, { log });
     instances.set(inst.account, {
       account: inst.account,
       wcpp: inst.wcpp,
       heartbeat: inst.heartbeat,
       log,
       client,
-      send: createSendHandler(client),
+      send: pacer.send,
+      pacer,
       fetchMedia: createMediaFetcher(client, db, { dir: mediaDir, log }),
       wsUp: false,
       msgsInWindow: 0,
@@ -121,6 +142,7 @@ async function main(): Promise<void> {
     log.info(
       `[cfg] host=${inst.wcpp.host ?? "(webhook-only)"}:${inst.wcpp.port}` +
         ` hb=${inst.heartbeat.enabled ? "on" : "off"}` +
+        ` pacer=${inst.outboundPacer.enabled ? "on" : "off"}` +
         ` maxAge=${inst.wcpp.maxMessageAge ?? 180}s readOnly=${Boolean(inst.wcpp.readOnly)}`,
     );
     if (inst.wcpp.readOnly) log.warn("[cfg] read-only mode — outbound sends are disabled");
@@ -308,6 +330,11 @@ async function main(): Promise<void> {
     clearInterval(pruneTimer);
     clearInterval(livenessTimer);
     for (const inst of instances.values()) {
+      try {
+        inst.pacer.stop();
+      } catch {
+        /* ignore */
+      }
       try {
         inst.client.disconnect();
       } catch {
