@@ -5,29 +5,71 @@
  * with real branching logic live here so they can be unit-tested.
  */
 
+import type { OutboundMedia } from "../shared/frame.js";
+
 export interface SendCapableClient {
   sendText(to: string, text: string): Promise<boolean>;
-  sendQuote(to: string, text: string, referMsgId: string, referToUserName?: string): Promise<boolean>;
+  sendQuote(
+    to: string,
+    text: string,
+    referMsgId: string,
+    opts?: { senderWxid?: string; displayName?: string; quotedContent?: string; msgSeq?: string },
+  ): Promise<boolean>;
+  sendMediaFromUrl(
+    to: string,
+    url: string,
+    opts?: { kind?: "image" | "video" | "file"; fileName?: string; caption?: string },
+  ): Promise<boolean>;
+}
+
+/** Quoted-message context recovered for an outbound quote-reply (see createSendHandler). */
+export interface QuoteContext {
+  senderWxid?: string;
+  displayName?: string;
+  quotedContent?: string;
 }
 
 export interface SendRequest {
   account?: string;
   to: string;
-  text: string;
+  /** Optional when `media` is present (a media-only reply carries no text). */
+  text?: string;
   replyTo?: string;
+  media?: OutboundMedia;
 }
 
 /**
- * Build the `send` handler for ServerDeps: route to sendQuote when replyTo is
- * set (mapping it to the WeChat refer-msg-id), otherwise plain sendText.
+ * Build the `send` handler for ServerDeps. Routing order:
+ *   1. `media` present  → download + send via the matching media endpoint
+ *      (the request `text`, or `media.caption`, becomes the image caption).
+ *   2. `replyTo` present → sendQuote (mapping it to the WeChat refer-msg-id).
+ *   3. otherwise         → plain sendText.
+ *
+ * `resolveQuoteContext` (optional) recovers the quoted message's sender name +
+ * content for the quote-reply, so `/Msg/Quote` can render the grey quoted
+ * block. Wired from SQLite in main.ts; absent in tests → a bare quote (msg-id
+ * only, same as before).
  */
 export function createSendHandler(
   client: SendCapableClient,
+  resolveQuoteContext?: (referMsgId: string) => QuoteContext | undefined,
 ): (req: SendRequest) => Promise<{ ok: boolean; msgId?: string }> {
   return async (req) => {
-    const ok = req.replyTo
-      ? await client.sendQuote(req.to, req.text, req.replyTo)
-      : await client.sendText(req.to, req.text);
+    if (req.media) {
+      const ok = await client.sendMediaFromUrl(req.to, req.media.url, {
+        kind: req.media.kind,
+        fileName: req.media.fileName,
+        caption: req.media.caption ?? (req.text || undefined),
+      });
+      return { ok };
+    }
+    const text = req.text ?? "";
+    if (req.replyTo) {
+      const ctx = resolveQuoteContext?.(req.replyTo);
+      const ok = await client.sendQuote(req.to, text, req.replyTo, ctx ?? {});
+      return { ok };
+    }
+    const ok = await client.sendText(req.to, text);
     return { ok };
   };
 }

@@ -62,6 +62,8 @@ export interface Db {
   markDelivered(account: string, id: string, deliveredAt: number): void;
   /** Replay set: un-acked rows for an account with ts >= sinceTs (the age window), oldest first. */
   getUndelivered(account: string, sinceTs: number): InboundRow[];
+  /** Single inbound row by (account, id), or undefined. Used to recover quote context. */
+  getInbound(account: string, id: string): InboundRow | undefined;
   /** Retention: delete inbound rows with ts < cutoff. Returns how many were removed. */
   pruneInbound(cutoffTs: number): number;
   /** INSERT OR IGNORE a media descriptor (lazy-fetch). Returns true if newly inserted. */
@@ -174,6 +176,9 @@ export function openDb(path: string): Db {
     "SELECT id, account, ts, payload, delivered_at FROM inbound_log" +
       " WHERE account = ? AND delivered_at IS NULL AND ts >= ? ORDER BY ts ASC",
   );
+  const getInboundStmt = db.prepare(
+    "SELECT id, account, ts, payload, delivered_at FROM inbound_log WHERE account = ? AND id = ?",
+  );
   const pruneStmt = db.prepare("DELETE FROM inbound_log WHERE ts < ?");
   const insertMediaStmt = db.prepare(
     "INSERT OR IGNORE INTO media (id, account, kind, descriptor, ts) VALUES (?, ?, ?, ?, ?)",
@@ -209,6 +214,9 @@ export function openDb(path: string): Db {
     },
     getUndelivered(account, sinceTs) {
       return undeliveredStmt.all(account, sinceTs) as unknown as InboundRow[];
+    },
+    getInbound(account, id) {
+      return getInboundStmt.get(account, id) as InboundRow | undefined;
     },
     pruneInbound(cutoffTs) {
       return Number(pruneStmt.run(cutoffTs).changes);

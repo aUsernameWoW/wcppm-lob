@@ -18,6 +18,22 @@ export interface FrameMedia {
   localPath?: string;
 }
 
+/**
+ * Outbound media descriptor carried on a `/send` request. The middleware
+ * downloads/reads `url` (http(s) or file://), infers `kind` from the
+ * content-type/extension when omitted, and dispatches via the matching MAX
+ * send endpoint. `caption` (or the request's `text`) is sent as a follow-up
+ * text for images. Voice is intentionally NOT supported yet (needs a SILK
+ * encoder — see Spec B notes).
+ */
+export interface OutboundMedia {
+  kind?: "image" | "video" | "file";
+  /** http(s) URL or file:// path the middleware can read. */
+  url: string;
+  fileName?: string;
+  caption?: string;
+}
+
 /** What an inbound message quotes/replies to, when present. */
 export interface FrameQuote {
   /** Server-side id of the quoted message. */

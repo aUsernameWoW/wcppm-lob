@@ -14,7 +14,7 @@
 import WebSocket from "ws";
 import { fetch as undiciFetch } from "undici";
 import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, timingSafeEqual, randomUUID } from "node:crypto";
 import type { Logger } from "../shared/logger.js";
 import { buildProxyTransport, type ProxyTransport } from "./proxy.js";
 import { makeRng } from "./rng.js";
@@ -94,7 +94,32 @@ export interface WcppConfig {
   maxMessageAge?: number;
   /** Randomized CDN image-download retry policy (resolved by config.ts). */
   imageRetry?: ImageRetryConfig;
+  /** Outbound send timeout + transient-failure retry policy (defaults below). */
+  sendRetry?: SendRetryConfig;
 }
+
+/**
+ * Outbound `/api/*` send policy: per-request timeout + retry on TRANSPORT
+ * failures only (network error / abort / HTTP 5xx). A parsed business failure
+ * (non-success `Code`) is NEVER retried — retrying a user-initiated send on a
+ * server-side rejection is the rapid-outbound pattern the account-safety rules
+ * warn against (see CLAUDE.md). Mirrors the reference plugin's `maxApiCall`.
+ */
+export interface SendRetryConfig {
+  /** Retries AFTER the first attempt (2 → up to 3 total tries). */
+  retries: number;
+  /** Backoff baseline in ms; per-retry delay = baseDelayMs × 2^attempt ± 20% jitter. */
+  baseDelayMs: number;
+  /** Per-request abort timeout in ms. */
+  timeoutMs: number;
+}
+
+/** Built-in defaults for SendRetryConfig — used when config omits the block. */
+export const DEFAULT_SEND_RETRY: SendRetryConfig = {
+  retries: 2,
+  baseDelayMs: 500,
+  timeoutMs: 30_000,
+};
 
 /** Built-in defaults for ImageRetryConfig — used when config omits the block. */
 export const DEFAULT_IMAGE_RETRY: ImageRetryConfig = {
@@ -478,6 +503,21 @@ export function extractDownloadBuffer(json: unknown): Buffer | null {
   return walk(json);
 }
 
+/**
+ * Classify an outbound media URL/path so the right MAX send endpoint is chosen.
+ * Prefers the HTTP content-type when present, falling back to the file
+ * extension. Anything unrecognized → "file" (the generic SendFile path).
+ */
+export function inferOutboundMediaKind(contentType: string | null, url: string): "image" | "video" | "file" {
+  const ct = (contentType ?? "").toLowerCase();
+  if (ct.startsWith("image/")) return "image";
+  if (ct.startsWith("video/")) return "video";
+  const ext = (url.split("?")[0].match(/\.([a-z0-9]+)$/i)?.[1] ?? "").toLowerCase();
+  if (["jpg", "jpeg", "png", "gif", "webp", "bmp"].includes(ext)) return "image";
+  if (["mp4", "mov", "avi", "mkv", "webm"].includes(ext)) return "video";
+  return "file";
+}
+
 // ──────────────────────────────────────────────
 // Client
 // ──────────────────────────────────────────────
@@ -507,6 +547,9 @@ export class WcppClient {
   private imageRetry: ImageRetryConfig;
   private imageRng: () => number;
 
+  // Outbound send timeout + transient-retry policy.
+  private sendRetry: SendRetryConfig;
+
   // Outbound proxy transport (direct unless `proxy` is configured)
   private proxyTransport: ProxyTransport;
 
@@ -517,6 +560,7 @@ export class WcppClient {
     this.config = config;
     this.imageRetry = config.imageRetry ?? DEFAULT_IMAGE_RETRY;
     this.imageRng = makeRng(this.imageRetry.randomSeed);
+    this.sendRetry = config.sendRetry ?? DEFAULT_SEND_RETRY;
     this.wxid = config.wxid ?? null;
     this.baseUrl = config.host ? `http://${config.host}:${config.port}` : "";
     this.synckey = ""; // empty until we ingest a real KeyBuf cursor; doSyncRequest omits Synckey while empty
@@ -1671,27 +1715,86 @@ export class WcppClient {
   // Send messages
   // ──────────────────────────────────────────────
 
+  /**
+   * Unify the MAX API success check across response shapes. Success when the
+   * envelope is explicitly OK (`Success` / `Code` 0/1/200) OR the inner WeChat
+   * ack reports `ret === 0`. `Data` is surfaced for callers that need a MsgId;
+   * `error` carries the server's reason on failure. Mirrors the reference
+   * plugin's `parseResponse` (which also accepts `Code === 1`).
+   */
+  private parseResponse(data: any): { ok: boolean; data?: any; error?: string } {
+    const ok =
+      data?.Success === true ||
+      data?.Code === 0 ||
+      data?.Code === 1 ||
+      data?.Code === 200 ||
+      data?.Data?.BaseResponse?.ret === 0;
+    if (ok) return { ok: true, data: data?.Data ?? data?.data };
+    return { ok: false, error: data?.Message || data?.Text || "API error" };
+  }
+
+  /**
+   * Centralized outbound `/api/*` call: per-request timeout + retry on
+   * TRANSPORT failures only (network error / abort / HTTP 5xx), with jittered
+   * exponential backoff. A parsed business failure (non-success `Code`) is
+   * returned immediately and NOT retried — see SendRetryConfig for why.
+   *
+   * `path` is the route WITHOUT the `/api` prefix or query (e.g.
+   * "/Msg/SendTxt"); the prefix + authcode are added here. Always goes through
+   * `httpFetch` so the proxy dispatcher is applied.
+   */
+  private async maxApiCall(
+    path: string,
+    body: Record<string, unknown>,
+    opts?: { retries?: number; timeoutMs?: number },
+  ): Promise<{ ok: boolean; data?: any; error?: string }> {
+    const retries = opts?.retries ?? this.sendRetry.retries;
+    const timeoutMs = opts?.timeoutMs ?? this.sendRetry.timeoutMs;
+    const url = `${this.baseUrl}/api${path}?${this.authQuery()}`;
+
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      let retryableError: string | null = null;
+      try {
+        const res = await this.httpFetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        // 5xx is a transient server fault → retry. 4xx is a definitive
+        // rejection (bad route/param) → parse + return, no retry.
+        if (res.status >= 500) {
+          retryableError = `HTTP ${res.status}`;
+        } else {
+          const data = (await res.json()) as any;
+          return this.parseResponse(data);
+        }
+      } catch (e) {
+        // Network error / AbortSignal timeout → transient, retry.
+        retryableError = String(e);
+      }
+
+      if (attempt >= retries) {
+        return { ok: false, error: retryableError ?? "send failed" };
+      }
+      const base = this.sendRetry.baseDelayMs * 2 ** attempt;
+      const jitter = base * (Math.random() * 0.4 - 0.2); // ±20%
+      const delay = Math.max(0, Math.round(base + jitter));
+      this.log.debug(`[send] ${path} retry ${attempt + 1}/${retries} after ${delay}ms: ${retryableError}`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+    return { ok: false, error: "send failed" };
+  }
+
   async sendText(to: string, text: string): Promise<boolean> {
     if (this.config.readOnly) {
       this.log.warn("[send] read-only mode active, not sending message");
       return false;
     }
 
-    const url = `${this.baseUrl}/api/Msg/SendTxt?${this.authQuery()}`;
-    try {
-      const res = await this.httpFetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ToWxid: to, Content: text, Type: 1 }),
-      });
-      const data = (await res.json()) as any;
-      if (data.Code === 0 || data.Code === 200) return true;
-      this.log.warn("[send] SendTxt returned non-success", data);
-      return false;
-    } catch (e) {
-      this.log.error("[send] error sending text", e);
-      return false;
-    }
+    const result = await this.maxApiCall("/Msg/SendTxt", { ToWxid: to, Content: text, Type: 1 });
+    if (!result.ok) this.log.warn(`[send] SendTxt failed: ${result.error}`);
+    return result.ok;
   }
 
   async sendImage(to: string, base64Data: string): Promise<boolean> {
@@ -1704,20 +1807,149 @@ export class WcppClient {
     // — see docs/api-reference/api/356821074e0.md. The old
     // /message/SendImageNewMessage path + MsgItem/ImageContent shape do not
     // exist in the MAX API and 404'd silently.
-    const url = `${this.baseUrl}/api/Msg/UploadImg?${this.authQuery()}`;
+    const result = await this.maxApiCall("/Msg/UploadImg", { Base64: base64Data, ToWxid: to });
+    if (!result.ok) this.log.warn(`[send] UploadImg failed: ${result.error}`);
+    return result.ok;
+  }
 
-    try {
-      const res = await this.httpFetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ Base64: base64Data, ToWxid: to }),
-      });
-      const data = (await res.json()) as any;
-      return data.Code === 0 || data.Code === 200;
-    } catch (e) {
-      this.log.error("[send] error sending image", e);
+  /**
+   * Send a video from a LOCAL file path. Mirrors the reference plugin's
+   * SendVideo flow: base64 the MP4 (data-URL form), extract a first-frame
+   * thumbnail via ffmpeg, derive the duration via ffprobe when not provided,
+   * then POST /Msg/SendVideo. Requires ffmpeg + ffprobe on PATH.
+   */
+  async sendVideo(to: string, videoPath: string, playLength = 0): Promise<boolean> {
+    if (this.config.readOnly) {
+      this.log.warn("[send] read-only mode active, not sending video");
       return false;
     }
+    const { execFileSync } = await import("node:child_process");
+    const { readFileSync, existsSync, rmSync } = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+
+    if (!existsSync(videoPath)) {
+      this.log.warn(`[send] video file not found: ${videoPath}`);
+      return false;
+    }
+    const videoBuf = readFileSync(videoPath);
+    const videoBase64 = `data:video/mp4;base64,${videoBuf.toString("base64")}`;
+
+    // First-frame thumbnail (the MAX SendVideo payload requires it).
+    const thumbPath = path.join(os.tmpdir(), `wcppm-thumb-${randomUUID()}.jpg`);
+    let thumbBase64: string;
+    try {
+      execFileSync("ffmpeg", ["-y", "-i", videoPath, "-ss", "00:00:01", "-vframes", "1", "-q:v", "2", thumbPath], { stdio: "pipe" });
+      thumbBase64 = `data:image/jpeg;base64,${readFileSync(thumbPath).toString("base64")}`;
+    } catch (e) {
+      this.log.warn(`[send] video thumbnail extraction failed: ${String(e)}`);
+      return false;
+    } finally {
+      try { rmSync(thumbPath, { force: true }); } catch { /* best-effort cleanup */ }
+    }
+
+    let duration = playLength;
+    if (!duration) {
+      try {
+        const out = execFileSync("ffprobe", ["-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", videoPath], { stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+        const d = parseFloat(out);
+        duration = Number.isFinite(d) ? Math.round(d) : 10;
+      } catch {
+        duration = 10;
+      }
+    }
+
+    const result = await this.maxApiCall("/Msg/SendVideo", {
+      ToWxid: to,
+      PlayLength: duration,
+      Base64: videoBase64,
+      thumbBase64,            // OpenAPI-required field
+      ImageBase64: thumbBase64, // compat with some API versions
+    });
+    if (!result.ok) this.log.warn(`[send] SendVideo failed: ${result.error}`);
+    return result.ok;
+  }
+
+  /**
+   * Send a file attachment. The MAX SendFile endpoint takes the bytes as base64
+   * in `Content` (no data: prefix); the display name is best-effort via
+   * `FileName` (ignored by API versions that derive it server-side).
+   */
+  async sendFile(to: string, base64Data: string, fileName?: string): Promise<boolean> {
+    if (this.config.readOnly) {
+      this.log.warn("[send] read-only mode active, not sending file");
+      return false;
+    }
+    const body: Record<string, unknown> = { ToWxid: to, Content: base64Data };
+    if (fileName) body.FileName = fileName;
+    const result = await this.maxApiCall("/Msg/SendFile", body);
+    if (!result.ok) this.log.warn(`[send] SendFile failed: ${result.error}`);
+    return result.ok;
+  }
+
+  /** Fetch outbound media bytes from an http(s) URL or a local (file://) path. */
+  private async fetchOutboundMedia(urlOrPath: string): Promise<{ buffer: Buffer; contentType: string | null }> {
+    if (/^https?:\/\//i.test(urlOrPath)) {
+      const res = await this.httpFetch(urlOrPath, { signal: AbortSignal.timeout(this.sendRetry.timeoutMs) });
+      if (!res.ok) throw new Error(`download HTTP ${res.status}`);
+      const buffer = Buffer.from(await res.arrayBuffer());
+      return { buffer, contentType: res.headers.get("content-type") };
+    }
+    const { readFile } = await import("node:fs/promises");
+    const { fileURLToPath } = await import("node:url");
+    const p = urlOrPath.startsWith("file://") ? fileURLToPath(urlOrPath) : urlOrPath;
+    const buffer = await readFile(p);
+    return { buffer, contentType: null };
+  }
+
+  /**
+   * High-level outbound media: download/read `url`, infer the kind (explicit
+   * `opts.kind` wins, else content-type / extension), and dispatch via the
+   * matching send method. For images an optional `caption` is sent as a
+   * follow-up text. Returns false (and logs) on any failure.
+   */
+  async sendMediaFromUrl(
+    to: string,
+    url: string,
+    opts: { kind?: "image" | "video" | "file"; fileName?: string; caption?: string } = {},
+  ): Promise<boolean> {
+    if (this.config.readOnly) {
+      this.log.warn("[send] read-only mode active, not sending media");
+      return false;
+    }
+    let buffer: Buffer;
+    let contentType: string | null;
+    try {
+      ({ buffer, contentType } = await this.fetchOutboundMedia(url));
+    } catch (e) {
+      this.log.warn(`[send] media download failed (${url}): ${String(e)}`);
+      return false;
+    }
+
+    const kind = opts.kind ?? inferOutboundMediaKind(contentType, url);
+
+    if (kind === "image") {
+      const ok = await this.sendImage(to, buffer.toString("base64"));
+      if (ok && opts.caption?.trim()) await this.sendText(to, opts.caption.trim());
+      return ok;
+    }
+
+    if (kind === "video") {
+      // SendVideo needs a local file for the ffmpeg thumbnail step — stage one.
+      const os = await import("node:os");
+      const path = await import("node:path");
+      const { writeFile, rm } = await import("node:fs/promises");
+      const tmp = path.join(os.tmpdir(), `wcppm-video-${randomUUID()}.mp4`);
+      await writeFile(tmp, buffer);
+      try {
+        return await this.sendVideo(to, tmp);
+      } finally {
+        await rm(tmp, { force: true }).catch(() => { /* best-effort cleanup */ });
+      }
+    }
+
+    // Default: generic file.
+    return this.sendFile(to, buffer.toString("base64"), opts.fileName);
   }
 
   private buildAttachmentCandidate(
@@ -2044,42 +2276,39 @@ export class WcppClient {
   }
 
   /**
-   * Send a quoted/reply message (引用回复).
-   * Requires WCPP MAX API.
+   * Send a quoted/reply message (引用回复) via the MAX server's first-class
+   * `/Msg/Quote` endpoint (`引用文本消息`, schema `QuoteDoc`). The server takes
+   * every refermsg field directly — `Displayname` (quoted sender name) and
+   * `QuoteContent` (quoted message text) are what render the grey quoted block,
+   * so populate them when known (the middleware recovers them from its stored
+   * inbound frame). This matches the reference plugin's *intent* (rich quotes)
+   * without hand-building APPMSG XML — on this server `/Msg/SendApp` is
+   * mass-send, NOT app-message, so the plugin's type=57 XML doesn't apply here.
    */
-  async sendQuote(to: string, text: string, referMsgId: string, referToUserName?: string): Promise<boolean> {
+  async sendQuote(
+    to: string,
+    text: string,
+    referMsgId: string,
+    opts: { senderWxid?: string; displayName?: string; quotedContent?: string; msgSeq?: string } = {},
+  ): Promise<boolean> {
     if (this.config.readOnly) {
       this.log.warn("[send] read-only mode active, not sending quote");
       return false;
     }
 
-    // Quote API (WCPP MAX /api/Msg/Quote)
-    // Fields: ToWxid, Fromusr (quoted sender), Displayname, NewMsgId, QuoteContent, MsgContent
-    const url = `${this.baseUrl}/api/Msg/Quote?${this.authQuery()}`;
     const payload: Record<string, unknown> = {
       ToWxid: to,
       MsgContent: text,
       NewMsgId: referMsgId,
     };
+    if (opts.senderWxid) payload.Fromusr = opts.senderWxid;
+    if (opts.displayName) payload.Displayname = opts.displayName;
+    if (opts.quotedContent) payload.QuoteContent = opts.quotedContent;
+    if (opts.msgSeq) payload.MsgSeq = opts.msgSeq;
 
-    if (referToUserName) {
-      payload.Fromusr = referToUserName;
-    }
-
-    try {
-      const res = await this.httpFetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const data = (await res.json()) as any;
-      if (data.Code === 0 || data.Code === 200) return true;
-      this.log.warn("[send] Quote API returned non-success", data);
-      return false;
-    } catch (e) {
-      this.log.error("[send] error sending quote", e);
-      return false;
-    }
+    const result = await this.maxApiCall("/Msg/Quote", payload);
+    if (!result.ok) this.log.warn(`[send] Quote failed: ${result.error}`);
+    return result.ok;
   }
 
   // ──────────────────────────────────────────────

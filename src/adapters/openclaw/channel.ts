@@ -170,6 +170,11 @@ const wechatpadproBase = {
             const b = bridges.get(ctx.accountId);
             return b ? (await b.send({ to, text, replyTo: quoteMsgId })).ok : false;
           },
+          sendMedia: async (to: string, url: string, caption?: string) => {
+            const b = bridges.get(ctx.accountId);
+            // text carries the caption; the middleware infers the media kind.
+            return b ? (await b.send({ to, text: caption ?? "", media: { url } })).ok : false;
+          },
         },
         authorizeDm: buildDmAuthorizer({
           runtime: ctx.runtime,
@@ -250,10 +255,24 @@ export const wechatpadproPlugin = createChatChannelPlugin<ResolvedAccount>({
       },
     },
     base: {
-      sendMedia: async () => {
-        // Outbound media is not yet supported over the bridge (middleware /send
-        // is text-only). Add a middleware /sendMedia endpoint to enable this.
-        throw new Error("WeChatPadPro: media send not supported via the bridge yet");
+      sendMedia: async (params: any) => {
+        const b = bridges.get(params?.accountId ?? DEFAULT_ACCOUNT_ID);
+        if (!b) throw new Error("WeChatPadPro bridge not connected");
+        // Accept the common OpenClaw shapes for a media url (single or list).
+        const url =
+          params?.mediaUrl ??
+          params?.url ??
+          params?.media?.url ??
+          (Array.isArray(params?.mediaUrls) ? params.mediaUrls[0] : undefined);
+        if (!url) throw new Error("WeChatPadPro: sendMedia requires a media url");
+        const ok = (
+          await b.send({
+            to: params.to,
+            text: params.caption ?? params.text ?? "",
+            media: { url, fileName: params.fileName },
+          })
+        ).ok;
+        return { messageId: ok ? `wcpp-${Date.now()}` : undefined };
       },
     },
   },

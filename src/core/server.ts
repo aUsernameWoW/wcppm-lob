@@ -16,7 +16,7 @@
 
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
-import type { Frame } from "../shared/frame.js";
+import type { Frame, OutboundMedia } from "../shared/frame.js";
 import type { InboundRow } from "./db.js";
 import type { Logger } from "../shared/logger.js";
 
@@ -34,12 +34,13 @@ export interface ServerDeps {
     getUndelivered(account: string, sinceTs: number): InboundRow[];
     markDelivered(account: string, id: string, deliveredAt: number): void;
   };
-  /** Outbound send (real impl wraps WcppClient.sendText/sendQuote). */
+  /** Outbound send (real impl wraps WcppClient.sendText/sendQuote/sendMediaFromUrl). */
   send(req: {
     account?: string;
     to: string;
-    text: string;
+    text?: string;
     replyTo?: string;
+    media?: OutboundMedia;
   }): Promise<{ ok: boolean; msgId?: string }>;
   /** One-shot catch-up (real impl wraps WcppClient.forceSync). */
   forceSync(account?: string): Promise<{ ok: boolean; messages?: number; hasMore?: boolean }>;

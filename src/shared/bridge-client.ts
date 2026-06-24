@@ -12,7 +12,7 @@ import WebSocket from "ws";
 import { fetch as undiciFetch } from "undici";
 
 import { buildProxyTransport } from "../core/proxy.js";
-import type { Frame } from "./frame.js";
+import type { Frame, OutboundMedia } from "./frame.js";
 import type { Logger } from "./logger.js";
 
 export interface BridgeClientOpts {
@@ -33,9 +33,11 @@ export interface BridgeClientOpts {
 
 export interface SendRequest {
   to: string;
-  text: string;
+  /** Optional when `media` is present (a media-only reply carries no text). */
+  text?: string;
   replyTo?: string;
   account?: string;
+  media?: OutboundMedia;
 }
 
 export interface BridgeClient {
@@ -154,8 +156,10 @@ export function createBridgeClient(opts: BridgeClientOpts): BridgeClient {
       ws = null;
     },
     async send(req) {
-      const body: SendRequest = { to: req.to, text: req.text };
+      const body: SendRequest = { to: req.to };
+      if (req.text !== undefined) body.text = req.text;
       if (req.replyTo !== undefined) body.replyTo = req.replyTo;
+      if (req.media !== undefined) body.media = req.media;
       // Default to this connection's configured account (mirrors fetchMedia /
       // getHistory): the per-account bridge knows its account even when the
       // caller omits it. Without this, a multi-instance middleware can't route

@@ -33,6 +33,9 @@ export type WcppLogger = {
 export type WcppSendApi = {
   sendText: (toWxid: string, text: string) => Promise<boolean>;
   sendQuote: (toWxid: string, text: string, quoteMsgId: string) => Promise<boolean>;
+  /** Send a media URL (image/video/file; kind inferred middleware-side). The
+   *  optional caption is sent as a follow-up text for images. */
+  sendMedia: (toWxid: string, url: string, caption?: string) => Promise<boolean>;
 };
 
 export type WcppDmAuthorizer = (input: {
@@ -180,13 +183,31 @@ export async function dispatchInboundToOpenClaw(
       ...replyPipeline,
       deliver: async (payload: ReplyPayload, info) => {
         const text = (payload.text ?? "").trim();
-        if (!text) return;
+        // The agent may emit a single mediaUrl or a list; normalize to an array.
+        const mediaUrls = payload.mediaUrls?.length
+          ? payload.mediaUrls
+          : payload.mediaUrl
+            ? [payload.mediaUrl]
+            : [];
+        if (!text && mediaUrls.length === 0) return;
         const target = msg.conversationId;
-        // Quote-reply when the agent flagged a reply target. We use the inbound
-        // msgId as the quote target — the agent rarely surfaces a different one
-        // and per-channel reply_to mapping is out of scope for v1.
-        const quoteId = payload.replyToId || (payload.replyToTag ? msg.msgId : undefined);
         try {
+          if (mediaUrls.length > 0) {
+            // Send each attachment; the text rides on the first as its caption,
+            // the rest go bare. (Quote-reply is text-only — media isn't quoted.)
+            for (let i = 0; i < mediaUrls.length; i++) {
+              const caption = i === 0 ? text : "";
+              const ok = await ctx.send.sendMedia(target, mediaUrls[i], caption || undefined);
+              if (!ok) {
+                ctx.log.warn(`wechatpadpro: ${info.kind} media reply to ${target} returned not-ok`);
+              }
+            }
+            return;
+          }
+          // Quote-reply when the agent flagged a reply target. We use the inbound
+          // msgId as the quote target — the agent rarely surfaces a different one
+          // and per-channel reply_to mapping is out of scope for v1.
+          const quoteId = payload.replyToId || (payload.replyToTag ? msg.msgId : undefined);
           const ok = quoteId
             ? await ctx.send.sendQuote(target, text, quoteId)
             : await ctx.send.sendText(target, text);
