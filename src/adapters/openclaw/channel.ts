@@ -18,6 +18,10 @@ import {
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import { createChannelPairingController } from "openclaw/plugin-sdk/channel-pairing";
 import {
+  createInboundDebouncer,
+  resolveInboundDebounceMs,
+} from "openclaw/plugin-sdk/channel-inbound-debounce";
+import {
   createPreCryptoDirectDmAuthorizer,
   resolveInboundDirectDmAccessWithRuntime,
 } from "openclaw/plugin-sdk/direct-dm-access";
@@ -189,7 +193,12 @@ const wechatpadproBase = {
           return b ? b.fetchMedia(id, account.account) : Promise.resolve(null);
         },
       };
-      startWcppRuntime(ctx.accountId, account, log, async (msg) => {
+      // Inbound coalescing window: a burst of rapid messages from one sender is
+      // merged into a single agent dispatch (more human, fewer tokens). Resolved
+      // from cfg.messages.inbound.{debounceMs,byChannel.wechatpadpro}; 0 (default)
+      // disables it → one dispatch per message, exactly as before.
+      const debounceMs = resolveInboundDebounceMs({ cfg: ctx.cfg, channel: "wechatpadpro" });
+      startWcppRuntime(ctx.accountId, account, log, debounceMs, async (msg) => {
         await dispatchInboundToOpenClaw(dispatchCtx, {
           chatType: msg.chatType,
           conversationId: msg.groupId || msg.senderId,
@@ -354,26 +363,65 @@ function buildDmAuthorizer(params: {
 // Runtime lifecycle (bridge connection)
 // ──────────────────────────────────────────────
 
+/** The inbound shape the bridge `onMessage` hands to the agent dispatch. */
+type WcppDispatchMsg = {
+  channel: string;
+  chatType: "dm" | "group";
+  senderId: string;
+  senderName: string;
+  text: string;
+  groupId?: string;
+  isAtBot: boolean;
+  replyToId?: string;
+  replyToBody?: string;
+  replyToSender?: string;
+  mediaKind?: "image" | "voice" | "video" | "file";
+  raw: any;
+};
+
 export function startWcppRuntime(
   accountId: string,
   account: ResolvedAccount,
   log: { info: (...args: any[]) => void; error: (...args: any[]) => void; warn: (...args: any[]) => void; debug: (...args: any[]) => void },
-  dispatchInbound: (msg: {
-    channel: string;
-    chatType: "dm" | "group";
-    senderId: string;
-    senderName: string;
-    text: string;
-    groupId?: string;
-    isAtBot: boolean;
-    replyToId?: string;
-    replyToBody?: string;
-    replyToSender?: string;
-    mediaKind?: "image" | "voice" | "video" | "file";
-    raw: any;
-  }) => Promise<void>,
+  debounceMs: number,
+  dispatchInbound: (msg: WcppDispatchMsg) => Promise<void>,
 ): void {
   let selfWxid: string | null = null;
+
+  // Optional inbound coalescer: when debounceMs > 0, merge a rapid burst from the
+  // SAME sender+conversation into one dispatch (join the texts, keep the latest
+  // message's reply/media/msgId context — like a human reading several lines then
+  // answering once). debounceMs == 0 → no debouncer, one dispatch per message.
+  const debouncer =
+    debounceMs > 0
+      ? createInboundDebouncer<WcppDispatchMsg>({
+          debounceMs,
+          buildKey: (m) => `${m.chatType}:${m.groupId ?? m.senderId}:${m.senderId}`,
+          onFlush: async (items) => {
+            const base = items[items.length - 1];
+            if (!base) return;
+            if (items.length === 1) {
+              await dispatchInbound(base);
+              return;
+            }
+            // NB: merges TEXT only; if earlier items carried media it is dropped
+            // (the kept context is the latest item's). Acceptable for a text-burst
+            // coalescer and only active when explicitly enabled.
+            const mergedText = items.map((i) => i.text).filter((t) => t && t.length > 0).join("\n");
+            await dispatchInbound({ ...base, text: mergedText });
+          },
+          onError: (err) => log.error(`wechatpadpro: debounced dispatch failed: ${String(err)}`),
+        })
+      : null;
+
+  /** Deliver an inbound message into the (optionally debounced) agent dispatch. */
+  const deliverInbound = (msg: WcppDispatchMsg): void => {
+    if (debouncer) {
+      void debouncer.enqueue(msg);
+      return;
+    }
+    void dispatchInbound(msg).catch((err) => log.error(`wechatpadpro: dispatch failed: ${String(err)}`));
+  };
   const bridge = createBridgeClient({
     url: account.bridgeUrl,
     token: account.bridgeToken!,
@@ -403,7 +451,7 @@ export function startWcppRuntime(
         const label = frame.quote.senderName || frame.quote.senderWxid || "unknown";
         bodyText += `\n\n[Replying to ${label}]\n${frame.quote.summary ?? ""}\n[/Replying]`;
       }
-      dispatchInbound({
+      deliverInbound({
         channel: "wechatpadpro",
         chatType: frame.chatType === "group" ? "group" : "dm",
         senderId: frame.from.wxid,
@@ -419,14 +467,15 @@ export function startWcppRuntime(
         }),
         // startAccount reads msgId from raw.normalized.msgId.
         raw: { frame, normalized: { msgId: frame.id } },
-      }).catch((err) => log.error(`wechatpadpro: dispatch failed: ${String(err)}`));
+      });
     },
   });
 
   bridges.set(accountId, bridge);
   bridge.connect();
   log.info(
-    `WeChatPadPro: bridge runtime started → ${account.bridgeUrl} (accountId=${accountId}, account=${account.account})`,
+    `WeChatPadPro: bridge runtime started → ${account.bridgeUrl} (accountId=${accountId},` +
+      ` account=${account.account}, inboundDebounce=${debounceMs > 0 ? `${debounceMs}ms` : "off"})`,
   );
 }
 

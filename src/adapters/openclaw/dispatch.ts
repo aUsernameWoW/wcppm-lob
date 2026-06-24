@@ -11,6 +11,7 @@
  */
 
 import { loadConfig } from "openclaw/plugin-sdk/config-runtime";
+import { resolveHumanDelayConfig } from "openclaw/plugin-sdk/agent-runtime";
 import { createChannelReplyPipeline } from "openclaw/plugin-sdk/channel-reply-pipeline";
 import type { DirectDmDecision } from "openclaw/plugin-sdk/direct-dm-access";
 import {
@@ -181,6 +182,10 @@ export async function dispatchInboundToOpenClaw(
   const { dispatcher, replyOptions, markDispatchIdle, markRunComplete } =
     createReplyDispatcherWithTyping({
       ...replyPipeline,
+      // Inter-block human delay (resolved from agent defaults / per-agent config).
+      // Pauses between streamed reply blocks so a multi-part answer doesn't land
+      // all at once. undefined when unconfigured → no delay (current behaviour).
+      humanDelay: resolveHumanDelayConfig(cfg, route.agentId),
       deliver: async (payload: ReplyPayload, info) => {
         const text = (payload.text ?? "").trim();
         // The agent may emit a single mediaUrl or a list; normalize to an array.
