@@ -9,7 +9,7 @@
  */
 
 export interface FrameMedia {
-  kind: "image" | "voice" | "video";
+  kind: "image" | "voice" | "video" | "file";
   mimeType?: string;
   fileName?: string;
   /** Direct/CDN URL when available. */

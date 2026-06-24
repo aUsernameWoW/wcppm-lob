@@ -156,7 +156,11 @@ export function createBridgeClient(opts: BridgeClientOpts): BridgeClient {
     async send(req) {
       const body: SendRequest = { to: req.to, text: req.text };
       if (req.replyTo !== undefined) body.replyTo = req.replyTo;
-      if (req.account !== undefined) body.account = req.account;
+      // Default to this connection's configured account (mirrors fetchMedia /
+      // getHistory): the per-account bridge knows its account even when the
+      // caller omits it. Without this, a multi-instance middleware can't route
+      // the reply and drops it with "no instance for account=undefined".
+      body.account = req.account ?? account;
       const r = await postJson("/send", body);
       return { ok: r.ok, msgId: typeof r.msgId === "string" ? r.msgId : undefined };
     },

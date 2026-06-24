@@ -133,6 +133,32 @@ test("buildFrame: opts.media takes precedence over intrinsic image detection", (
   assert.equal(frame.media?.localPath, "/tmp/already.jpg");
 });
 
+test("buildFrame: file message (msgType 49, appmsg type 6) derives a 'file' attachment", () => {
+  const content =
+    '<msg><appmsg appid="wxeb7" sdkver="0"><title>症状.docx</title><type>6</type>' +
+    "<appattach><totallen>159214</totallen><fileext>docx</fileext>" +
+    "<attachid>@cdn_1</attachid></appattach></appmsg></msg>";
+  const msg = baseMsg({ msgId: "file-9", msgType: 49, content, text: "[文件] 症状.docx" });
+
+  const frame = buildFrame(msg, { account: "default" });
+
+  assert.equal(frame.media?.kind, "file");
+  assert.equal(
+    frame.media?.mimeType,
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  );
+  assert.equal(frame.media?.fileName, "症状.docx");
+  assert.equal(frame.text, "[文件] 症状.docx");
+});
+
+test("buildFrame: a type-74 file placeholder yields no media (suppressed upstream, but be safe)", () => {
+  const content =
+    "<msg><appmsg><title>症状.docx</title><type>74</type>" +
+    "<appattach><fileext>docx</fileext></appattach></appmsg></msg>";
+  const frame = buildFrame(baseMsg({ msgType: 49, content }), { account: "default" });
+  assert.equal(frame.media, undefined);
+});
+
 test("buildFrame: non-media message has no media", () => {
   const frame = buildFrame(baseMsg({ msgType: 1 }), { account: "default" });
   assert.equal(frame.media, undefined);

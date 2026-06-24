@@ -9,6 +9,7 @@
  */
 import type { NormalizedMessage } from "./client.js";
 import type { Frame, FrameMedia } from "../shared/frame.js";
+import { fileExtToMime, safeFileName } from "./media-meta.js";
 
 export interface BuildFrameOpts {
   account: string;
@@ -25,6 +26,24 @@ export interface BuildFrameOpts {
 function intrinsicMedia(msg: NormalizedMessage): FrameMedia | undefined {
   if (msg.msgType === 3) {
     return { kind: "image", mimeType: "image/jpeg", fileName: `wechat-image-${msg.msgId}.jpg` };
+  }
+  // File attachment: MsgType 49 with appmsg <type>6</type> (the completed,
+  // downloadable file). The <type>74</type> "uploading…" placeholder is
+  // suppressed upstream in the client, so it never reaches here.
+  if (msg.msgType === 49) {
+    const appType = msg.content.match(/<type>\s*(\d+)\s*<\/type>/i)?.[1];
+    if (appType === "6") {
+      const peek = (tag: string) =>
+        msg.content
+          .match(new RegExp(`<${tag}>(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?<\\/${tag}>`, "i"))?.[1]
+          ?.trim() ?? null;
+      const ext = peek("fileext");
+      return {
+        kind: "file",
+        mimeType: fileExtToMime(ext),
+        fileName: safeFileName(peek("title"), msg.msgId, ext),
+      };
+    }
   }
   return undefined;
 }

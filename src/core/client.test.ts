@@ -341,3 +341,123 @@ test("webhook: a stale (timestamp-skew) doorbell is dropped quietly — accepted
     client.disconnect();
   }
 });
+
+// ── inbound file attachments (MsgType 49, appmsg type 6) ───────────────────
+
+// The downloadable, completed file (appmsg <type>6</type>) — abridged from the
+// 2026-06-24 production webhook log.
+const FILE_TYPE6_XML =
+  '<?xml version="1.0"?>\n<msg>\n\t<appmsg appid="wxeb7ec651dd0aefa9" sdkver="0">\n' +
+  "\t\t<title>症状.docx</title>\n\t\t<type>6</type>\n\t\t<appattach>\n" +
+  "\t\t\t<totallen>159214</totallen>\n\t\t\t<fileext>docx</fileext>\n" +
+  "\t\t\t<attachid>@cdn_305f0201000_1</attachid>\n" +
+  "\t\t\t<cdnattachurl>305f0201000</cdnattachurl>\n\t\t\t<cdnthumbaeskey />\n" +
+  "\t\t\t<aeskey>6c737366696265616367627071767175</aeskey>\n\t\t\t<encryver>0</encryver>\n" +
+  "\t\t</appattach>\n\t\t<md5>e612607b3c73f679eb4afca83cfc1256</md5>\n\t</appmsg>\n" +
+  "\t<fromusername>gxnnycz</fromusername>\n</msg>";
+
+// The transient "uploading…" placeholder (appmsg <type>74</type>) — note it
+// carries a <fileuploadtoken> but NO <attachid>, so it is not downloadable.
+const FILE_TYPE74_XML =
+  '<?xml version="1.0"?>\n<msg>\n\t<appmsg appid="" sdkver="0">\n' +
+  "\t\t<title><![CDATA[症状.docx]]></title>\n\t\t<type>74</type>\n\t\t<showtype>0</showtype>\n" +
+  "\t\t<appattach>\n\t\t\t<totallen>159214</totallen>\n\t\t\t<fileext><![CDATA[docx]]></fileext>\n" +
+  "\t\t\t<fileuploadtoken>v1_abc</fileuploadtoken>\n\t\t\t<status>0</status>\n\t\t</appattach>\n" +
+  "\t\t<md5><![CDATA[e612607b3c73f679eb4afca83cfc1256]]></md5>\n\t</appmsg>\n" +
+  "\t<fromusername>gxnnycz</fromusername>\n</msg>";
+
+function fileClient(): WcppClient {
+  return new WcppClient({ host: "", port: 8062, authcode: "x" } as WcppConfig, makeLogger());
+}
+
+test("extractFileMessageInfo: parses a type-6 file appmsg (attachid/totallen/fileext/appid)", () => {
+  const info = fileClient().extractFileMessageInfo({
+    MsgId: 1144397471,
+    MsgType: 49,
+    FromUserName: { string: "gxnnycz" },
+    Content: { string: FILE_TYPE6_XML },
+  } as any);
+  assert.ok(info, "type-6 must be recognized as a file");
+  assert.equal(info!.title, "症状.docx");
+  assert.equal(info!.attachId, "@cdn_305f0201000_1");
+  assert.equal(info!.totalLen, 159214);
+  assert.equal(info!.fileExt, "docx");
+  assert.equal(info!.appId, "wxeb7ec651dd0aefa9");
+  assert.equal(info!.aesKey, "6c737366696265616367627071767175");
+  assert.equal(info!.fromUserName, "gxnnycz");
+  assert.equal(info!.msgId, 1144397471);
+});
+
+test("extractFileMessageInfo: returns null for the type-74 placeholder (no attachid)", () => {
+  const info = fileClient().extractFileMessageInfo({
+    MsgId: 1520091361,
+    MsgType: 49,
+    FromUserName: { string: "gxnnycz" },
+    Content: { string: FILE_TYPE74_XML },
+  } as any);
+  assert.equal(info, null);
+});
+
+test("extractFileMessageInfo: returns null for a non-49 message", () => {
+  const info = fileClient().extractFileMessageInfo({
+    MsgId: 1,
+    MsgType: 1,
+    FromUserName: { string: "gxnnycz" },
+    Content: { string: "hi" },
+  } as any);
+  assert.equal(info, null);
+});
+
+test("resolveMedia: a type-6 file resolves to kind 'file' with a docx attachment", () => {
+  const resolved = fileClient().resolveMedia({
+    MsgId: 1144397471,
+    MsgType: 49,
+    FromUserName: { string: "gxnnycz" },
+    Content: { string: FILE_TYPE6_XML },
+  } as any);
+  assert.ok(resolved);
+  assert.equal(resolved!.kind, "file");
+  assert.equal(resolved!.attachment.fileName, "症状.docx");
+  assert.equal(
+    resolved!.attachment.mimeType,
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  );
+});
+
+test("ingest: a type-6 file is emitted with '[文件]' text; the type-74 placeholder is suppressed", () => {
+  const client = new WcppClient({ host: "", port: 0 }, makeLogger());
+  const got: NormalizedMessage[] = [];
+  client.onMessage = (m) => got.push(m);
+
+  const now = Math.floor(Date.now() / 1000);
+  const mkMsg = (msgId: number, newMsgId: string, xml: string) => ({
+    MsgId: msgId,
+    FromUserName: { string: "gxnnycz" },
+    ToUserName: { string: "wxid_rg95pmno4jo422" },
+    MsgType: 49,
+    Content: { string: xml },
+    CreateTime: now,
+    NewMsgId: Number(newMsgId),
+    MsgSeq: 1,
+  });
+
+  client.handleWsMessage(
+    JSON.stringify({
+      Code: 0,
+      Success: true,
+      Message: "",
+      Data: {
+        syncData: {
+          AddMsgs: [
+            mkMsg(1520091361, "7993953510678847488", FILE_TYPE74_XML), // placeholder
+            mkMsg(1144397471, "7973635185929928704", FILE_TYPE6_XML), // real file
+          ],
+        },
+      },
+    }),
+  );
+
+  assert.equal(got.length, 1, "only the downloadable type-6 file should be emitted");
+  assert.equal(got[0].text, "[文件] 症状.docx");
+  assert.equal(got[0].msgType, 49);
+});

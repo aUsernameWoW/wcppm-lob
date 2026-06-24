@@ -18,6 +18,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Logger } from "../shared/logger.js";
 import { buildProxyTransport, type ProxyTransport } from "./proxy.js";
 import { makeRng } from "./rng.js";
+import { fileExtToMime, safeFileName } from "./media-meta.js";
 
 // ──────────────────────────────────────────────
 // Config
@@ -379,6 +380,23 @@ export interface VideoMessageInfo {
   rawXml: string;
 }
 
+export interface FileMessageInfo {
+  msgId: number | null;
+  fromUserName: string | null;
+  /** `<appmsg appid="…">` — passed as DownloadFile `appID` (may be empty). */
+  appId: string | null;
+  /** `<attachid>` — the `@cdn_…` token. Absent on the type-74 placeholder. */
+  attachId: string | null;
+  cdnAttachUrl: string | null;
+  aesKey: string | null;
+  /** `<totallen>` — total file size in bytes (DownloadFile `dataLen`). */
+  totalLen: number | null;
+  fileExt: string | null;
+  /** `<title>` — the display file name (e.g. "症状.docx"). */
+  title: string | null;
+  rawXml: string;
+}
+
 export interface MediaDownloadResult {
   contentType: string | null;
   buffer: Buffer | null;
@@ -388,7 +406,7 @@ export interface MediaDownloadResult {
 }
 
 export interface AttachmentCandidate {
-  kind: "voice" | "image" | "video";
+  kind: "voice" | "image" | "video" | "file";
   mimeType: string;
   fileName: string;
   extension: string;
@@ -413,6 +431,13 @@ export type ResolvedMedia =
   | {
       kind: "video";
       info: VideoMessageInfo;
+      attachment: AttachmentCandidate;
+      download: (outputPath?: string) => Promise<MediaDownloadResult>;
+      materialize: (dir?: string) => Promise<{ filePath: string; mimeType: string; fileName: string }>;
+    }
+  | {
+      kind: "file";
+      info: FileMessageInfo;
       attachment: AttachmentCandidate;
       download: (outputPath?: string) => Promise<MediaDownloadResult>;
       materialize: (dir?: string) => Promise<{ filePath: string; mimeType: string; fileName: string }>;
@@ -683,6 +708,16 @@ export class WcppClient {
         continue;
       }
 
+      // Suppress the transient "file uploading…" placeholder (appmsg type 74):
+      // it carries no <attachid> (not downloadable) and the real, downloadable
+      // file (type 6) follows within seconds. Dropping it here — like the type-51
+      // status filter above — keeps OpenClaw from seeing a useless duplicate
+      // attachment. (Type-filter drop, NOT an age drop, so the store-all rule
+      // for real messages is untouched.)
+      if (msg.MsgType === 49 && this.extractXmlTag(msg.Content?.string ?? "", "type") === "74") {
+        continue;
+      }
+
       // NOTE: no CreateTime age filter here. The middleware persists every
       // new (by stable-id dedup) message to SQLite regardless of age — so a
       // backlog redelivery / brief downtime gap is captured losslessly. Whether
@@ -775,6 +810,8 @@ export class WcppClient {
     }
     if (msgType === 49) {
       const title = this.extractXmlTag(content, "title");
+      const appType = this.extractXmlTag(content, "type");
+      if (appType === "6" || appType === "74") return title ? `[文件] ${title}` : "[文件]";
       if (title) return `[卡片] ${title}`;
       return "[卡片消息]";
     }
@@ -935,6 +972,42 @@ export class WcppClient {
     };
   }
 
+  /**
+   * Parse an inbound file attachment (MsgType 49, appmsg `<type>6</type>`).
+   * Returns null for anything else — crucially for the `<type>74</type>`
+   * "uploading…" placeholder (no `<attachid>`, hence not downloadable) and for
+   * quote(57)/link(5) appmsgs.
+   */
+  extractFileMessageInfo(message: SyncMessage | NormalizedMessage): FileMessageInfo | null {
+    const msgType = "msgType" in message ? message.msgType : message.MsgType;
+    if (msgType !== 49) return null;
+
+    const rawXml = "content" in message ? message.content : message.Content?.string ?? "";
+    if (this.extractXmlTag(rawXml, "type") !== "6") return null;
+
+    const attachId = this.extractXmlTag(rawXml, "attachid");
+    if (!attachId) return null; // placeholder / not yet downloadable
+
+    const fromUserName = "fromUser" in message
+      ? message.fromUser
+      : message.FromUserName?.string ?? null;
+    const msgId = "msgId" in message ? Number(message.msgId) : message.MsgId ?? null;
+    const totalLenRaw = this.extractXmlTag(rawXml, "totallen");
+
+    return {
+      msgId: Number.isFinite(msgId) ? (msgId as number) : null,
+      fromUserName,
+      appId: this.extractXmlAttr(rawXml, "appmsg", "appid"),
+      attachId,
+      cdnAttachUrl: this.extractXmlTag(rawXml, "cdnattachurl"),
+      aesKey: this.extractXmlTag(rawXml, "aeskey"),
+      totalLen: totalLenRaw ? Number(totalLenRaw) : null,
+      fileExt: this.extractXmlTag(rawXml, "fileext"),
+      title: this.extractXmlTag(rawXml, "title"),
+      rawXml,
+    };
+  }
+
   private formatInboundDisplayText(msgType: number, content: string): string {
     if (msgType === 3) return "[图片]";
 
@@ -962,6 +1035,9 @@ export class WcppClient {
       // The quoted context is attached separately via NormalizedMessage.quote.
       if (appType === "57") return title ?? "";
       if (appType === "5") return this.formatLinkCard(content);
+      // File attachment: type 6 = completed (downloadable), 74 = uploading
+      // placeholder. Both display as a file so a download miss still reads right.
+      if (appType === "6" || appType === "74") return title ? `[文件] ${title}` : "[文件]";
       if (title) return `[卡片] ${title}`;
       return "[卡片消息]";
     }
@@ -1645,9 +1721,20 @@ export class WcppClient {
   }
 
   private buildAttachmentCandidate(
-    kind: "voice" | "image" | "video",
+    kind: "voice" | "image" | "video" | "file",
     msgId: string,
+    fileOpts?: { fileExt?: string | null; title?: string | null },
   ): AttachmentCandidate {
+    if (kind === "file") {
+      const ext = (fileOpts?.fileExt ?? "bin").toLowerCase();
+      return {
+        kind,
+        mimeType: fileExtToMime(fileOpts?.fileExt),
+        extension: `.${ext}`,
+        fileName: safeFileName(fileOpts?.title, msgId, fileOpts?.fileExt),
+        msgId,
+      };
+    }
     if (kind === "voice") {
       return {
         kind,
@@ -1844,6 +1931,59 @@ export class WcppClient {
     return this.downloadMediaEndpoint("/Tools/DownloadVideo", payload, outputPath);
   }
 
+  /**
+   * Download a file attachment via `/Tools/DownloadFile`. Tries a single-shot
+   * (sectionLen = the whole file); if the server caps the section size and
+   * returns a partial buffer, falls back to a bounded section loop that
+   * concatenates chunks until `totalLen` bytes are collected.
+   */
+  async downloadFile(message: SyncMessage | NormalizedMessage, outputPath?: string): Promise<MediaDownloadResult> {
+    const info = this.extractFileMessageInfo(message);
+    if (!info) {
+      throw new Error("WCPP: message is not a downloadable file message (MsgType 49 appType 6)");
+    }
+    if (!info.attachId || !info.fromUserName || info.totalLen == null) {
+      throw new Error("WCPP: file message is missing required download fields (attachid/fromUserName/totallen)");
+    }
+
+    const total = info.totalLen;
+    const MAX_SECTION = 64 * 1024; // conservative per-chunk cap for the loop fallback
+    const fetchSection = (start: number, len: number) =>
+      this.downloadMediaEndpoint("/Tools/DownloadFile", {
+        appID: info.appId ?? "",
+        attachId: info.attachId,
+        userName: info.fromUserName,
+        dataLen: total,
+        sectionStart: start,
+        sectionLen: len,
+      });
+
+    const first = await fetchSection(0, total);
+    let buffer = first.buffer ?? Buffer.alloc(0);
+
+    // Section-loop fallback only if the first shot came back short.
+    let guard = 0;
+    while (buffer.length > 0 && buffer.length < total && guard++ < 1024) {
+      const next = await fetchSection(buffer.length, Math.min(MAX_SECTION, total - buffer.length));
+      if (!next.buffer || next.buffer.length === 0) break; // server gave nothing more
+      buffer = Buffer.concat([buffer, next.buffer]);
+    }
+
+    const result: MediaDownloadResult = {
+      contentType: first.contentType,
+      buffer: buffer.length > 0 ? buffer : null,
+      responseJson: first.responseJson,
+      requestPayload: { appID: info.appId ?? "", attachId: info.attachId, dataLen: total },
+    };
+
+    if (outputPath && buffer.length > 0) {
+      const fs = await import("fs/promises");
+      await fs.writeFile(outputPath, buffer);
+      result.outputPath = outputPath;
+    }
+    return result;
+  }
+
   resolveMedia(message: SyncMessage | NormalizedMessage): ResolvedMedia | null {
     const voice = this.extractVoiceMessageInfo(message);
     if (voice) {
@@ -1878,6 +2018,21 @@ export class WcppClient {
         attachment,
         download: (outputPath?: string) => this.downloadVideo(message, outputPath),
         materialize: (dir?: string) => this.materializeMedia((outputPath?: string) => this.downloadVideo(message, outputPath), attachment, dir),
+      };
+    }
+
+    const file = this.extractFileMessageInfo(message);
+    if (file) {
+      const attachment = this.buildAttachmentCandidate("file", String(file.msgId ?? "unknown"), {
+        fileExt: file.fileExt,
+        title: file.title,
+      });
+      return {
+        kind: "file",
+        info: file,
+        attachment,
+        download: (outputPath?: string) => this.downloadFile(message, outputPath),
+        materialize: (dir?: string) => this.materializeMedia((outputPath?: string) => this.downloadFile(message, outputPath), attachment, dir),
       };
     }
 

@@ -56,7 +56,7 @@ export type WcppDispatchContext = {
    * messages that carry a media marker, so non-dispatched traffic never triggers
    * a download. Absent in tests / text-only paths → media is skipped silently.
    */
-  fetchMedia?: (id: string) => Promise<{ ok: boolean; localPath?: string } | null>;
+  fetchMedia?: (id: string) => Promise<{ ok: boolean; localPath?: string; mimeType?: string } | null>;
 };
 
 export type WcppInboundMessage = {
@@ -70,8 +70,8 @@ export type WcppInboundMessage = {
   isAtBot: boolean;
   replyToBody?: string;
   replyToSender?: string;
-  /** Set when the frame carries a lazily-fetchable attachment (image, …). */
-  mediaKind?: "image" | "voice" | "video";
+  /** Set when the frame carries a lazily-fetchable attachment (image, file, …). */
+  mediaKind?: "image" | "voice" | "video" | "file";
 };
 
 function buildFromTag(msg: WcppInboundMessage): string {
@@ -109,11 +109,15 @@ export async function dispatchInboundToOpenClaw(
   // agent as MediaPath. A miss/failure degrades gracefully: the text still
   // dispatches without the image.
   let mediaPath: string | undefined;
+  let mediaType: string | undefined;
   if (msg.mediaKind && ctx.fetchMedia) {
     try {
       const m = await ctx.fetchMedia(msg.msgId);
       if (m?.ok && m.localPath) {
         mediaPath = m.localPath;
+        // Forward the MIME so a non-image attachment (e.g. a .docx) isn't
+        // mistaken for an image by the media-understanding pipeline.
+        mediaType = m.mimeType;
       } else {
         ctx.log.warn(`wechatpadpro: media fetch for ${msg.msgId} returned no path (${msg.mediaKind})`);
       }
@@ -160,6 +164,7 @@ export async function dispatchInboundToOpenClaw(
     ReplyToBody: msg.replyToBody,
     ReplyToSender: msg.replyToSender,
     ...(mediaPath ? { MediaPath: mediaPath } : {}),
+    ...(mediaType ? { MediaType: mediaType } : {}),
     Timestamp: Math.floor(Date.now() / 1000),
   });
 
