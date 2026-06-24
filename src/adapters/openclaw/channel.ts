@@ -25,59 +25,31 @@ import type { Frame } from "../../shared/frame.js";
 import { createBridgeClient, type BridgeClient } from "../../shared/bridge-client.js";
 import { dispatchInboundToOpenClaw, type WcppDmAuthorizer } from "./dispatch.js";
 import { evaluateInboundFrame } from "./gate.js";
+import {
+  DEFAULT_ACCOUNT_ID,
+  isConfigured,
+  listAccountIds,
+  readSection,
+  resolveAccount,
+  type ResolvedAccount,
+} from "./account-config.js";
 
-// ──────────────────────────────────────────────
-// Account resolution
-// ──────────────────────────────────────────────
-
-export interface ResolvedAccount {
-  accountId: string | null;
-  /** WS base URL of the middleware, e.g. ws://127.0.0.1:8077 */
-  bridgeUrl: string;
-  /** Bearer token shared with the middleware. */
-  bridgeToken?: string;
-  /** Middleware account id to subscribe as (default "default"). */
-  account: string;
-  allowFrom: string[];
-  /** Group ids (…@chatroom) whose messages may reach the agent. Empty = block all groups; "*" = allow all. */
-  groupAllowFrom: string[];
-  dmPolicy: string | undefined;
-}
-
-const DEFAULT_ACCOUNT_ID = "default";
-
-function readSection(cfg: OpenClawConfig): Record<string, any> | undefined {
-  return (cfg.channels as Record<string, any>)?.["wechatpadpro"];
-}
-
-function resolveAccount(
-  cfg: OpenClawConfig,
-  accountId?: string | null,
-): ResolvedAccount {
-  const section = readSection(cfg) ?? {};
-
-  return {
-    accountId: accountId ?? null,
-    bridgeUrl: section.bridgeUrl,
-    bridgeToken: section.bridgeToken,
-    account: section.account ?? DEFAULT_ACCOUNT_ID,
-    allowFrom: section.allowFrom ?? [],
-    groupAllowFrom: section.groupAllowFrom ?? [],
-    dmPolicy: section.dmSecurity,
-  };
-}
+export type { ResolvedAccount } from "./account-config.js";
 
 // ──────────────────────────────────────────────
 // The plugin
 // ──────────────────────────────────────────────
 
-let bridge: BridgeClient | null = null;
+// One bridge connection per OpenClaw accountId (each subscribes to the middleware
+// as its own account). Replaces the former single-connection module global.
+const bridges = new Map<string, BridgeClient>();
 
-function inspectAccount(cfg: OpenClawConfig, _accountId?: string | null) {
-  const section = readSection(cfg);
-  const hasToken = Boolean(section?.bridgeToken);
+function inspectAccount(cfg: OpenClawConfig, accountId?: string | null) {
+  const account = resolveAccount(cfg, accountId ?? DEFAULT_ACCOUNT_ID);
+  const hasToken = Boolean(account.bridgeToken);
   // Configured = we can reach the middleware: bridgeUrl + bridgeToken.
-  const configured = Boolean(section?.bridgeUrl) && hasToken;
+  const configured = Boolean(account.bridgeUrl) && hasToken;
+  const section = readSection(cfg);
   return {
     enabled: configured && section?.enabled !== false,
     configured,
@@ -85,14 +57,9 @@ function inspectAccount(cfg: OpenClawConfig, _accountId?: string | null) {
   };
 }
 
-function isConfigured(account: ResolvedAccount | undefined): boolean {
-  if (!account) return false;
-  return Boolean(account.bridgeUrl) && Boolean(account.bridgeToken);
-}
-
 const wechatpadproConfigAdapter = {
   listAccountIds(cfg: OpenClawConfig): string[] {
-    return readSection(cfg) ? [DEFAULT_ACCOUNT_ID] : [];
+    return listAccountIds(cfg);
   },
   resolveAccount(cfg: OpenClawConfig, accountId?: string | null): ResolvedAccount {
     return resolveAccount(cfg, accountId ?? DEFAULT_ACCOUNT_ID);
@@ -195,10 +162,14 @@ const wechatpadproBase = {
         accountId: ctx.accountId,
         log,
         send: {
-          sendText: async (to: string, text: string) =>
-            bridge ? (await bridge.send({ to, text })).ok : false,
-          sendQuote: async (to: string, text: string, quoteMsgId: string) =>
-            bridge ? (await bridge.send({ to, text, replyTo: quoteMsgId })).ok : false,
+          sendText: async (to: string, text: string) => {
+            const b = bridges.get(ctx.accountId);
+            return b ? (await b.send({ to, text })).ok : false;
+          },
+          sendQuote: async (to: string, text: string, quoteMsgId: string) => {
+            const b = bridges.get(ctx.accountId);
+            return b ? (await b.send({ to, text, replyTo: quoteMsgId })).ok : false;
+          },
         },
         authorizeDm: buildDmAuthorizer({
           runtime: ctx.runtime,
@@ -208,10 +179,12 @@ const wechatpadproBase = {
           allowFrom: account.allowFrom,
           log,
         }),
-        fetchMedia: (id: string) =>
-          bridge ? bridge.fetchMedia(id, account.account) : Promise.resolve(null),
+        fetchMedia: (id: string) => {
+          const b = bridges.get(ctx.accountId);
+          return b ? b.fetchMedia(id, account.account) : Promise.resolve(null);
+        },
       };
-      startWcppRuntime(account, log, async (msg) => {
+      startWcppRuntime(ctx.accountId, account, log, async (msg) => {
         await dispatchInboundToOpenClaw(dispatchCtx, {
           chatType: msg.chatType,
           conversationId: msg.groupId || msg.senderId,
@@ -238,10 +211,10 @@ const wechatpadproBase = {
         }
         sig.addEventListener("abort", () => resolve(), { once: true });
       });
-      stopWcppRuntime();
+      stopWcppRuntime(ctx.accountId);
     },
     stopAccount: async (ctx: any) => {
-      stopWcppRuntime();
+      stopWcppRuntime(ctx.accountId);
       ctx.setStatus?.({
         accountId: ctx.accountId,
         running: false,
@@ -268,10 +241,11 @@ export const wechatpadproPlugin = createChatChannelPlugin<ResolvedAccount>({
   outbound: {
     attachedResults: {
       sendText: async (params) => {
-        if (!bridge) throw new Error("WeChatPadPro bridge not connected");
+        const b = bridges.get((params as any).accountId ?? DEFAULT_ACCOUNT_ID);
+        if (!b) throw new Error("WeChatPadPro bridge not connected");
         const ok = params.reply_to
-          ? (await bridge.send({ to: params.to, text: params.text, replyTo: params.reply_to })).ok
-          : (await bridge.send({ to: params.to, text: params.text })).ok;
+          ? (await b.send({ to: params.to, text: params.text, replyTo: params.reply_to })).ok
+          : (await b.send({ to: params.to, text: params.text })).ok;
         return { messageId: ok ? `wcpp-${Date.now()}` : undefined };
       },
     },
@@ -362,6 +336,7 @@ function buildDmAuthorizer(params: {
 // ──────────────────────────────────────────────
 
 export function startWcppRuntime(
+  accountId: string,
   account: ResolvedAccount,
   log: { info: (...args: any[]) => void; error: (...args: any[]) => void; warn: (...args: any[]) => void; debug: (...args: any[]) => void },
   dispatchInbound: (msg: {
@@ -380,7 +355,7 @@ export function startWcppRuntime(
   }) => Promise<void>,
 ): void {
   let selfWxid: string | null = null;
-  bridge = createBridgeClient({
+  const bridge = createBridgeClient({
     url: account.bridgeUrl,
     token: account.bridgeToken!,
     account: account.account,
@@ -429,15 +404,24 @@ export function startWcppRuntime(
     },
   });
 
+  bridges.set(accountId, bridge);
   bridge.connect();
-  log.info(`WeChatPadPro: bridge runtime started → ${account.bridgeUrl} (account=${account.account})`);
+  log.info(
+    `WeChatPadPro: bridge runtime started → ${account.bridgeUrl} (accountId=${accountId}, account=${account.account})`,
+  );
 }
 
-export function stopWcppRuntime(): void {
+export function stopWcppRuntime(accountId: string): void {
+  const bridge = bridges.get(accountId);
   bridge?.close();
-  bridge = null;
+  bridges.delete(accountId);
 }
 
-export function getBridgeClient(): BridgeClient | null {
-  return bridge;
+/**
+ * Look up a running bridge by accountId. With the accountId omitted it returns
+ * the sole bridge when exactly one is running (operator convenience / single-account).
+ */
+export function getBridgeClient(accountId?: string): BridgeClient | null {
+  if (accountId) return bridges.get(accountId) ?? null;
+  return bridges.size === 1 ? bridges.values().next().value ?? null : null;
 }

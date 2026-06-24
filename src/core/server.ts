@@ -32,7 +32,7 @@ export interface ServerDeps {
   /** Replay/ack store (subset of Db). */
   db: {
     getUndelivered(account: string, sinceTs: number): InboundRow[];
-    markDelivered(id: string, deliveredAt: number): void;
+    markDelivered(account: string, id: string, deliveredAt: number): void;
   };
   /** Outbound send (real impl wraps WcppClient.sendText/sendQuote). */
   send(req: {
@@ -58,8 +58,8 @@ export interface ServerDeps {
   }>;
   /** Liveness/status for /healthz. */
   status(): { wsUp: boolean; selfWxid?: string; lastMsgTs?: number };
-  /** selfWxid for the ready frame (may be undefined early). */
-  selfWxid(): string | undefined;
+  /** selfWxid for the ready frame of the given account (may be undefined early). */
+  selfWxid(account?: string): string | undefined;
   /** Replay age window in seconds (default 600). */
   ageWindowSeconds?: number;
   /** Injectable clock (ms since epoch). Default Date.now. Tests pass a fake. */
@@ -350,7 +350,7 @@ export function createBridgeServer(deps: ServerDeps): BridgeServer {
       if (ws.readyState !== WebSocket.OPEN) return;
 
       // 1. Send ready frame
-      const readyFrame = { type: "ready", selfWxid: deps.selfWxid() ?? "" };
+      const readyFrame = { type: "ready", selfWxid: deps.selfWxid(account) ?? "" };
       ws.send(JSON.stringify(readyFrame));
 
       // 2. Replay undelivered rows after ready frame
@@ -378,8 +378,8 @@ export function createBridgeServer(deps: ServerDeps): BridgeServer {
         typeof (msg as Record<string, unknown>).id === "string"
       ) {
         const id = (msg as Record<string, unknown>).id as string;
-        deps.db.markDelivered(id, now());
-        log.debug(`[sub] ack id=${id}`);
+        deps.db.markDelivered(account, id, now());
+        log.debug(`[sub] ack account=${account} id=${id}`);
       }
     });
 
@@ -397,8 +397,9 @@ export function createBridgeServer(deps: ServerDeps): BridgeServer {
   return {
     broadcast(frame: Frame): void {
       const payload = JSON.stringify(frame);
-      for (const [ws] of subscribers) {
-        if (ws.readyState === WebSocket.OPEN) {
+      // Route by account: a subscriber on account A must only see account-A frames.
+      for (const [ws, meta] of subscribers) {
+        if (ws.readyState === WebSocket.OPEN && meta.account === frame.account) {
           ws.send(payload);
         }
       }

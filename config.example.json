@@ -1,16 +1,19 @@
 {
   "_comment": "Middleware config — read by `node dist/core/main.js` (default path ~/.config/wcppm/config.json). The WeChat server connection lives HERE now, not in openclaw.json.",
 
+  "_single_instance_comment": "SINGLE INSTANCE: set the WeChat fields at the top level (host/port/authcode/wsUrl/wxid). `account` labels it (default \"default\").",
   "host": "100.64.0.8",
   "port": 8062,
   "authcode": "REPLACE_WITH_REAL_AUTHCODE",
   "proxy": "",
 
+  "_instances_comment": "MULTI INSTANCE: instead of the flat host/port/authcode above, provide an `instances` array — each entry is one WeChat account with its own account label, host, port (HTTP API), wsUrl (WS push), and wxid (routes shared-webhook pushes). `account` must be UNIQUE per entry. When `instances` is present it supersedes the flat fields. Example: \"instances\": [ {\"account\":\"acctA\",\"host\":\"100.64.0.8\",\"port\":8062,\"authcode\":\"AC_A\",\"wsUrl\":\"ws://100.64.0.8:8089/ws/sync\",\"wxid\":\"wxid_a\"}, {\"account\":\"acctB\",\"host\":\"100.64.0.8\",\"port\":8072,\"authcode\":\"AC_B\",\"wsUrl\":\"ws://100.64.0.8:8090/ws/sync\",\"wxid\":\"wxid_b\"} ]",
+
+  "_webhook_comment": "ONE shared webhook listener for ALL instances. WCPPM pushes are routed to the owning instance by the envelope's Wxid (point each WCPPM instance's webhook at this one URL; use the same secret across instances).",
   "webhookEnabled": false,
   "webhookHost": "127.0.0.1",
   "webhookPort": 8000,
   "webhookSecret": "",
-  "webhookUrl": "",
 
   "readOnly": false,
   "passRevokemsg": true,

@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import { openDb } from "./db.js";
 
@@ -75,7 +76,7 @@ test("getUndelivered: returns un-acked rows in the account within the age window
   db.recordInbound({ id: "c", account: "default", ts: 300, payload: "C" });
   db.recordInbound({ id: "x", account: "other", ts: 300, payload: "X" }); // different account
 
-  db.markDelivered("b", 999); // b is acked → excluded
+  db.markDelivered("default", "b", 999); // b is acked → excluded
 
   // age window ts >= 150 → "a" too old (excluded), "b" acked (excluded), "x" wrong account → only "c"
   const recent = db.getUndelivered("default", 150);
@@ -162,6 +163,89 @@ test("searchContacts: treats LIKE metacharacters in q as literals", () => {
   assert.equal(percent.length, 0);
 
   db.close();
+});
+
+test("recordInbound: same NewMsgId in different accounts both persist (composite PK, no cross-account drop)", () => {
+  const db = openDb(":memory:");
+  // A WeChat NewMsgId is only unique WITHIN one account — two accounts can legitimately
+  // produce the same id. The second must NOT be silently dropped as a "duplicate".
+  assert.equal(db.recordInbound({ id: "dup", account: "A", ts: 100, payload: "fromA" }), true);
+  assert.equal(db.recordInbound({ id: "dup", account: "B", ts: 100, payload: "fromB" }), true);
+
+  // Re-inserting within the same account is still an idempotent no-op.
+  assert.equal(db.recordInbound({ id: "dup", account: "A", ts: 100, payload: "fromA" }), false);
+
+  assert.deepEqual(db.getUndelivered("A", 0).map((r) => r.payload), ["fromA"]);
+  assert.deepEqual(db.getUndelivered("B", 0).map((r) => r.payload), ["fromB"]);
+
+  db.close();
+});
+
+test("recordMedia: same id in different accounts both persist (composite PK)", () => {
+  const db = openDb(":memory:");
+  assert.equal(db.recordMedia({ id: "dup", account: "A", kind: "image", descriptor: "A", ts: 1 }), true);
+  assert.equal(db.recordMedia({ id: "dup", account: "B", kind: "image", descriptor: "B", ts: 1 }), true);
+
+  assert.equal(db.getMedia("A", "dup")?.descriptor, "A");
+  assert.equal(db.getMedia("B", "dup")?.descriptor, "B");
+
+  db.close();
+});
+
+test("markDelivered: account-scoped — acking one account's id leaves the other account's same id undelivered", () => {
+  const db = openDb(":memory:");
+  db.recordInbound({ id: "dup", account: "A", ts: 100, payload: "fromA" });
+  db.recordInbound({ id: "dup", account: "B", ts: 100, payload: "fromB" });
+
+  db.markDelivered("A", "dup", 999);
+
+  assert.deepEqual(db.getUndelivered("A", 0).map((r) => r.id), []); // A acked
+  assert.deepEqual(db.getUndelivered("B", 0).map((r) => r.id), ["dup"]); // B untouched
+
+  db.close();
+});
+
+test("openDb: migrates an old id-only-PK database, preserving rows and enabling composite-PK behavior", () => {
+  const root = join(tmpdir(), `wcppm-migrate-${process.pid}-${Date.now()}`);
+  const dbPath = join(root, "state.db");
+  try {
+    mkdirSync(root, { recursive: true });
+    // Stand up the OLD schema by hand (id-only PRIMARY KEY) and seed a legacy 'default' row.
+    {
+      const raw = new DatabaseSync(dbPath);
+      raw.exec(`
+        CREATE TABLE inbound_log (
+          id TEXT PRIMARY KEY, account TEXT NOT NULL, ts INTEGER NOT NULL,
+          payload TEXT NOT NULL, delivered_at INTEGER
+        );
+        CREATE TABLE media (
+          id TEXT PRIMARY KEY, account TEXT NOT NULL, kind TEXT NOT NULL,
+          descriptor TEXT NOT NULL, ts INTEGER NOT NULL
+        );
+      `);
+      raw.prepare("INSERT INTO inbound_log (id, account, ts, payload, delivered_at) VALUES (?,?,?,?,?)")
+        .run("legacy", "default", 100, "old-payload", 42);
+      raw.prepare("INSERT INTO media (id, account, kind, descriptor, ts) VALUES (?,?,?,?,?)")
+        .run("legacy", "default", "image", "old-desc", 100);
+      raw.close();
+    }
+
+    // openDb must migrate the existing tables to composite PK without losing data.
+    const db = openDb(dbPath);
+
+    // Legacy row survived, including its delivered_at (acked → excluded from undelivered).
+    assert.deepEqual(db.getUndelivered("default", 0).map((r) => r.id), []);
+    assert.deepEqual(db.recentInbound("default", 10).map((r) => r.payload), ["old-payload"]);
+    assert.equal(db.getMedia("default", "legacy")?.descriptor, "old-desc");
+
+    // Composite-PK behavior now works: a second account can reuse the same id.
+    assert.equal(db.recordInbound({ id: "legacy", account: "B", ts: 200, payload: "fromB" }), true);
+    assert.deepEqual(db.getUndelivered("B", 0).map((r) => r.payload), ["fromB"]);
+
+    db.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("recentInbound: newest-first rows scoped to account, respects limit", () => {

@@ -267,14 +267,14 @@ test("replay: undelivered rows sent after ready frame, both arrive, in ts order"
 // Test 4: Ack — client sends {type:"ack",id:"x"} → server calls markDelivered
 // ---------------------------------------------------------------------------
 
-test("ack: client {type:'ack',id} triggers deps.db.markDelivered(id, now)", async () => {
-  const calls: Array<{ id: string; deliveredAt: number }> = [];
+test("ack: client {type:'ack',id} triggers deps.db.markDelivered(account, id, now)", async () => {
+  const calls: Array<{ account: string; id: string; deliveredAt: number }> = [];
 
   const deps = makeDeps({
     db: {
       getUndelivered: () => [],
-      markDelivered(id, deliveredAt) {
-        calls.push({ id, deliveredAt });
+      markDelivered(account, id, deliveredAt) {
+        calls.push({ account, id, deliveredAt });
       },
     },
   });
@@ -295,6 +295,7 @@ test("ack: client {type:'ack',id} triggers deps.db.markDelivered(id, now)", asyn
     await new Promise((r) => setTimeout(r, 50));
 
     assert.equal(calls.length, 1);
+    assert.equal(calls[0].account, "default"); // subscriber's account scopes the ack
     assert.equal(calls[0].id, "msg-abc");
     assert.equal(calls[0].deliveredAt, FIXED_NOW_MS);
 
@@ -334,6 +335,36 @@ test("broadcast: server.broadcast(frame) sends JSON to all connected subscribers
 
     cs1.close();
     cs2.close();
+  } finally {
+    await server.close();
+  }
+});
+
+test("broadcast: a frame is delivered only to subscribers whose account matches frame.account", async () => {
+  const deps = makeDeps();
+  const server = createBridgeServer(deps);
+  const port = await server.listen(0);
+
+  try {
+    const csA = await connect(port, { token: "test-token", account: "acctA" });
+    const csB = await connect(port, { token: "test-token", account: "acctB" });
+    await csA.nextMessage(); // ready
+    await csB.nextMessage(); // ready
+
+    const frameA = { ...makeFrame("only-A"), account: "acctA" };
+    const gotA = csA.nextMessage();
+    server.broadcast(frameA);
+    assert.deepEqual(await gotA, frameA); // A receives it
+
+    // B must NOT receive A's frame. Prove it by broadcasting a B-frame next and
+    // asserting B's first delivered message is the B-frame, never the A-frame.
+    const frameB = { ...makeFrame("only-B"), account: "acctB" };
+    const gotB = csB.nextMessage();
+    server.broadcast(frameB);
+    assert.deepEqual(await gotB, frameB);
+
+    csA.close();
+    csB.close();
   } finally {
     await server.close();
   }

@@ -1,13 +1,19 @@
 /**
  * main.ts — middleware entrypoint (the systemd --user service).
  *
- * Wires: config → SQLite → WcppClient (WeChat transport) → bridge server.
+ * Wires: config → SQLite → N WcppClients (one per WeChat instance) → bridge server.
  *   inbound:  client.onMessage → handleInbound (dedup + persist) → server.broadcast
- *   outbound: server POST /send → client.sendText / sendQuote
+ *   outbound: server POST /send → the owning instance's sendText / sendQuote
  *
- * Account-safety: this only does what the existing plugin did — login() verifies
- * the authcode via a single Sync probe and connect() opens the push WS. It NEVER
- * calls /Login/Newinit or StartAutoSync (see CLAUDE.md).
+ * Multi-instance: each config instance gets its own WcppClient (own auth, WS push,
+ * dedup set, contact cache) and its own heartbeat conductor. All instances share
+ * ONE db, ONE bridge server, and ONE webhook listener (routed to the owning client
+ * by self-`Wxid`). Every bridge callback (send/forceSync/media/status/selfWxid/…)
+ * selects the instance by `account`.
+ *
+ * Account-safety: startup is passive — connect() opens the WS push and (for this
+ * deployment) the shared webhook listener receives pushes. It NEVER calls
+ * /Login/Newinit or StartAutoSync, and never auto-Syncs on a webhook (see CLAUDE.md).
  *
  * Run: node dist/core/main.js [configPath]   (default ~/.config/wcppm/config.json)
  */
@@ -17,9 +23,10 @@ import { join } from "node:path";
 
 import { resolveConfig, type RawConfig } from "./config.js";
 import { openDb } from "./db.js";
-import { WcppClient } from "./client.js";
+import { WcppClient, type WcppConfig } from "./client.js";
 import { createBridgeServer, type ServerDeps } from "./server.js";
 import { createSendHandler, createMediaFetcher } from "./wiring.js";
+import { createWebhookListener, type WebhookSink } from "./webhook-listener.js";
 import { handleInbound } from "./ingest.js";
 import { startHeartbeatConductor } from "../heartbeat/runtime.js";
 import type { Logger } from "../shared/logger.js";
@@ -33,6 +40,18 @@ const logger: Logger = {
     if (process.env.WCPPM_DEBUG) console.debug("[wcppm]", ...a);
   },
 };
+
+/** A running WeChat instance and its per-account state. */
+interface Instance {
+  account: string;
+  wcpp: WcppConfig;
+  client: WcppClient;
+  send: ReturnType<typeof createSendHandler>;
+  fetchMedia: ReturnType<typeof createMediaFetcher>;
+  hb?: { stop(): Promise<void> | void } | null;
+  wsUp: boolean;
+  lastMsgTs?: number;
+}
 
 /**
  * Delete media files in `dir` whose mtime is older than `cutoffMs`. Best-effort
@@ -68,42 +87,78 @@ async function main(): Promise<void> {
   const configPath = process.argv[2] ?? join(homedir(), ".config", "wcppm", "config.json");
   const cfg = resolveConfig(loadRawConfig(configPath));
   logger.info(
-    `config: account=${cfg.account} bridge=${cfg.bridgeHost}:${cfg.bridgePort}` +
-      ` db=${cfg.dbPath} wcppHost=${cfg.wcpp.host || "(passive)"}`,
+    `config: instances=[${cfg.instances.map((i) => i.account).join(", ")}]` +
+      ` bridge=${cfg.bridgeHost}:${cfg.bridgePort} db=${cfg.dbPath}` +
+      ` webhook=${cfg.webhook.enabled ? `${cfg.webhook.host}:${cfg.webhook.port}${cfg.webhook.path}` : "off"}`,
   );
 
   const db = openDb(cfg.dbPath);
-  const client = new WcppClient(cfg.wcpp, logger);
 
   // Lazy media download directory. Shared filesystem with the adapter (same
   // box/user), so the localPath we return is directly readable downstream.
-  // Must be under an OpenClaw-allowed media root (config.mediaDir) or the
-  // agent's image tool rejects the path.
   const mediaDir = cfg.mediaDir;
 
-  let lastMsgTs: number | undefined;
-  let wsUp = false;
+  // Build one client per instance. onMessage is wired AFTER the server exists.
+  const instances = new Map<string, Instance>();
+  for (const inst of cfg.instances) {
+    const client = new WcppClient(inst.wcpp, logger);
+    instances.set(inst.account, {
+      account: inst.account,
+      wcpp: inst.wcpp,
+      client,
+      send: createSendHandler(client),
+      fetchMedia: createMediaFetcher(client, db, { dir: mediaDir, log: logger }),
+      wsUp: false,
+    });
+  }
 
-  const send = createSendHandler(client);
+  /** Select the instance for an account. With a single instance, an omitted account resolves to it. */
+  const instanceFor = (account?: string): Instance | undefined => {
+    if (account) return instances.get(account);
+    return instances.size === 1 ? instances.values().next().value : undefined;
+  };
+
   const deps: ServerDeps = {
     token: cfg.bridgeToken,
     log: logger,
     ageWindowSeconds: cfg.ageWindowSeconds,
     db: {
       getUndelivered: (account, sinceTs) => db.getUndelivered(account, sinceTs),
-      markDelivered: (id, at) => db.markDelivered(id, at),
+      markDelivered: (account, id, at) => db.markDelivered(account, id, at),
     },
-    send,
-    forceSync: async () => {
-      const r = await client.forceSync();
+    send: (req) => {
+      const inst = instanceFor(req.account);
+      if (!inst) {
+        logger.warn(`[send] no instance for account=${req.account}`);
+        return Promise.resolve({ ok: false });
+      }
+      return inst.send(req);
+    },
+    forceSync: async (account) => {
+      const inst = instanceFor(account);
+      if (!inst) return { ok: false };
+      const r = await inst.client.forceSync();
       return { ok: r.ok, messages: r.messages, hasMore: r.hasMore };
     },
-    // Lazy media fetch: the adapter calls POST /media after its gate; we download
-    // the bytes (operator-safe — /Tools/DownloadImg, not a /Login or /Msg/Sync
-    // call) to mediaDir and hand back the local path.
-    fetchMedia: createMediaFetcher(client, db, { dir: mediaDir, log: logger }),
-    status: () => ({ wsUp, selfWxid: client.wxid ?? undefined, lastMsgTs }),
-    selfWxid: () => client.wxid ?? undefined,
+    // Lazy media fetch: download the bytes for a previously-broadcast media frame
+    // (operator-safe — /Tools/DownloadImg, not a /Login or /Msg/Sync call).
+    fetchMedia: (account, id) => {
+      const inst = instanceFor(account);
+      if (!inst) return Promise.resolve({ ok: false });
+      return inst.fetchMedia(account, id);
+    },
+    status: () => {
+      let wsUp = false;
+      let selfWxid: string | undefined;
+      let lastMsgTs: number | undefined;
+      for (const inst of instances.values()) {
+        if (inst.wsUp) wsUp = true;
+        if (!selfWxid && inst.client.wxid) selfWxid = inst.client.wxid;
+        if (inst.lastMsgTs && (lastMsgTs === undefined || inst.lastMsgTs > lastMsgTs)) lastMsgTs = inst.lastMsgTs;
+      }
+      return { wsUp, selfWxid, lastMsgTs };
+    },
+    selfWxid: (account) => instanceFor(account)?.client.wxid ?? undefined,
     queryContacts: (account, q, limit) =>
       db.searchContacts(account, q, limit).map((c) => ({
         wxid: c.wxid,
@@ -131,54 +186,70 @@ async function main(): Promise<void> {
 
   const server = createBridgeServer(deps);
 
-  // Inbound: WeChat → dedup/persist → broadcast. One bad message must never
-  // kill the receiver loop.
-  client.onMessage = (msg) => {
-    lastMsgTs = msg.createTime;
-    try {
-      handleInbound(msg, {
-        account: cfg.account,
-        db,
-        log: logger,
-        broadcast: (frame) => server.broadcast(frame),
-        resolveName: (wxid) => client.getContact(wxid)?.NickName?.string || undefined,
-        // Persist every new message regardless of age, but only dispatch recent
-        // ones to the agent — so a backlog redelivery / brief downtime gap is
-        // captured in SQLite without replaying stale messages as auto-replies.
-        maxBroadcastAge: cfg.wcpp.maxMessageAge ?? 180,
-      });
-    } catch (err) {
-      logger.error("handleInbound failed:", err);
+  // Inbound: WeChat → dedup/persist → broadcast (per instance). One bad message
+  // must never kill a receiver loop.
+  for (const inst of instances.values()) {
+    inst.client.onMessage = (msg) => {
+      inst.lastMsgTs = msg.createTime;
+      try {
+        handleInbound(msg, {
+          account: inst.account,
+          db,
+          log: logger,
+          broadcast: (frame) => server.broadcast(frame),
+          resolveName: (wxid) => inst.client.getContact(wxid)?.NickName?.string || undefined,
+          // Persist every new message regardless of age, but only dispatch recent
+          // ones to the agent (a backlog redelivery is captured but not replayed).
+          maxBroadcastAge: inst.wcpp.maxMessageAge ?? 180,
+        });
+      } catch (err) {
+        logger.error(`handleInbound failed (account=${inst.account}):`, err);
+      }
+    };
+  }
+
+  // Shared webhook listener: ONE port for all instances, routed to the owning
+  // client by self-Wxid. Prefer the config-declared wxid; fall back to a learned
+  // one so routing works even before a wxid is configured.
+  const routeWebhook = (wxid: string): WebhookSink | undefined => {
+    for (const inst of instances.values()) {
+      if (inst.wcpp.wxid === wxid || inst.client.wxid === wxid) {
+        return { account: inst.account, ingestWebhookEnvelope: (e) => inst.client.ingestWebhookEnvelope(e) };
+      }
     }
+    return undefined;
   };
+  const webhookListener = cfg.webhook.enabled
+    ? createWebhookListener({ config: cfg.webhook, log: logger, route: routeWebhook })
+    : undefined;
+  if (webhookListener) await webhookListener.listen();
 
   // Bring up WeChat transports PASSIVELY — no startup /Msg/Sync probe. connect()
-  // is the SINGLE owner of inbound bring-up: it opens the WS push (when host is
-  // set), starts the local webhook listener (when webhookEnabled), and registers
-  // the webhook via /Webhook/Set (when host + webhookUrl). Call it exactly once —
-  // also calling startWebhookServer() here would listen() the webhook port twice
-  // → EADDRINUSE, and would double-fire the active /Webhook/Set call.
-  // The WS push longlink authenticates with the authcode itself and supplies
-  // self-wxid via its envelope; the SyncKey cursor isn't needed (forceSync's
-  // first call omits it). So there is no reason to actively pull on connect —
-  // keeping startup passive is better for account safety. (forceSync stays
-  // operator-only.)
-  client.connect();
-  if (cfg.wcpp.host) {
-    wsUp = true;
-    logger.info(`WeChat: connecting WS push to ${cfg.wcpp.host} (passive; no startup Sync)`);
-  } else {
-    logger.info("WeChat: passive webhook-only mode (no host)");
+  // opens the WS push when host is set; the per-instance webhook server stays
+  // disabled (the shared listener above owns webhook receive). forceSync stays
+  // operator-only.
+  for (const inst of instances.values()) {
+    inst.client.connect();
+    if (inst.wcpp.host) {
+      inst.wsUp = true;
+      logger.info(`WeChat[${inst.account}]: connecting WS push to ${inst.wcpp.host} (passive; no startup Sync)`);
+    } else {
+      logger.info(`WeChat[${inst.account}]: passive webhook-only mode (no host)`);
+    }
   }
 
   const port = await server.listen(cfg.bridgePort, cfg.bridgeHost);
   logger.info(`bridge up: ws://${cfg.bridgeHost}:${port}/subscribe · http://${cfg.bridgeHost}:${port}`);
 
-  // Start the heartbeat conductor if enabled (default-off; existing deployments unaffected).
-  const hb = startHeartbeatConductor(cfg.heartbeat, cfg.wcpp, logger);
+  // One heartbeat conductor per instance (default-off; netKey is namespaced by
+  // authcode so per-account heartbeat state never collides).
+  for (const inst of instances.values()) {
+    inst.hb = startHeartbeatConductor(cfg.heartbeat, inst.wcpp, logger);
+  }
 
-  // Retention: prune inbound_log rows older than max(maxMessageAge, 1h).
-  const retentionSec = Math.max(cfg.wcpp.maxMessageAge ?? 180, 3600);
+  // Retention: prune inbound_log/media rows older than max(maxMessageAge, 1h).
+  const maxRetentionAge = Math.max(...cfg.instances.map((i) => i.wcpp.maxMessageAge ?? 180), 180);
+  const retentionSec = Math.max(maxRetentionAge, 3600);
   const pruneTimer = setInterval(() => {
     try {
       const cutoff = Math.floor(Date.now() / 1000) - retentionSec;
@@ -187,8 +258,6 @@ async function main(): Promise<void> {
       if (removed > 0 || removedMedia > 0) {
         logger.debug(`pruned ${removed} inbound + ${removedMedia} media rows (> ${retentionSec}s old)`);
       }
-      // Sweep downloaded media files older than the retention window so the
-      // lazy-download dir doesn't grow without bound.
       pruneMediaFiles(mediaDir, Date.now() - retentionSec * 1000);
     } catch (err) {
       logger.error("prune failed:", err);
@@ -203,18 +272,25 @@ async function main(): Promise<void> {
     shuttingDown = true;
     logger.info(`received ${sig}, shutting down…`);
     clearInterval(pruneTimer);
+    for (const inst of instances.values()) {
+      try {
+        inst.client.disconnect();
+      } catch {
+        /* ignore */
+      }
+      try {
+        await inst.hb?.stop();
+      } catch {
+        /* ignore */
+      }
+    }
     try {
-      client.disconnect();
+      await webhookListener?.close();
     } catch {
       /* ignore */
     }
     try {
       await server.close();
-    } catch {
-      /* ignore */
-    }
-    try {
-      await hb?.stop();
     } catch {
       /* ignore */
     }

@@ -197,17 +197,18 @@ interface MaxWsEnvelope {
  * Webhook push envelope from WCPP MAX.
  * POST'd to our local HTTP server when webhook mode is active.
  *
- * NOTE (verified by live capture 2026-06-07): the 0416 server's webhook is a
- * signed **doorbell**, not a message carrier — it sends
- * `{ MessageType: "sync_message", Data: {} }` with an EMPTY `Data` to signal
- * "new messages available". The actual messages arrive over the WS push
- * (`handleWsMessage`), so `Data.messages` is typically absent and
- * `processWebhookMessages` is a no-op for it. We deliberately do NOT Sync in
- * response (auto-dispatch with no demand is the banned ban-trigger pattern —
- * see CLAUDE.md Account Safety). The `messages[]` shape below is the legacy
- * inline-payload format kept for older server modes / `forge-webhook.mjs`.
+ * NOTE: the webhook payload shape depends on the WCPPM server's webhook config.
+ *  - DOORBELL mode (live capture 2026-06-07): `{ MessageType: "sync_message",
+ *    Data: {} }` with EMPTY `Data` — a signal only; the messages arrive over the
+ *    WS push, so `processWebhookMessages` is a no-op.
+ *  - INLINE mode (some deployments, incl. the current multi-instance one): the
+ *    webhook carries the full `Data.messages[]` — typically the SAME messages as
+ *    the WS push, a few seconds later. These are deduped against the WS copy by
+ *    the shared `seenMsgIds` set, so the webhook acts as a redundant backup path.
+ * Either way we deliberately do NOT Sync in response to a webhook (auto-dispatch
+ * with no demand is the banned ban-trigger pattern — see CLAUDE.md Account Safety).
  */
-interface WebhookEnvelope {
+export interface WebhookEnvelope {
   MessageType: string;
   Signature: string;
   Timestamp: number;
@@ -215,6 +216,34 @@ interface WebhookEnvelope {
   IsSelf: boolean;
   Data: {
     messages?: WebhookMessage[];
+  };
+}
+
+/**
+ * Verify a webhook envelope's HMAC signature against `secret`. Pure (no instance
+ * state) so both the in-client webhook server and the shared webhook listener can
+ * use it. The signing input is `${Wxid}:${MessageType}:${Timestamp}`.
+ */
+export function verifyWebhookSignature(
+  envelope: WebhookEnvelope,
+  secret: string,
+): { ok: true } | { ok: false; signingInput: string; expectedPrefix: string; gotPrefix: string; gotLen: number } {
+  const signingInput = `${envelope.Wxid}:${envelope.MessageType}:${envelope.Timestamp}`;
+  const expected = createHmac("sha256", secret).update(signingInput).digest("hex");
+  const got = (envelope.Signature || "").toLowerCase();
+  let match = false;
+  try {
+    match = timingSafeEqual(Buffer.from(expected, "utf8"), Buffer.from(got, "utf8"));
+  } catch {
+    match = false;
+  }
+  if (match) return { ok: true };
+  return {
+    ok: false,
+    signingInput,
+    expectedPrefix: expected.slice(0, 12),
+    gotPrefix: got.slice(0, 12),
+    gotLen: got.length,
   };
 }
 
@@ -1291,7 +1320,7 @@ export class WcppClient {
 
           // Signature verification
           if (this.config.webhookSecret) {
-            const verdict = this.verifyWebhookSignature(envelope, this.config.webhookSecret);
+            const verdict = verifyWebhookSignature(envelope, this.config.webhookSecret);
             if (!verdict.ok) {
               // Silent-drop escape hatch: empty signature field means the
               // push was enqueued before a secret was configured on WCPPM.
@@ -1403,27 +1432,19 @@ export class WcppClient {
     }
   }
 
-  private verifyWebhookSignature(
-    envelope: WebhookEnvelope,
-    secret: string,
-  ): { ok: true } | { ok: false; signingInput: string; expectedPrefix: string; gotPrefix: string; gotLen: number } {
-    const signingInput = `${envelope.Wxid}:${envelope.MessageType}:${envelope.Timestamp}`;
-    const expected = createHmac("sha256", secret).update(signingInput).digest("hex");
-    const got = (envelope.Signature || "").toLowerCase();
-    let match = false;
-    try {
-      match = timingSafeEqual(Buffer.from(expected, "utf8"), Buffer.from(got, "utf8"));
-    } catch {
-      match = false;
+  /**
+   * Shared-webhook-listener entrypoint: the listener has already parsed and
+   * signature-verified the envelope and routed it here by `Wxid`. Learn the
+   * self-wxid if not yet known, then run the inline messages through the same
+   * pipeline as WS push — so cross-transport duplicates (WS push then webhook
+   * a few seconds later) are deduped by the shared `seenMsgIds` set.
+   */
+  ingestWebhookEnvelope(envelope: WebhookEnvelope): void {
+    if (!this.wxid && envelope.Wxid) {
+      this.wxid = envelope.Wxid;
+      this.log.info(`[webhook] detected wxid=${this.wxid}`);
     }
-    if (match) return { ok: true };
-    return {
-      ok: false,
-      signingInput,
-      expectedPrefix: expected.slice(0, 12),
-      gotPrefix: got.slice(0, 12),
-      gotLen: got.length,
-    };
+    this.processWebhookMessages(envelope);
   }
 
   /**

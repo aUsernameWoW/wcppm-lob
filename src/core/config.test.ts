@@ -3,40 +3,95 @@ import assert from "node:assert/strict";
 
 import { resolveConfig } from "./config.js";
 
-test("resolveConfig: fills bridge defaults (port 8077, loopback, age window) and threads wcpp fields", () => {
+test("resolveConfig: a flat single-instance config becomes instances[0]=default and threads wcpp fields", () => {
   const cfg = resolveConfig({ host: "100.64.0.8", authcode: "AC", bridgeToken: "secret" });
 
-  // wcpp passthrough + defaults
-  assert.equal(cfg.wcpp.host, "100.64.0.8");
-  assert.equal(cfg.wcpp.port, 8062);
-  assert.equal(cfg.wcpp.authcode, "AC");
+  assert.equal(cfg.instances.length, 1);
+  assert.equal(cfg.instances[0].account, "default");
+  assert.equal(cfg.instances[0].wcpp.host, "100.64.0.8");
+  assert.equal(cfg.instances[0].wcpp.port, 8062);
+  assert.equal(cfg.instances[0].wcpp.authcode, "AC");
 
   // bridge defaults
-  assert.equal(cfg.account, "default");
   assert.equal(cfg.bridgeHost, "127.0.0.1");
   assert.equal(cfg.bridgePort, 8077);
   assert.equal(cfg.ageWindowSeconds, 600);
   assert.equal(cfg.bridgeToken, "secret");
 });
 
-test("resolveConfig: explicit values override defaults", () => {
+test("resolveConfig: flat config respects an explicit account label", () => {
+  const cfg = resolveConfig({ host: "h", port: 9001, bridgeToken: "t", account: "acct2" });
+  assert.equal(cfg.instances.length, 1);
+  assert.equal(cfg.instances[0].account, "acct2");
+  assert.equal(cfg.instances[0].wcpp.port, 9001);
+});
+
+test("resolveConfig: an instances[] config yields one WcppConfig per entry, account-labelled", () => {
   const cfg = resolveConfig({
-    host: "h",
-    port: 9001,
     bridgeToken: "t",
-    account: "acct2",
-    bridgeHost: "0.0.0.0",
-    bridgePort: 9999,
-    ageWindowSeconds: 120,
-    dbPath: "/tmp/x.db",
+    instances: [
+      { account: "acctA", host: "100.64.0.8", port: 8062, authcode: "A", wsUrl: "ws://100.64.0.8:8089/x", wxid: "wxid_a" },
+      { account: "acctB", host: "100.64.0.8", port: 8063, authcode: "B", wsUrl: "ws://100.64.0.8:8090/x", wxid: "wxid_b" },
+    ],
   });
 
-  assert.equal(cfg.wcpp.port, 9001);
-  assert.equal(cfg.account, "acct2");
-  assert.equal(cfg.bridgeHost, "0.0.0.0");
-  assert.equal(cfg.bridgePort, 9999);
-  assert.equal(cfg.ageWindowSeconds, 120);
-  assert.equal(cfg.dbPath, "/tmp/x.db");
+  assert.equal(cfg.instances.length, 2);
+  assert.deepEqual(cfg.instances.map((i) => i.account), ["acctA", "acctB"]);
+  assert.equal(cfg.instances[0].wcpp.wsUrl, "ws://100.64.0.8:8089/x");
+  assert.equal(cfg.instances[0].wcpp.wxid, "wxid_a");
+  assert.equal(cfg.instances[1].wcpp.port, 8063);
+  assert.equal(cfg.instances[1].wcpp.wxid, "wxid_b");
+});
+
+test("resolveConfig: duplicate account labels are rejected", () => {
+  assert.throws(
+    () =>
+      resolveConfig({
+        bridgeToken: "t",
+        instances: [
+          { account: "dup", host: "h", authcode: "A" },
+          { account: "dup", host: "h", authcode: "B" },
+        ],
+      }),
+    /duplicate account/i,
+  );
+});
+
+test("resolveConfig: an instance missing an account label is rejected", () => {
+  assert.throws(
+    () => resolveConfig({ bridgeToken: "t", instances: [{ host: "h", authcode: "A" }] }),
+    /account/i,
+  );
+});
+
+test("resolveConfig: webhook listener config is shared (top-level) with defaults", () => {
+  const cfg = resolveConfig({ host: "h", bridgeToken: "t" });
+  assert.equal(cfg.webhook.enabled, false);
+  assert.equal(cfg.webhook.host, "127.0.0.1");
+  assert.equal(cfg.webhook.port, 8000);
+  assert.equal(cfg.webhook.path, "/webhook");
+
+  const cfg2 = resolveConfig({
+    bridgeToken: "t",
+    webhookEnabled: true,
+    webhookPort: 9100,
+    webhookSecret: "s",
+    instances: [{ account: "a", host: "h", authcode: "A" }],
+  });
+  assert.equal(cfg2.webhook.enabled, true);
+  assert.equal(cfg2.webhook.port, 9100);
+  assert.equal(cfg2.webhook.secret, "s");
+});
+
+test("resolveConfig: per-instance webhook listeners are NOT started (shared listener owns the port)", () => {
+  // The middleware runs ONE shared webhook listener and routes by Wxid; each
+  // WcppClient must therefore keep its own in-client webhook server disabled.
+  const cfg = resolveConfig({
+    bridgeToken: "t",
+    webhookEnabled: true,
+    instances: [{ account: "a", host: "h", authcode: "A" }],
+  });
+  assert.notEqual(cfg.instances[0].wcpp.webhookEnabled, true);
 });
 
 test("resolveConfig: a missing bridgeToken is rejected (it guards the downstream interface)", () => {

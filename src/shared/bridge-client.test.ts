@@ -49,7 +49,7 @@ const sampleFrame: Frame = {
 
 test("bridge-client: receives a broadcast frame via onMessage and auto-acks it", async () => {
   const marked: string[] = [];
-  const server = createBridgeServer(fakeDeps({ db: { getUndelivered: () => [], markDelivered: (id) => marked.push(id) } }));
+  const server = createBridgeServer(fakeDeps({ db: { getUndelivered: () => [], markDelivered: (_account, id) => marked.push(id) } }));
   const port = await server.listen(0);
 
   const got = deferred<Frame>();

@@ -13,31 +13,45 @@ import { DEFAULT_IMAGE_RETRY } from "./client.js";
 import { resolveHeartbeatConfig } from "../heartbeat/runtime.js";
 import type { HeartbeatConfig } from "../heartbeat/runtime.js";
 
-/** Loose shape of the on-disk config file. */
-export interface RawConfig {
-  // WeChat client (passed through to WcppConfig)
+/**
+ * Per-WeChat-instance fields. In a multi-instance config these live inside each
+ * `instances[]` entry; in a legacy flat config they sit at the top level and
+ * synthesize a single `default` instance. Webhook listener fields are NOT here —
+ * the middleware runs ONE shared webhook listener and routes by Wxid (see below).
+ */
+export interface RawInstanceConfig {
+  /** Stable label that identifies this account across the bridge (== subscribe ?account=). */
+  account?: string;
   host?: string;
   port?: number;
   authcode?: string;
+  /** This account's self-wxid. Used to route shared-webhook frames to this instance. */
   wxid?: string;
   proxy?: string;
   wsUrl?: string;
-  webhookEnabled?: boolean;
-  webhookHost?: string;
-  webhookPort?: number;
-  webhookPath?: string;
-  webhookSecret?: string;
-  webhookUrl?: string;
-  webhookDebug?: boolean;
-  webhookSilentDropUnsigned?: boolean;
   readOnly?: boolean;
   allowMsgTypes?: number[];
   passRevokemsg?: boolean;
   maxMessageAge?: number;
   /** Randomized CDN image-download retry policy (all fields optional; see ImageRetryConfig). */
   imageRetry?: Partial<ImageRetryConfig>;
-  // Downstream bridge
-  account?: string;
+}
+
+/** Loose shape of the on-disk config file. */
+export interface RawConfig extends RawInstanceConfig {
+  /** Multi-instance form. When present, supersedes the top-level flat instance fields. */
+  instances?: RawInstanceConfig[];
+
+  // Shared webhook listener (ONE port for all instances; routed by envelope.Wxid).
+  webhookEnabled?: boolean;
+  webhookHost?: string;
+  webhookPort?: number;
+  webhookPath?: string;
+  webhookSecret?: string;
+  webhookDebug?: boolean;
+  webhookSilentDropUnsigned?: boolean;
+
+  // Downstream bridge (single, shared across instances).
   bridgeToken?: string;
   bridgeHost?: string;
   bridgePort?: number;
@@ -55,9 +69,26 @@ export interface RawConfig {
   heartbeat?: Partial<HeartbeatConfig>;
 }
 
-export interface MiddlewareConfig {
-  wcpp: WcppConfig;
+/** A single resolved WeChat instance: its account label + the client config. */
+export interface InstanceConfig {
   account: string;
+  wcpp: WcppConfig;
+}
+
+/** The shared webhook listener: one port, signature-verified, routed by Wxid. */
+export interface WebhookListenerConfig {
+  enabled: boolean;
+  host: string;
+  port: number;
+  path: string;
+  secret?: string;
+  debug: boolean;
+  silentDropUnsigned: boolean;
+}
+
+export interface MiddlewareConfig {
+  instances: InstanceConfig[];
+  webhook: WebhookListenerConfig;
   bridgeToken: string;
   bridgeHost: string;
   bridgePort: number;
@@ -89,11 +120,16 @@ export function resolveImageRetryConfig(raw?: Partial<ImageRetryConfig>): ImageR
   return cfg;
 }
 
-export function resolveConfig(raw: RawConfig): MiddlewareConfig {
-  if (!raw.bridgeToken) {
-    throw new Error("config: bridgeToken is required (it is the bearer token guarding the downstream WS/HTTP interface)");
+/**
+ * Resolve one raw instance entry into an InstanceConfig. `index` is only used for
+ * error messages. The webhook* fields are intentionally NOT threaded here: the
+ * shared listener owns the webhook port, so each instance keeps webhookEnabled off.
+ */
+function resolveInstance(raw: RawInstanceConfig, index: number): InstanceConfig {
+  const account = (raw.account || "").trim();
+  if (!account) {
+    throw new Error(`config: instances[${index}] is missing an "account" label (the stable id used across the bridge)`);
   }
-
   const wcpp: WcppConfig = {
     host: raw.host ?? "",
     port: raw.port ?? 8062,
@@ -101,24 +137,51 @@ export function resolveConfig(raw: RawConfig): MiddlewareConfig {
     wxid: raw.wxid,
     proxy: raw.proxy,
     wsUrl: raw.wsUrl,
-    webhookEnabled: raw.webhookEnabled,
-    webhookHost: raw.webhookHost,
-    webhookPort: raw.webhookPort,
-    webhookPath: raw.webhookPath,
-    webhookSecret: raw.webhookSecret,
-    webhookUrl: raw.webhookUrl,
-    webhookDebug: raw.webhookDebug,
-    webhookSilentDropUnsigned: raw.webhookSilentDropUnsigned,
+    // Shared webhook listener owns the port — never start a per-instance one.
+    webhookEnabled: false,
     readOnly: raw.readOnly,
     allowMsgTypes: raw.allowMsgTypes,
     passRevokemsg: raw.passRevokemsg,
     maxMessageAge: raw.maxMessageAge,
     imageRetry: resolveImageRetryConfig(raw.imageRetry),
   };
+  return { account, wcpp };
+}
+
+export function resolveConfig(raw: RawConfig): MiddlewareConfig {
+  if (!raw.bridgeToken) {
+    throw new Error("config: bridgeToken is required (it is the bearer token guarding the downstream WS/HTTP interface)");
+  }
+
+  // Multi-instance form wins; otherwise synthesize a single instance from the flat
+  // top-level fields (back-compat with the legacy single-account config), defaulting
+  // the account label to "default".
+  const rawInstances: RawInstanceConfig[] =
+    raw.instances && raw.instances.length > 0 ? raw.instances : [{ ...raw, account: raw.account || "default" }];
+
+  const instances = rawInstances.map(resolveInstance);
+
+  const seen = new Set<string>();
+  for (const inst of instances) {
+    if (seen.has(inst.account)) {
+      throw new Error(`config: duplicate account label "${inst.account}" (each instance needs a unique account)`);
+    }
+    seen.add(inst.account);
+  }
+
+  const webhook: WebhookListenerConfig = {
+    enabled: raw.webhookEnabled ?? false,
+    host: raw.webhookHost || "127.0.0.1",
+    port: raw.webhookPort ?? 8000,
+    path: raw.webhookPath || "/webhook",
+    secret: raw.webhookSecret,
+    debug: raw.webhookDebug ?? false,
+    silentDropUnsigned: raw.webhookSilentDropUnsigned ?? false,
+  };
 
   return {
-    wcpp,
-    account: raw.account || "default",
+    instances,
+    webhook,
     bridgeToken: raw.bridgeToken,
     bridgeHost: raw.bridgeHost || "127.0.0.1",
     bridgePort: raw.bridgePort ?? 8077,

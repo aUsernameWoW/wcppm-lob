@@ -46,6 +46,27 @@
             "type": "array",
             "items": { "type": "string" },
             "description": "Group ids (…@chatroom) whose messages may reach the agent. Empty or absent = block all groups; \"*\" = allow all groups."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether this channel is enabled. Default true when the section is present."
+          },
+          "accounts": {
+            "type": "object",
+            "description": "Multiple WeChat accounts. Each key is an OpenClaw accountId (which is also the middleware subscribe account unless overridden by its own \"account\"). Per-account fields override the base section.",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "bridgeUrl": { "type": "string", "description": "WebSocket base URL of the middleware (defaults to the base section's bridgeUrl)." },
+                "bridgeToken": { "type": "string", "description": "Bearer token (defaults to the base section's bridgeToken)." },
+                "account": { "type": "string", "description": "Middleware account id to subscribe as (defaults to this entry's key)." },
+                "dmSecurity": { "type": "string", "enum": ["allowlist", "allow-all", "pairing"], "description": "DM security policy for this account." },
+                "allowFrom": { "type": "array", "items": { "type": "string" }, "description": "DM allowlist for this account." },
+                "groupAllowFrom": { "type": "array", "items": { "type": "string" }, "description": "Group allowlist for this account." },
+                "enabled": { "type": "boolean", "description": "Whether this account is enabled." }
+              }
+            }
           }
         }
       },

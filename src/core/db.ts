@@ -58,8 +58,8 @@ export interface ContactRow {
 export interface Db {
   /** INSERT OR IGNORE the inbound row. Returns true if newly inserted, false if it was a duplicate. */
   recordInbound(entry: InboundEntry): boolean;
-  /** Mark a row as delivered (acked by a subscriber) at the given time. No-op if id unknown. */
-  markDelivered(id: string, deliveredAt: number): void;
+  /** Mark a row as delivered (acked by a subscriber) at the given time. No-op if (account,id) unknown. */
+  markDelivered(account: string, id: string, deliveredAt: number): void;
   /** Replay set: un-acked rows for an account with ts >= sinceTs (the age window), oldest first. */
   getUndelivered(account: string, sinceTs: number): InboundRow[];
   /** Retention: delete inbound rows with ts < cutoff. Returns how many were removed. */
@@ -81,28 +81,75 @@ export interface Db {
   close(): void;
 }
 
+/**
+ * Rebuild `table` to a composite (account, id) PK if it currently exists with an
+ * id-only PK. `columns` is the shared column list (same order in old and new tables);
+ * `createSql` creates the new composite-PK table. Preserves all rows. No-op when the
+ * table is absent (fresh DB) or already on the composite PK.
+ */
+function migrateToCompositePk(db: DatabaseSync, table: string, columns: string, createSql: string): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string; pk: number }>;
+  if (cols.length === 0) return; // table doesn't exist yet — CREATE IF NOT EXISTS will make it fresh
+  const pkCols = cols.filter((c) => Number(c.pk) > 0).map((c) => c.name);
+  const alreadyComposite = pkCols.length === 2 && pkCols.includes("account") && pkCols.includes("id");
+  if (alreadyComposite) return;
+
+  db.exec(`
+    ALTER TABLE ${table} RENAME TO ${table}_old;
+    ${createSql}
+    INSERT INTO ${table} (${columns}) SELECT ${columns} FROM ${table}_old;
+    DROP TABLE ${table}_old;
+  `);
+}
+
 export function openDb(path: string): Db {
   // SQLite creates the db file but NOT its parent directory — ensure it exists.
   if (path !== ":memory:") {
     mkdirSync(dirname(path), { recursive: true });
   }
   const db = new DatabaseSync(path);
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS inbound_log (
-      id           TEXT PRIMARY KEY,
+
+  // Migration: older databases keyed inbound_log/media on `id` alone. Since a WeChat
+  // NewMsgId is only unique WITHIN one account, that PK silently dropped a second
+  // account's identical id. Rebuild such tables to a composite (account, id) PK,
+  // preserving every existing row. Idempotent: a no-op on fresh or already-migrated DBs.
+  migrateToCompositePk(db, "inbound_log", "id, account, ts, payload, delivered_at", `
+    CREATE TABLE inbound_log (
+      id           TEXT NOT NULL,
       account      TEXT NOT NULL,
       ts           INTEGER NOT NULL,
       payload      TEXT NOT NULL,
-      delivered_at INTEGER
+      delivered_at INTEGER,
+      PRIMARY KEY (account, id)
+    );`);
+  migrateToCompositePk(db, "media", "id, account, kind, descriptor, ts", `
+    CREATE TABLE media (
+      id         TEXT NOT NULL,
+      account    TEXT NOT NULL,
+      kind       TEXT NOT NULL,
+      descriptor TEXT NOT NULL,
+      ts         INTEGER NOT NULL,
+      PRIMARY KEY (account, id)
+    );`);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS inbound_log (
+      id           TEXT NOT NULL,
+      account      TEXT NOT NULL,
+      ts           INTEGER NOT NULL,
+      payload      TEXT NOT NULL,
+      delivered_at INTEGER,
+      PRIMARY KEY (account, id)
     );
     CREATE INDEX IF NOT EXISTS idx_inbound_replay ON inbound_log (account, delivered_at, ts);
 
     CREATE TABLE IF NOT EXISTS media (
-      id         TEXT PRIMARY KEY,
+      id         TEXT NOT NULL,
       account    TEXT NOT NULL,
       kind       TEXT NOT NULL,
       descriptor TEXT NOT NULL,
-      ts         INTEGER NOT NULL
+      ts         INTEGER NOT NULL,
+      PRIMARY KEY (account, id)
     );
     CREATE INDEX IF NOT EXISTS idx_media_ts ON media (ts);
 
@@ -120,7 +167,9 @@ export function openDb(path: string): Db {
   const insertInbound = db.prepare(
     "INSERT OR IGNORE INTO inbound_log (id, account, ts, payload) VALUES (?, ?, ?, ?)",
   );
-  const markDeliveredStmt = db.prepare("UPDATE inbound_log SET delivered_at = ? WHERE id = ?");
+  const markDeliveredStmt = db.prepare(
+    "UPDATE inbound_log SET delivered_at = ? WHERE account = ? AND id = ?",
+  );
   const undeliveredStmt = db.prepare(
     "SELECT id, account, ts, payload, delivered_at FROM inbound_log" +
       " WHERE account = ? AND delivered_at IS NULL AND ts >= ? ORDER BY ts ASC",
@@ -155,8 +204,8 @@ export function openDb(path: string): Db {
       const r = insertInbound.run(entry.id, entry.account, entry.ts, entry.payload);
       return Number(r.changes) === 1;
     },
-    markDelivered(id, deliveredAt) {
-      markDeliveredStmt.run(deliveredAt, id);
+    markDelivered(account, id, deliveredAt) {
+      markDeliveredStmt.run(deliveredAt, account, id);
     },
     getUndelivered(account, sinceTs) {
       return undeliveredStmt.all(account, sinceTs) as unknown as InboundRow[];

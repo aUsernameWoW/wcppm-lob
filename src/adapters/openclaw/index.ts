@@ -16,10 +16,12 @@ export default defineChannelPluginEntry({
     // re-invokes if hasMore. Reach via `openclaw gateway call wechatpadpro.forceSync`.
     api.registerGatewayMethod(
       "wechatpadpro.forceSync",
-      async ({ respond }: { respond: (ok: boolean, payload?: unknown) => void }) => {
-        const client = getBridgeClient();
+      async ({ params, respond }: { params?: { account?: string }; respond: (ok: boolean, payload?: unknown) => void }) => {
+        // With multiple accounts running, the operator passes { account } to pick
+        // one; omitted is fine when exactly one account is running.
+        const client = getBridgeClient(params?.account);
         if (!client) {
-          respond(false, { error: "channel not running" });
+          respond(false, { error: params?.account ? `account not running: ${params.account}` : "channel not running (specify account)" });
           return;
         }
         const result = await client.forceSync();
