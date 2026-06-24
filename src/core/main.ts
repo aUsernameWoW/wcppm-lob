@@ -30,29 +30,29 @@ import { createWebhookListener, type WebhookSink } from "./webhook-listener.js";
 import { handleInbound } from "./ingest.js";
 import { startHeartbeatConductor } from "../heartbeat/runtime.js";
 import type { HeartbeatConfig } from "../heartbeat/runtime.js";
+import { createLogger } from "../shared/logger.js";
 import type { Logger } from "../shared/logger.js";
 import type { Frame } from "../shared/frame.js";
 
-const logger: Logger = {
-  info: (...a: unknown[]) => console.log("[wcppm]", ...a),
-  warn: (...a: unknown[]) => console.warn("[wcppm]", ...a),
-  error: (...a: unknown[]) => console.error("[wcppm]", ...a),
-  debug: (...a: unknown[]) => {
-    if (process.env.WCPPM_DEBUG) console.debug("[wcppm]", ...a);
-  },
-};
+// Root logger. Debug is gated by WCPPM_DEBUG; per-instance lines are tagged with
+// the account via root.child(account) below so multi-account logs stay readable.
+const logger = createLogger({ debug: Boolean(process.env.WCPPM_DEBUG) });
 
 /** A running WeChat instance and its per-account state. */
 interface Instance {
   account: string;
   wcpp: WcppConfig;
   heartbeat: HeartbeatConfig;
+  /** Per-instance logger (root.child(account)) — auto-tags every line `[account]`. */
+  log: Logger;
   client: WcppClient;
   send: ReturnType<typeof createSendHandler>;
   fetchMedia: ReturnType<typeof createMediaFetcher>;
   hb?: { stop(): Promise<void> | void } | null;
   wsUp: boolean;
   lastMsgTs?: number;
+  /** Inbound messages received since the last hourly liveness summary. */
+  msgsInWindow: number;
 }
 
 /**
@@ -103,16 +103,27 @@ async function main(): Promise<void> {
   // Build one client per instance. onMessage is wired AFTER the server exists.
   const instances = new Map<string, Instance>();
   for (const inst of cfg.instances) {
-    const client = new WcppClient(inst.wcpp, logger);
+    const log = logger.child(inst.account);
+    const client = new WcppClient(inst.wcpp, log);
     instances.set(inst.account, {
       account: inst.account,
       wcpp: inst.wcpp,
       heartbeat: inst.heartbeat,
+      log,
       client,
       send: createSendHandler(client),
-      fetchMedia: createMediaFetcher(client, db, { dir: mediaDir, log: logger }),
+      fetchMedia: createMediaFetcher(client, db, { dir: mediaDir, log }),
       wsUp: false,
+      msgsInWindow: 0,
     });
+    // One-line per-instance config snapshot at startup so misconfig is obvious
+    // on boot (mode is otherwise only discoverable per-event).
+    log.info(
+      `[cfg] host=${inst.wcpp.host ?? "(webhook-only)"}:${inst.wcpp.port}` +
+        ` hb=${inst.heartbeat.enabled ? "on" : "off"}` +
+        ` maxAge=${inst.wcpp.maxMessageAge ?? 180}s readOnly=${Boolean(inst.wcpp.readOnly)}`,
+    );
+    if (inst.wcpp.readOnly) log.warn("[cfg] read-only mode — outbound sends are disabled");
   }
 
   /** Select the instance for an account. With a single instance, an omitted account resolves to it. */
@@ -194,11 +205,12 @@ async function main(): Promise<void> {
   for (const inst of instances.values()) {
     inst.client.onMessage = (msg) => {
       inst.lastMsgTs = msg.createTime;
+      inst.msgsInWindow++;
       try {
         handleInbound(msg, {
           account: inst.account,
           db,
-          log: logger,
+          log: inst.log,
           broadcast: (frame) => server.broadcast(frame),
           resolveName: (wxid) => inst.client.getContact(wxid)?.NickName?.string || undefined,
           // Persist every new message regardless of age, but only dispatch recent
@@ -206,7 +218,7 @@ async function main(): Promise<void> {
           maxBroadcastAge: inst.wcpp.maxMessageAge ?? 180,
         });
       } catch (err) {
-        logger.error(`handleInbound failed (account=${inst.account}):`, err);
+        inst.log.error("[in] handleInbound failed:", err);
       }
     };
   }
@@ -235,9 +247,9 @@ async function main(): Promise<void> {
     inst.client.connect();
     if (inst.wcpp.host) {
       inst.wsUp = true;
-      logger.info(`WeChat[${inst.account}]: connecting WS push to ${inst.wcpp.host} (passive; no startup Sync)`);
+      inst.log.info(`[ws] connecting WS push to ${inst.wcpp.host} (passive; no startup Sync)`);
     } else {
-      logger.info(`WeChat[${inst.account}]: passive webhook-only mode (no host)`);
+      inst.log.info("[ws] passive webhook-only mode (no host)");
     }
   }
 
@@ -248,7 +260,7 @@ async function main(): Promise<void> {
   // override) heartbeat config. The redis netKey is namespaced by host:port, so two
   // instances sharing an authcode keep independent heartbeat state.
   for (const inst of instances.values()) {
-    inst.hb = startHeartbeatConductor(inst.heartbeat, inst.wcpp, logger);
+    inst.hb = startHeartbeatConductor(inst.heartbeat, inst.wcpp, inst.log);
   }
 
   // Retention: prune inbound_log/media rows older than max(maxMessageAge, 1h).
@@ -269,6 +281,24 @@ async function main(): Promise<void> {
   }, cfg.pruneIntervalMs);
   pruneTimer.unref?.();
 
+  // Inbound liveness: an hourly per-instance INFO pulse mirroring the heartbeat
+  // summary. The receive path is otherwise silent in steady state, so if pushes
+  // stall this surfaces "0 msgs/1h" instead of total silence. INFO not WARN — a
+  // genuinely quiet chat legitimately produces zero messages.
+  const HOUR_MS = 3_600_000;
+  const livenessTimer = setInterval(() => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    for (const inst of instances.values()) {
+      const lastAge = inst.lastMsgTs ? `${nowSec - inst.lastMsgTs}s ago` : "never";
+      inst.log.info(
+        `[in] alive: ${inst.msgsInWindow} msgs/1h last ${lastAge}` +
+          ` ws=${inst.wsUp ? "up" : "down"} subs=${server.subscriberCount(inst.account)}`,
+      );
+      inst.msgsInWindow = 0;
+    }
+  }, HOUR_MS);
+  livenessTimer.unref?.();
+
   // Graceful shutdown.
   let shuttingDown = false;
   const shutdown = async (sig: string) => {
@@ -276,6 +306,7 @@ async function main(): Promise<void> {
     shuttingDown = true;
     logger.info(`received ${sig}, shutting down…`);
     clearInterval(pruneTimer);
+    clearInterval(livenessTimer);
     for (const inst of instances.values()) {
       try {
         inst.client.disconnect();

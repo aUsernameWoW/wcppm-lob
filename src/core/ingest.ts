@@ -42,10 +42,16 @@ export function handleInbound(msg: NormalizedMessage, deps: IngestDeps): boolean
   // Per-message trace (debug-only; the steady-state inbound path is otherwise
   // silent at info). Logged before dedup so every message that reaches the
   // pipeline leaves a footprint regardless of outcome.
+  // Names aren't resolved yet at this point (that happens below); the broadcast
+  // line carries the human-readable names. Here we add a flattened, truncated
+  // text preview so the trace shows WHAT arrived, not just that something did.
+  const preview = frame.text ? ` text=${JSON.stringify(frame.text.replace(/\s+/g, " ").slice(0, 48))}` : "";
   log.debug(
     `[in] recv id=${frame.id} ${frame.chatType} from=${frame.from.wxid}` +
       (frame.chatType === "group" ? ` chat=${frame.chat.id}` : "") +
-      (frame.media ? ` media=${frame.media.kind}` : ""),
+      (frame.mentionedMe ? " @me" : "") +
+      (frame.media ? ` media=${frame.media.kind}` : "") +
+      preview,
   );
 
   // Fill names from the contact cache only where buildFrame didn't already
@@ -127,6 +133,9 @@ export function handleInbound(msg: NormalizedMessage, deps: IngestDeps): boolean
   }
 
   broadcast(frame);
-  log.debug(`[in] broadcast id=${frame.id}`);
+  log.debug(
+    `[in] broadcast id=${frame.id} ${frame.chatType} from=${frame.from.name ?? frame.from.wxid}` +
+      (frame.chatType === "group" ? ` chat=${frame.chat.name ?? frame.chat.id}` : ""),
+  );
   return true;
 }

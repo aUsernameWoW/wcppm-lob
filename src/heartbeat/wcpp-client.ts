@@ -4,12 +4,15 @@ import type { HeartbeatClient, HeartbeatResult } from "./conductor.js";
 import type { Logger } from "../shared/logger.js";
 
 /** Pure classifier: success iff Success===true AND Data.BaseResponse.ret===0.
- *  NOTE: Selector and NextTime are intentionally ignored (ban-safety — see plan constraints). */
+ *  NextTime is intentionally ignored. Selector is surfaced for LOGGING ONLY —
+ *  it is NEVER acted on (acting on it would trigger a Sync = ban risk; see CLAUDE.md). */
 export function classifyHeartbeat(json: unknown): HeartbeatResult {
   const j = json as any;
   const ret = j?.Data?.BaseResponse?.ret;
   const success = j?.Success === true && ret === 0;
-  return { success, failOfTimeout: false };
+  const result: HeartbeatResult = { success, failOfTimeout: false };
+  if (typeof j?.Data?.Selector === "number") result.selector = j.Data.Selector;
+  return result;
 }
 
 export class WcppHeartbeatClient implements HeartbeatClient {
@@ -35,6 +38,7 @@ export class WcppHeartbeatClient implements HeartbeatClient {
 
   async sendHeartbeat(): Promise<HeartbeatResult> {
     const signal = AbortSignal.timeout(this.timeoutMs);
+    const startedAt = Date.now();
     try {
       const res = await this.fetchFn(this.url("/api/Login/HeartBeat"), {
         method: "POST",
@@ -43,11 +47,14 @@ export class WcppHeartbeatClient implements HeartbeatClient {
         dispatcher: this.dispatcher,
         signal,
       });
-      return classifyHeartbeat(await (res as any).json());
+      const result = classifyHeartbeat(await (res as any).json());
+      result.latencyMs = Date.now() - startedAt;
+      return result;
     } catch (e: any) {
       const timeout = e?.name === "AbortError" || e?.name === "TimeoutError";
-      this.opts.log.warn(`[hb] heartbeat request error: ${e?.message ?? e}`);
-      return { success: false, failOfTimeout: timeout };
+      const latencyMs = Date.now() - startedAt;
+      this.opts.log.warn(`[hb] heartbeat request error: ${e?.message ?? e} (after ${latencyMs}ms)`);
+      return { success: false, failOfTimeout: timeout, latencyMs };
     }
   }
 

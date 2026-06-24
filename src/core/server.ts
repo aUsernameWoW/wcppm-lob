@@ -87,8 +87,8 @@ export interface BridgeServer {
    * Returns the bound port number (useful when port=0 is passed for ephemeral port).
    */
   listen(port: number, host?: string): Promise<number>;
-  /** Number of currently-connected WS subscribers. */
-  subscriberCount(): number;
+  /** Number of currently-connected WS subscribers (optionally scoped to one account). */
+  subscriberCount(account?: string): number;
   /** Stop the server and close all sockets. */
   close(): Promise<void>;
 }
@@ -112,6 +112,13 @@ export function createBridgeServer(deps: ServerDeps): BridgeServer {
 
   // Map from WebSocket instance to its metadata (account).
   const subscribers = new Map<WebSocket, SubscriberMeta>();
+
+  /** Count subscribers, optionally scoped to one account. */
+  const countFor = (account: string): number => {
+    let n = 0;
+    for (const meta of subscribers.values()) if (meta.account === account) n++;
+    return n;
+  };
 
   // ---------------------------------------------------------------------------
   // Auth helpers
@@ -338,6 +345,9 @@ export function createBridgeServer(deps: ServerDeps): BridgeServer {
     const sinceTs = sinceParam ? Number(sinceParam) : undefined;
 
     subscribers.set(ws, { account });
+    // First subscriber for this account → delivery is live again. Worth INFO:
+    // the inverse (zero subscribers) means messages are stored but undelivered.
+    if (countFor(account) === 1) log.info(`[sub] subscriber online for account=${account} (delivery live)`);
     log.debug(`[sub] connected account=${account} total=${subscribers.size}`);
 
     // Defer the initial ready + replay sends so they happen after the
@@ -386,6 +396,11 @@ export function createBridgeServer(deps: ServerDeps): BridgeServer {
     // 4. Clean up on disconnect
     ws.on("close", () => {
       subscribers.delete(ws);
+      // Last subscriber gone → degraded: inbound is still stored, but nobody is
+      // receiving it (the agent won't reply until a subscriber reconnects).
+      if (countFor(account) === 0) {
+        log.warn(`[sub] no subscribers for account=${account} — messages will be stored, not delivered`);
+      }
       log.debug(`[sub] disconnected account=${account} total=${subscribers.size}`);
     });
   });
@@ -420,8 +435,8 @@ export function createBridgeServer(deps: ServerDeps): BridgeServer {
       });
     },
 
-    subscriberCount(): number {
-      return subscribers.size;
+    subscriberCount(account?: string): number {
+      return account === undefined ? subscribers.size : countFor(account);
     },
 
     close(): Promise<void> {

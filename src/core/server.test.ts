@@ -371,6 +371,52 @@ test("broadcast: a frame is delivered only to subscribers whose account matches 
 });
 
 // ---------------------------------------------------------------------------
+// Test 5b: subscriberCount is per-account; first/last subscriber log transitions
+// ---------------------------------------------------------------------------
+
+test("subscriberCount(account) is per-account and logs online/offline transitions", async () => {
+  const lines: Array<{ level: string; msg: string }> = [];
+  const recLog: Logger = {
+    info: (...a) => lines.push({ level: "info", msg: a.join(" ") }),
+    warn: (...a) => lines.push({ level: "warn", msg: a.join(" ") }),
+    error: () => {},
+    debug: () => {},
+  };
+  const server = createBridgeServer(makeDeps({ log: recLog }));
+  const port = await server.listen(0);
+  const poll = async (cond: () => boolean) => {
+    for (let i = 0; i < 100 && !cond(); i++) await new Promise((r) => setTimeout(r, 5));
+    assert.ok(cond(), "condition not met in time");
+  };
+  try {
+    const a1 = await connect(port, { token: "test-token", account: "acctA" });
+    await a1.nextMessage();
+    const b1 = await connect(port, { token: "test-token", account: "acctB" });
+    await b1.nextMessage();
+
+    assert.equal(server.subscriberCount("acctA"), 1);
+    assert.equal(server.subscriberCount("acctB"), 1);
+    assert.equal(server.subscriberCount(), 2); // global, no arg
+    assert.ok(
+      lines.some((l) => l.level === "info" && l.msg.includes("subscriber online for account=acctA")),
+      "expected an INFO online transition for acctA",
+    );
+
+    a1.close();
+    await poll(() => server.subscriberCount("acctA") === 0);
+    assert.equal(server.subscriberCount("acctB"), 1, "acctB unaffected by acctA dropping");
+    assert.ok(
+      lines.some((l) => l.level === "warn" && l.msg.includes("no subscribers for account=acctA")),
+      "expected a WARN offline transition for acctA",
+    );
+
+    b1.close();
+  } finally {
+    await server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Test 6: POST /send — valid token → calls deps.send, returns result; wrong token → 401
 // ---------------------------------------------------------------------------
 
