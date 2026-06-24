@@ -13,7 +13,7 @@ Why split: OpenClaw restarting no longer tears down the WeChat session; the WeCh
 
 ## Status / Orientation (read first)
 
-- The standalone-middleware refactor (phases **P0→P2**) lives on branch **`feat/standalone-middleware`** and is **complete but NOT yet deployed**. `main` still carries the older in-process plugin.
+- The standalone-middleware refactor (phases **P0→P3**) has **landed on `main`** and is the current, deployed architecture: `main` **is** the two-part split documented here (standalone middleware + thin adapter) — the older in-process plugin is gone. Subsequent work (multi-instance, structured logging, Mars heartbeat conductor, inbound media, the outbound humanization layer) has merged on top.
 - **Design spec:** `docs/superpowers/specs/2026-06-06-wcppm-standalone-middleware-design.md` (the source of truth for the architecture and the decisions behind it).
 - **Deploy / go-live:** `deploy/README.md`.
 - **Deep historical lore** (webhook signature debugging, Sync mechanics, the full MsgType table, past incidents) lives in **`CLAUDE.md.old`** — consult it when working on the WeChat protocol details inside `src/core/client.ts`.
