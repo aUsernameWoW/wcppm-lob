@@ -94,6 +94,44 @@ test("resolveConfig: per-instance webhook listeners are NOT started (shared list
   assert.notEqual(cfg.instances[0].wcpp.webhookEnabled, true);
 });
 
+test("resolveConfig: each instance inherits the global heartbeat config when it has no override", () => {
+  const cfg = resolveConfig({
+    bridgeToken: "t",
+    heartbeat: { enabled: true, redisDb: 7, maxPerHour: 20 },
+    instances: [
+      { account: "a", host: "h", authcode: "A" },
+      { account: "b", host: "h", port: 8063, authcode: "B" },
+    ],
+  });
+  for (const inst of cfg.instances) {
+    assert.equal(inst.heartbeat.enabled, true);
+    assert.equal(inst.heartbeat.redisDb, 7);
+    assert.equal(inst.heartbeat.maxPerHour, 20);
+  }
+  // The top-level heartbeat remains the global/base config.
+  assert.equal(cfg.heartbeat.redisDb, 7);
+});
+
+test("resolveConfig: a per-instance heartbeat override merges over the global, others inherit", () => {
+  const cfg = resolveConfig({
+    bridgeToken: "t",
+    heartbeat: { enabled: true, redisUrl: "redis://global:6379", redisDb: 0, maxPerHour: 30 },
+    instances: [
+      { account: "a", host: "h", authcode: "A" },
+      { account: "b", host: "h", port: 8063, authcode: "B", heartbeat: { enabled: false, maxPerHour: 10 } },
+    ],
+  });
+
+  const a = cfg.instances[0].heartbeat;
+  const b = cfg.instances[1].heartbeat;
+
+  assert.equal(a.enabled, true); // a uses the global
+  assert.equal(b.enabled, false); // b overrides
+  assert.equal(b.maxPerHour, 10); // b overrides
+  assert.equal(b.redisUrl, "redis://global:6379"); // b inherits non-overridden fields
+  assert.equal(b.redisDb, 0); // inherited
+});
+
 test("resolveConfig: a missing bridgeToken is rejected (it guards the downstream interface)", () => {
   assert.throws(() => resolveConfig({ host: "h" }), /bridgeToken/);
 });

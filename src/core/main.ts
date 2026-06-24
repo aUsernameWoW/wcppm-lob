@@ -29,6 +29,7 @@ import { createSendHandler, createMediaFetcher } from "./wiring.js";
 import { createWebhookListener, type WebhookSink } from "./webhook-listener.js";
 import { handleInbound } from "./ingest.js";
 import { startHeartbeatConductor } from "../heartbeat/runtime.js";
+import type { HeartbeatConfig } from "../heartbeat/runtime.js";
 import type { Logger } from "../shared/logger.js";
 import type { Frame } from "../shared/frame.js";
 
@@ -45,6 +46,7 @@ const logger: Logger = {
 interface Instance {
   account: string;
   wcpp: WcppConfig;
+  heartbeat: HeartbeatConfig;
   client: WcppClient;
   send: ReturnType<typeof createSendHandler>;
   fetchMedia: ReturnType<typeof createMediaFetcher>;
@@ -105,6 +107,7 @@ async function main(): Promise<void> {
     instances.set(inst.account, {
       account: inst.account,
       wcpp: inst.wcpp,
+      heartbeat: inst.heartbeat,
       client,
       send: createSendHandler(client),
       fetchMedia: createMediaFetcher(client, db, { dir: mediaDir, log: logger }),
@@ -241,10 +244,11 @@ async function main(): Promise<void> {
   const port = await server.listen(cfg.bridgePort, cfg.bridgeHost);
   logger.info(`bridge up: ws://${cfg.bridgeHost}:${port}/subscribe · http://${cfg.bridgeHost}:${port}`);
 
-  // One heartbeat conductor per instance (default-off; netKey is namespaced by
-  // authcode so per-account heartbeat state never collides).
+  // One heartbeat conductor per instance, each with its own (global + per-instance
+  // override) heartbeat config. The redis netKey is namespaced by host:port, so two
+  // instances sharing an authcode keep independent heartbeat state.
   for (const inst of instances.values()) {
-    inst.hb = startHeartbeatConductor(cfg.heartbeat, inst.wcpp, logger);
+    inst.hb = startHeartbeatConductor(inst.heartbeat, inst.wcpp, logger);
   }
 
   // Retention: prune inbound_log/media rows older than max(maxMessageAge, 1h).

@@ -35,6 +35,11 @@ export interface RawInstanceConfig {
   maxMessageAge?: number;
   /** Randomized CDN image-download retry policy (all fields optional; see ImageRetryConfig). */
   imageRetry?: Partial<ImageRetryConfig>;
+  /**
+   * Heartbeat conductor config. At the TOP level this is the global default; inside
+   * an `instances[]` entry it OVERRIDES (field-by-field) the global for that instance.
+   */
+  heartbeat?: Partial<HeartbeatConfig>;
 }
 
 /** Loose shape of the on-disk config file. */
@@ -65,14 +70,14 @@ export interface RawConfig extends RawInstanceConfig {
    * agent's image tool rejects the path. Default: <tmp>/wcppm-lob-media.
    */
   mediaDir?: string;
-  // Heartbeat conductor (middleware-only, not in openclaw.plugin.json schema)
-  heartbeat?: Partial<HeartbeatConfig>;
 }
 
-/** A single resolved WeChat instance: its account label + the client config. */
+/** A single resolved WeChat instance: its account label, client config, heartbeat. */
 export interface InstanceConfig {
   account: string;
   wcpp: WcppConfig;
+  /** Per-instance heartbeat config (global heartbeat with this instance's overrides applied). */
+  heartbeat: HeartbeatConfig;
 }
 
 /** The shared webhook listener: one port, signature-verified, routed by Wxid. */
@@ -122,10 +127,16 @@ export function resolveImageRetryConfig(raw?: Partial<ImageRetryConfig>): ImageR
 
 /**
  * Resolve one raw instance entry into an InstanceConfig. `index` is only used for
- * error messages. The webhook* fields are intentionally NOT threaded here: the
- * shared listener owns the webhook port, so each instance keeps webhookEnabled off.
+ * error messages. `globalHeartbeat` is the top-level heartbeat block that this
+ * instance's own `heartbeat` overrides field-by-field. The webhook* fields are
+ * intentionally NOT threaded here: the shared listener owns the webhook port, so
+ * each instance keeps webhookEnabled off.
  */
-function resolveInstance(raw: RawInstanceConfig, index: number): InstanceConfig {
+function resolveInstance(
+  raw: RawInstanceConfig,
+  index: number,
+  globalHeartbeat: Partial<HeartbeatConfig> | undefined,
+): InstanceConfig {
   const account = (raw.account || "").trim();
   if (!account) {
     throw new Error(`config: instances[${index}] is missing an "account" label (the stable id used across the bridge)`);
@@ -145,7 +156,9 @@ function resolveInstance(raw: RawInstanceConfig, index: number): InstanceConfig 
     maxMessageAge: raw.maxMessageAge,
     imageRetry: resolveImageRetryConfig(raw.imageRetry),
   };
-  return { account, wcpp };
+  // Per-instance heartbeat = global defaults with this instance's overrides on top.
+  const heartbeat = resolveHeartbeatConfig({ ...(globalHeartbeat ?? {}), ...(raw.heartbeat ?? {}) });
+  return { account, wcpp, heartbeat };
 }
 
 export function resolveConfig(raw: RawConfig): MiddlewareConfig {
@@ -159,7 +172,7 @@ export function resolveConfig(raw: RawConfig): MiddlewareConfig {
   const rawInstances: RawInstanceConfig[] =
     raw.instances && raw.instances.length > 0 ? raw.instances : [{ ...raw, account: raw.account || "default" }];
 
-  const instances = rawInstances.map(resolveInstance);
+  const instances = rawInstances.map((ri, i) => resolveInstance(ri, i, raw.heartbeat));
 
   const seen = new Set<string>();
   for (const inst of instances) {
