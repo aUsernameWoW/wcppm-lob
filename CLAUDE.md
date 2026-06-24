@@ -49,14 +49,15 @@ remote WCPPM (Tailscale)  ──WS push / webhook──►  [ MIDDLEWARE: own pr
 - `db.ts` — SQLite via built-in `node:sqlite` (no native dep). Two tables: `inbound_log` (dedup by stable id **and** replay/ack log) + `contacts` (name cache). `openDb` auto-creates the parent directory.
 - `frame.ts` (`buildFrame`) + `shared/frame.ts` (the `Frame` type) — map a `NormalizedMessage` to the downstream wire `Frame`.
 - `ingest.ts` (`handleInbound`) — per inbound message: build frame → record/dedup (persists **every** new message to SQLite **regardless of age**) → enrich names → broadcast **only if recent** (`maxBroadcastAge`). Dependency-injected, unit-tested apart from the live client/server.
-- `server.ts` (`createBridgeServer`) — the downstream interface: `WS /subscribe` (bearer auth, sends `ready` then replays undelivered, accepts `{type:ack,id}`) and HTTP `POST /send` / `POST /forceSync` / `GET /healthz` (`/healthz` is unauthenticated by design).
+- `server.ts` (`createBridgeServer`) — the downstream interface: `WS /subscribe` (bearer auth, sends `ready` then replays undelivered, accepts `{type:ack,id}`) and HTTP `POST /send` (text **and** media) / `POST /forceSync` / `POST /media` (lazy inbound fetch) / `GET /healthz` (`/healthz` is unauthenticated by design).
+- `outbound-pacer.ts` (`createOutboundPacer`) — humanizing pacer wrapping the per-account send handler at the `/send` choke point (see the 2026-06-24 outbound-humanization note under Account Safety). **Default-off = transparent pass-through.** Pure-logic + injected clock/sleep/RNG, unit-tested.
 - `config.ts` (`resolveConfig`) — middleware config + defaults; splits raw config into the WeChat-client config and the bridge config.
 - `wiring.ts` / `main.ts` — `main.ts` is the entrypoint that wires config → SQLite → `WcppClient` → bridge server and handles signals/pruning.
 
 **Adapter — `src/adapters/openclaw/`**:
 - `bridge-client.ts` (`createBridgeClient`) — the link to the middleware: WS subscribe (auto-acks) + `send`/`forceSync` over HTTP. Plain WS+HTTP, no OpenClaw SDK, so it's testable against the real `core/server.ts`.
-- `channel.ts` — the OpenClaw channel plugin (id `wechatpadpro`): gateway lifecycle, config adapter, DM gate; connects via `bridge-client`, maps inbound `Frame` → the dispatch shape.
-- `dispatch.ts` — inbound → OpenClaw agent reply pipeline. **Transport-agnostic** (consumes a clean `WcppInboundMessage` + a `send` api), so it did not change in the cutover.
+- `channel.ts` — the OpenClaw channel plugin (id `wechatpadpro`): gateway lifecycle, config adapter, DM gate; connects via `bridge-client`, maps inbound `Frame` → the dispatch shape. Also hosts the optional **inbound coalescer** (B): when `messages.inbound.debounceMs` > 0, a rapid same-sender burst is merged into one agent dispatch (`createInboundDebouncer`); 0 (default) = one dispatch per message.
+- `dispatch.ts` — inbound → OpenClaw agent reply pipeline. **Transport-agnostic** (consumes a clean `WcppInboundMessage` + a `send` api), so it did not change in the cutover. Passes **`humanDelay`** (C, `resolveHumanDelayConfig`) into the reply dispatcher to pace multi-block answers; `undefined`/unconfigured = no delay.
 - `shims/openclaw/*` — typecheck-only shims for `openclaw/plugin-sdk/*` (real impls provided by OpenClaw at runtime; mapped via tsconfig `paths`).
 
 **Data flow:** WeChat → middleware (dedup/normalize/persist) → WS broadcast (Frame) → adapter → DM gate + agent → reply → `POST /send` → middleware → WeChat.
@@ -73,6 +74,12 @@ remote WCPPM (Tailscale)  ──WS push / webhook──►  [ MIDDLEWARE: own pr
 - Prefer passive receive paths; avoid unnecessary active operations (account nurturing).
 
 **2026-06-23 follow-up:** the **heartbeat surface** is now actively driven by the conductor in `src/heartbeat/` per spec `docs/superpowers/specs/2026-06-23-mars-heartbeat-conductor-design.md`. The "fully passive / never touch `/Login/*`" rule **no longer applies to `/Login/HeartBeat`** specifically — the conductor calls it on the Mars smart-heartbeat cadence (210–600 s adaptive, jittered). `/Login/Newinit`, `StartAutoSync`, and active `/Msg/Sync` remain **forbidden** (still ban triggers). The conductor **reads but never acts on** the heartbeat `Selector` field (no Sync triggered).
+
+**2026-06-24 follow-up — outbound humanization (camouflage + rapid-outbound cap):** the reply path no longer sends instantly/24-7/every-message. Two layers, **all default-off / no-op until configured** (so steady-state behaviour is unchanged), tuned to resemble a real Mac client *and* to cap the rapid-outbound rate that caused the 2026-04-12 ban:
+- **Middleware pacer** (`core/outbound-pacer.ts`, config `outboundPacer{}` in `config.example.json`, global + per-instance like heartbeat) — one pacer per account at the `/send` choke point, so it protects **every** consumer (adapter, operator forceSync, future bots): **A** a few-second length-scaled+jittered "read/compose" delay before the first send into an idle conversation (kills sub-second 秒回); **E** per-conversation min-gap + a **per-account** sliding-window ceiling (sends/min·/hour) that stretches under load, with a per-conversation queue-depth cap that **drops + loud-warns** as the hard backstop; **D** tz-aware quiet-hours that multiply the delay and lower the night ceiling (slows, does **not** defer-to-morning).
+- **Adapter (OpenClaw SDK, configured in `openclaw.json`)** — **C** inter-block `humanDelay` (`agents.defaults.humanDelay`) paces multi-block answers; **B** inbound coalescing (`messages.inbound.debounceMs` / `byChannel.wechatpadpro`) merges a rapid same-sender burst into one agent dispatch (more human, fewer tokens, fewer replies).
+- **`/send` contract change — ONLY when the pacer is enabled:** `/send` then **acks on enqueue** — the returned `ok:true` means "accepted into the pacer", **not** "delivered". A real send failure is logged middleware-side (`[pace]`), not surfaced synchronously; the adapter's "returned not-ok" check now only catches enqueue rejection (queue-cap drop). The queue is in-memory: a restart inside the seconds-scale delay window **drops** not-yet-sent replies (inbound is still persisted in SQLite → bounded, accepted loss).
+- **Relation to the age gate:** orthogonal. `maxBroadcastAge` decides *whether* to reply (suppresses replies to old messages); the pacer only shapes the *timing* of replies that do happen. B/C and the pacer's min-gap both reduce/space outbound — bounded so they don't stack into sluggishness; turn them on incrementally and watch `[cfg] pacer=…` / `inboundDebounce=…` / `[pace]` (debug) lines.
 
 ## Scope Boundary (do not expand)
 
@@ -92,5 +99,5 @@ All `/Login/*`, `/User/*`, `/Admin/*` operations are the **WCPPM server operator
 
 ## Current Limitations
 
-- Outbound **media** is not yet supported over the bridge (middleware `POST /send` is text-only — add a `/sendMedia` endpoint to enable it).
+- Outbound **media** over the bridge supports **image / video / file** (an `OutboundMedia` descriptor on `POST /send`; the middleware reads the url, infers the kind, dispatches via the matching MAX endpoint). Outbound **voice is NOT supported** yet (needs a SILK encoder).
 - `WcppClient` (in `client.ts`) has grown large and is not yet split by responsibility; `login()` is now dead-ish (unused).

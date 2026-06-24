@@ -47,5 +47,29 @@
     "hardFloorMs": 60000,
     "maxPerHour": 30,
     "maxConsecutiveFailures": 4
-  }
+  },
+
+  "_outboundPacer_comment": "Outbound humanizing pacer (default-OFF = transparent pass-through, instant sends). Enable to make reply timing resemble a real Mac client and to cap outbound rate (the 2026-04-12 ban vector). Sits at the /send choke point, per-account; global default + per-instance override like heartbeat. WHEN ENABLED the /send contract changes to ack-on-enqueue (ok=true means 'queued', not 'delivered'); the in-memory queue means a restart in the delay window drops not-yet-sent replies (inbound is still persisted). firstReply*=A read/compose delay before the first send into an idle conversation (length-scaled+jittered, capped at a few seconds); minGapMs+ceiling*=E pacing/burst cap (per-conversation min-gap + per-account sliding-window ceiling; maxQueueDepth drops+warns as the hard backstop); quietHours=D nightly slow-down. NOTE: the adapter-side knobs (B/C) live in openclaw.json, NOT here — see below.",
+  "outboundPacer": {
+    "enabled": false,
+    "firstReplyBaseMs": 1200,
+    "firstReplyPerCharMs": 12,
+    "firstReplyMaxMs": 5000,
+    "jitterPct": 0.3,
+    "minGapMs": 1000,
+    "idleResetMs": 8000,
+    "hardFloorMs": 500,
+    "maxQueueDepth": 30,
+    "ceilingPerMinute": 6,
+    "ceilingPerHour": 90,
+    "quietHours": {
+      "enabled": true,
+      "timezone": "Asia/Shanghai",
+      "ranges": ["23:30-07:30"],
+      "delayMultiplier": 4,
+      "ceilingPerMinute": 2
+    }
+  },
+
+  "_adapter_humanization_comment": "The other two humanization knobs live on the OPENCLAW side (openclaw.json), not in this middleware config, because they ride OpenClaw's reply pipeline: (C) inter-block reply pacing → agents.defaults.humanDelay { mode:'natural', minMs, maxMs }; (B) inbound coalescing of a rapid same-sender burst into one agent dispatch → messages.inbound.debounceMs (or messages.inbound.byChannel.wechatpadpro). Both default to no-op."
 }
