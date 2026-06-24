@@ -34,6 +34,16 @@ export class RealClock implements Clock {
   }
 }
 
+/**
+ * Derive the heartbeat netDetail (the second half of the redis netKey). Namespaced
+ * by host:port so two instances that share an authcode (same WCPPM token across
+ * servers) still get DISTINCT heartbeat-state keys — otherwise their adaptive
+ * interval state would clobber each other in redis.
+ */
+export function heartbeatNetDetail(wcpp: { host?: string; port: number; proxy?: string }): string {
+  return `egress:${wcpp.proxy ? "proxy" : "direct"}@${wcpp.host ?? ""}:${wcpp.port}`;
+}
+
 /** Wire and start a conductor; returns a handle, or null if disabled/unconfigured. */
 export function startHeartbeatConductor(
   cfg: HeartbeatConfig,
@@ -46,7 +56,7 @@ export function startHeartbeatConductor(
   const baseUrl = `http://${wcpp.host}:${wcpp.port}`;
   const store = new RedisHeartbeatStore({ url: cfg.redisUrl, db: cfg.redisDb });
   const client = new WcppHeartbeatClient({ baseUrl, authcode: wcpp.authcode, proxy: wcpp.proxy, log });
-  const netDetail = `egress:${wcpp.proxy ? "proxy" : "direct"}`;
+  const netDetail = heartbeatNetDetail(wcpp);
   const conductor = new HeartbeatConductor(
     {
       authcode: wcpp.authcode, netDetail,

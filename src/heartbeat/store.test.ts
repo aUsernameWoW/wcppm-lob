@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { RedisHeartbeatStore, netKey, type RedisLike } from "./store.js";
 import { freshNetInfo } from "./types.js";
+import { heartbeatNetDetail } from "./runtime.js";
 
 function fakeRedis(): RedisLike & { data: Map<string, string> } {
   const data = new Map<string, string>();
@@ -15,6 +16,18 @@ function fakeRedis(): RedisLike & { data: Map<string, string> } {
 
 test("netKey is namespaced by prefix, authcode, netDetail", () => {
   assert.equal(netKey("hbconductor:", "AC1", "egress:direct"), "hbconductor:AC1:egress:direct");
+});
+
+test("heartbeatNetDetail: includes host:port so a shared authcode still yields distinct keys", () => {
+  const a = heartbeatNetDetail({ host: "127.0.0.1", port: 8062 });
+  const b = heartbeatNetDetail({ host: "127.0.0.1", port: 8063 });
+  assert.equal(a, "egress:direct@127.0.0.1:8062");
+  assert.notEqual(a, b); // same authcode + same host, different port → different netKey
+
+  // Two instances sharing an authcode no longer collide in redis.
+  assert.notEqual(netKey("hbconductor:", "SHARED", a), netKey("hbconductor:", "SHARED", b));
+
+  assert.equal(heartbeatNetDetail({ host: "h", port: 9, proxy: "http://p" }), "egress:proxy@h:9");
 });
 
 test("save then load round-trips NetHeartbeatInfo", async () => {
