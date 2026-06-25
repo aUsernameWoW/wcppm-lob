@@ -186,7 +186,7 @@ export interface SyncMessage {
   Content: { string: string };
   Status?: number;
   ImgStatus?: number;
-  ImgBuf?: { iLen: number };
+  ImgBuf?: { iLen: number; buffer?: string };
   CreateTime: number;
   MsgSource?: string;
   PushContent?: string;
@@ -504,6 +504,23 @@ export function extractDownloadBuffer(json: unknown): Buffer | null {
     return null;
   };
   return walk(json);
+}
+
+/**
+ * Pull the INLINE SILK bytes off a voice message, if present. WeChat ships a
+ * bufid=0 voice's audio inline on the push itself — on WS as `ImgBuf.buffer`
+ * (base64), on the webhook as `voice.base64` (normalized into `ImgBuf.buffer`
+ * at ingest). Returns the decoded bytes, or null when no usable inline payload
+ * is present (so the caller falls back to the download endpoint).
+ */
+export function extractInlineVoiceBuffer(message: unknown): Buffer | null {
+  if (message === null || typeof message !== "object") return null;
+  const imgBuf = (message as { ImgBuf?: unknown }).ImgBuf;
+  if (imgBuf === null || typeof imgBuf !== "object") return null;
+  const b64 = (imgBuf as { buffer?: unknown }).buffer;
+  if (typeof b64 !== "string" || b64.length < 32 || !/^[A-Za-z0-9+/=\r\n]+$/.test(b64)) return null;
+  const bytes = Buffer.from(b64.replace(/\s+/g, ""), "base64");
+  return bytes.length > 0 ? bytes : null;
 }
 
 /**
@@ -1605,19 +1622,27 @@ export class WcppClient {
 
     const syncMessages: SyncMessage[] = messages
       .filter(msg => !msg.isSelf)
-      .map(msg => ({
-        MsgId: msg.msgId,
-        NewMsgId: msg.newMsgId,
-        MsgType: msg.msgType,
-        FromUserName: { string: msg.fromUser },
-        ToUserName: { string: msg.toUser },
-        // Prefer rawContent (full XML for non-text types) over text
-        Content: { string: msg.rawContent || msg.text || "" },
-        CreateTime: msg.createTime,
-        PushContent: msg.pushContent || "",
-        MsgSource: "",  // Not available in webhook format
-        MsgSeq: 0,
-      }));
+      .map(msg => {
+        const sync: SyncMessage = {
+          MsgId: msg.msgId,
+          NewMsgId: msg.newMsgId,
+          MsgType: msg.msgType,
+          FromUserName: { string: msg.fromUser },
+          ToUserName: { string: msg.toUser },
+          // Prefer rawContent (full XML for non-text types) over text
+          Content: { string: msg.rawContent || msg.text || "" },
+          CreateTime: msg.createTime,
+          PushContent: msg.pushContent || "",
+          MsgSource: "",  // Not available in webhook format
+          MsgSeq: 0,
+        };
+        // A webhook voice ships its SILK inline under `voice.base64` — surface it
+        // on ImgBuf.buffer so it shares the WS inline-voice path (extractInline-
+        // VoiceBuffer / the descriptor) and serves without DownloadVoice.
+        const voiceB64 = msg.voice && typeof msg.voice.base64 === "string" ? msg.voice.base64 : undefined;
+        if (voiceB64) sync.ImgBuf = { buffer: voiceB64, iLen: voiceB64.length };
+        return sync;
+      });
 
     if (syncMessages.length === 0) return;
 
@@ -2115,6 +2140,21 @@ export class WcppClient {
     if (!info) {
       throw new Error("WCPP: message is not a voice message (MsgType 34)");
     }
+
+    // bufid=0 voices ship their SILK INLINE — on WS as `ImgBuf.buffer`, on the
+    // webhook as `voice.base64` (normalized into ImgBuf.buffer at ingest). The
+    // `/Tools/DownloadVoice` endpoint has nothing to serve for them and returns
+    // empty (the "no bytes" failure). Prefer the inline bytes; only fall back to
+    // the endpoint when none are present (e.g. a future bufid≠0 server variant).
+    const inline = extractInlineVoiceBuffer(message);
+    if (inline) {
+      if (outputPath) {
+        const fs = await import("fs/promises");
+        await fs.writeFile(outputPath, inline);
+      }
+      return { contentType: "audio/silk", buffer: inline, outputPath, responseJson: null };
+    }
+
     if (!info.bufid || !info.fromUserName || info.length == null || info.msgId == null) {
       throw new Error("WCPP: voice message is missing required download fields (bufid/fromUserName/length/msgId)");
     }

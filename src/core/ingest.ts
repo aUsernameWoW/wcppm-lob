@@ -105,8 +105,12 @@ export function handleInbound(msg: NormalizedMessage, deps: IngestDeps): boolean
     // Store a SyncMessage-shaped descriptor: extractImageMessageInfo then reads
     // the small int32 `MsgId` (the download API rejects the 64-bit NewMsgId that
     // NormalizedMessage.msgId resolves to). The raw MsgId lives on msg.raw.
-    const raw = msg.raw as { MsgId?: number } | null | undefined;
+    const raw = msg.raw as { MsgId?: number; ImgBuf?: { buffer?: string; iLen?: number } } | null | undefined;
     const rawMsgId = raw && typeof raw === "object" ? raw.MsgId : undefined;
+    // A bufid=0 voice carries its SILK inline on `ImgBuf.buffer` (DownloadVoice
+    // returns nothing for it). Persist those bytes so the lazy /media fetch can
+    // serve them offline instead of hitting the empty endpoint.
+    const inlineImgBuf = raw && typeof raw === "object" && raw.ImgBuf?.buffer ? raw.ImgBuf : undefined;
     db.recordMedia({
       id: frame.id,
       account,
@@ -116,6 +120,7 @@ export function handleInbound(msg: NormalizedMessage, deps: IngestDeps): boolean
         MsgType: msg.msgType,
         FromUserName: { string: msg.fromUser },
         Content: { string: msg.content },
+        ...(inlineImgBuf ? { ImgBuf: { buffer: inlineImgBuf.buffer, iLen: inlineImgBuf.iLen } } : {}),
       }),
       ts: frame.ts,
     });

@@ -61,6 +61,29 @@ test("handleInbound: a new message is recorded and broadcast (returns true)", ()
   db.close();
 });
 
+test("handleInbound: a voice frame persists the inline ImgBuf SILK in its media descriptor", () => {
+  const db = openDb(":memory:");
+  const silk = Buffer.from("#!SILK_V3 fake silk payload of sufficient length to be real", "utf8");
+  const b64 = silk.toString("base64");
+
+  handleInbound(
+    baseMsg({
+      msgId: "v1",
+      msgType: 34,
+      content: '<msg><voicemsg bufid="0" length="3793" voicelength="2220" /></msg>',
+      // raw mirrors the WS AddMsg: the inline SILK rides on ImgBuf.buffer.
+      raw: { MsgId: 2041297784, ImgBuf: { buffer: b64, iLen: silk.length } },
+    }),
+    { account: "default", db, broadcast: () => {}, log: noopLogger },
+  );
+
+  const row = db.getMedia("default", "v1");
+  assert.ok(row, "a voice message must record a media descriptor");
+  const descriptor = JSON.parse(row!.descriptor);
+  assert.equal(descriptor.ImgBuf?.buffer, b64, "descriptor must retain the inline SILK for offline serving");
+  db.close();
+});
+
 test("handleInbound: a duplicate message is NOT broadcast (returns false)", () => {
   const db = openDb(":memory:");
   const sent: Frame[] = [];

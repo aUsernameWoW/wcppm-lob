@@ -445,6 +445,64 @@ function fileClient(): WcppClient {
   return new WcppClient({ host: "", port: 8062, authcode: "x" } as WcppConfig, makeLogger());
 }
 
+// ── inbound voice: inline SILK (bufid=0) served without DownloadVoice ───────
+
+// A bufid=0 voice ships its SILK inline (WS ImgBuf.buffer / webhook voice.base64);
+// the DownloadVoice endpoint has nothing for it. The voicemsg XML mirrors a real
+// 0416 push (bufid="0", length/voicelength/aeskey/voiceurl present).
+const INLINE_VOICE_XML =
+  '<msg><voicemsg endflag="1" cancelflag="0" forwardflag="0" voiceformat="4" ' +
+  'voicelength="2220" length="3793" bufid="0" aeskey="4832b3f3cad24878beddbc7b77add3b6" ' +
+  'voiceurl="305f020100" fromusername="gxnnycz" /></msg>';
+
+test("ingestWebhookEnvelope: carries a webhook voice's base64 into ImgBuf.buffer for inline serving", () => {
+  const silk = Buffer.from("#!SILK_V3 webhook-delivered inline silk payload long enough", "utf8");
+  const b64 = silk.toString("base64");
+  const client = new WcppClient({ host: "", port: 0 }, makeLogger());
+  const got: NormalizedMessage[] = [];
+  client.onMessage = (m) => got.push(m);
+
+  client.ingestWebhookEnvelope({
+    MessageType: "sync_message",
+    Timestamp: Math.floor(Date.now() / 1000),
+    Wxid: "wxid_rg95pmno4jo422",
+    IsSelf: false,
+    Signature: "",
+    Data: {
+      messages: [
+        {
+          createTime: Math.floor(Date.now() / 1000),
+          fromUser: "gxnnycz",
+          toUser: "wxid_rg95pmno4jo422",
+          isSelf: false,
+          msgId: 2041297784,
+          newMsgId: Number("6341135508073566000"),
+          msgType: 34,
+          rawContent: INLINE_VOICE_XML,
+          voice: { base64: b64, length: "3793", aeskey: "x" },
+        },
+      ],
+    },
+  } as any);
+
+  assert.equal(got.length, 1, "the webhook voice must be emitted");
+  assert.equal((got[0].raw as any).ImgBuf?.buffer, b64, "voice.base64 must be carried into ImgBuf.buffer");
+});
+
+test("downloadVoice: serves inline ImgBuf SILK bytes without calling DownloadVoice", async () => {
+  const silk = Buffer.from("#!SILK_V3 fake silk payload long enough to be real bytes", "utf8");
+  const res = await fileClient().downloadVoice({
+    MsgId: 2041297784,
+    MsgType: 34,
+    FromUserName: { string: "gxnnycz" },
+    Content: { string: INLINE_VOICE_XML },
+    ImgBuf: { buffer: silk.toString("base64"), iLen: silk.length },
+  } as any);
+  assert.ok(res.buffer, "inline voice must yield bytes");
+  assert.equal(res.buffer!.toString("utf8"), silk.toString("utf8"));
+  assert.equal(res.contentType, "audio/silk");
+});
+
 test("extractFileMessageInfo: parses a type-6 file appmsg (attachid/totallen/fileext/appid)", () => {
   const info = fileClient().extractFileMessageInfo({
     MsgId: 1144397471,
