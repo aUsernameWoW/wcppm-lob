@@ -28,6 +28,7 @@ import {
 import type { Frame } from "../../shared/frame.js";
 import { createBridgeClient, type BridgeClient } from "../../shared/bridge-client.js";
 import { dispatchInboundToOpenClaw, type WcppDmAuthorizer } from "./dispatch.js";
+import { decodeSilkToWav } from "./silk.js";
 import { evaluateInboundFrame } from "./gate.js";
 import {
   DEFAULT_ACCOUNT_ID,
@@ -192,6 +193,7 @@ const wechatpadproBase = {
           const b = bridges.get(ctx.accountId);
           return b ? b.fetchMedia(id, account.account) : Promise.resolve(null);
         },
+        decodeVoice: decodeSilkToWav,
       };
       // Inbound coalescing window: a burst of rapid messages from one sender is
       // merged into a single agent dispatch (more human, fewer tokens). Resolved

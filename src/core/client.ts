@@ -475,10 +475,13 @@ export type ResolvedMedia =
 /**
  * Extract the binary payload from the MAX server's unified download JSON. The
  * bytes land at varying depths/keys across endpoints — CdnDownloadImage returns
- * base64 at `Data.Image`, others at `Data.data.buffer` — so we deep-scan for the
- * first `image`/`buffer`/`base64` key (base64 string or numeric byte array).
- * Returns null if none found.
+ * base64 at `Data.Image`, DownloadVoice at `Data.Voice`, DownloadVideo chunks at
+ * `Data.Video`, others at `Data.data.buffer` — so we deep-scan for the first
+ * `image`/`voice`/`video`/`buffer`/`base64` key (base64 string or numeric byte
+ * array). Returns null if none found.
  */
+const DOWNLOAD_BUFFER_KEYS = new Set(["image", "voice", "video", "buffer", "base64"]);
+
 export function extractDownloadBuffer(json: unknown): Buffer | null {
   const seen = new Set<object>();
   const walk = (node: unknown): Buffer | null => {
@@ -487,7 +490,7 @@ export function extractDownloadBuffer(json: unknown): Buffer | null {
     seen.add(node as object);
     for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
       const key = k.toLowerCase();
-      if ((key === "image" || key === "buffer" || key === "base64") && typeof v === "string" && v.length > 32 && /^[A-Za-z0-9+/=\r\n]+$/.test(v)) {
+      if (DOWNLOAD_BUFFER_KEYS.has(key) && typeof v === "string" && v.length > 32 && /^[A-Za-z0-9+/=\r\n]+$/.test(v)) {
         return Buffer.from(v.replace(/\s+/g, ""), "base64");
       }
       if (key === "buffer" && Array.isArray(v) && v.length > 0) {
@@ -516,6 +519,28 @@ export function inferOutboundMediaKind(contentType: string | null, url: string):
   if (["jpg", "jpeg", "png", "gif", "webp", "bmp"].includes(ext)) return "image";
   if (["mp4", "mov", "avi", "mkv", "webm"].includes(ext)) return "video";
   return "file";
+}
+
+/**
+ * Build one `/Tools/DownloadVideo` section request. Per the OAS
+ * (`Tools.DownloadParamDoc`), DownloadVideo is a *chunked* endpoint keyed by
+ * `toWxid`/`dataLen`/`msgId`/`sectionStart`/`sectionLen` — NOT the cdn-url/aeskey
+ * shape the image download uses. Extracted as a pure helper so the param mapping
+ * is unit-tested independently of the HTTP/section loop.
+ */
+export function buildVideoSectionPayload(
+  info: { fromUserName: string | null; msgId: number | null; fileLength: number | null },
+  sectionStart: number,
+  sectionLen: number,
+): Record<string, unknown> {
+  return {
+    toWxid: info.fromUserName,
+    dataLen: info.fileLength,
+    msgId: info.msgId,
+    sectionStart,
+    sectionLen,
+    compressType: 0,
+  };
 }
 
 // ──────────────────────────────────────────────
@@ -1968,11 +1993,13 @@ export class WcppClient {
       };
     }
     if (kind === "voice") {
+      // WeChat voice is SILK. We deliver the raw SILK bytes; the downstream
+      // consumer decodes/transcribes (this core has no SILK decoder).
       return {
         kind,
-        mimeType: "audio/ogg",
-        extension: ".ogg",
-        fileName: `wechat-voice-${msgId}.ogg`,
+        mimeType: "audio/silk",
+        extension: ".silk",
+        fileName: `wechat-voice-${msgId}.silk`,
         msgId,
       };
     }
@@ -2144,23 +2171,42 @@ export class WcppClient {
     if (!info) {
       throw new Error("WCPP: message is not a video message (MsgType 43/62)");
     }
-    if (!info.fromUserName || info.msgId == null) {
-      throw new Error("WCPP: video message is missing required fields (fromUserName/msgId)");
+    if (!info.fromUserName || info.msgId == null || info.fileLength == null) {
+      throw new Error("WCPP: video message is missing required download fields (fromUserName/msgId/length)");
     }
 
-    const payload: Record<string, unknown> = {
-      fromUserName: info.fromUserName,
-      msgId: info.msgId,
-    };
-    if (info.aesKey) payload.aesKey = info.aesKey;
-    if (info.cdnVideoUrl) payload.cdnVideoUrl = info.cdnVideoUrl;
-    if (info.cdnThumbUrl) payload.cdnThumbUrl = info.cdnThumbUrl;
-    if (info.md5) payload.md5 = info.md5;
-    if (info.newMd5) payload.newMd5 = info.newMd5;
-    if (info.fileLength != null) payload.length = info.fileLength;
-    if (info.playLengthSeconds != null) payload.playLength = info.playLengthSeconds;
+    // DownloadVideo is a *chunked* endpoint (toWxid/dataLen/msgId/sectionStart/
+    // sectionLen → bytes at Data.Video). Mirror downloadFile: one shot for the
+    // whole length, then a bounded section loop concatenating chunks until
+    // dataLen bytes are collected (the server caps the section size).
+    const total = info.fileLength;
+    const MAX_SECTION = 64 * 1024;
+    const fetchSection = (start: number, len: number) =>
+      this.downloadMediaEndpoint("/Tools/DownloadVideo", buildVideoSectionPayload(info, start, len));
 
-    return this.downloadMediaEndpoint("/Tools/DownloadVideo", payload, outputPath);
+    const first = await fetchSection(0, total);
+    let buffer = first.buffer ?? Buffer.alloc(0);
+
+    let guard = 0;
+    while (buffer.length > 0 && buffer.length < total && guard++ < 4096) {
+      const next = await fetchSection(buffer.length, Math.min(MAX_SECTION, total - buffer.length));
+      if (!next.buffer || next.buffer.length === 0) break; // server gave nothing more
+      buffer = Buffer.concat([buffer, next.buffer]);
+    }
+
+    const result: MediaDownloadResult = {
+      contentType: first.contentType,
+      buffer: buffer.length > 0 ? buffer : null,
+      responseJson: first.responseJson,
+      requestPayload: buildVideoSectionPayload(info, 0, total),
+    };
+
+    if (outputPath && buffer.length > 0) {
+      const fs = await import("fs/promises");
+      await fs.writeFile(outputPath, buffer);
+      result.outputPath = outputPath;
+    }
+    return result;
   }
 
   /**

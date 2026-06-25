@@ -124,6 +124,34 @@ test("buildFrame: image message (msgType 3) derives media metadata (no bytes —
   assert.equal(frame.text, "[图片]");
 });
 
+test("buildFrame: voice message (msgType 34) derives a 'voice' attachment (SILK, lazy fetch)", () => {
+  const msg = baseMsg({ msgId: "voice-7", msgType: 34, text: "[语音] 3秒" });
+
+  const frame = buildFrame(msg, { account: "default" });
+
+  assert.equal(frame.media?.kind, "voice");
+  // WeChat voice is SILK — advertise that, not ogg, so the downstream decoder
+  // gets an honest filename. The bytes are fetched on demand via POST /media.
+  assert.equal(frame.media?.mimeType, "audio/silk");
+  assert.equal(frame.media?.fileName, "wechat-voice-voice-7.silk");
+  assert.equal(frame.media?.url, undefined);
+  assert.equal(frame.media?.localPath, undefined);
+  assert.equal(frame.text, "[语音] 3秒");
+});
+
+test("buildFrame: video message (msgType 43) derives a 'video' attachment (lazy fetch)", () => {
+  const msg = baseMsg({ msgId: "video-7", msgType: 43, text: "[视频]" });
+
+  const frame = buildFrame(msg, { account: "default" });
+
+  assert.equal(frame.media?.kind, "video");
+  assert.equal(frame.media?.mimeType, "video/mp4");
+  assert.equal(frame.media?.fileName, "wechat-video-video-7.mp4");
+  assert.equal(frame.media?.url, undefined);
+  assert.equal(frame.media?.localPath, undefined);
+  assert.equal(frame.text, "[视频]");
+});
+
 test("buildFrame: opts.media takes precedence over intrinsic image detection", () => {
   const msg = baseMsg({ msgType: 3, text: "[图片]" });
   const frame = buildFrame(msg, {

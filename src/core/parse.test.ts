@@ -289,6 +289,10 @@ test("resolveMedia: voice message → kind 'voice'", () => {
   const media = client.resolveMedia(msg);
   assert.ok(media, "expected resolved media for a voice message");
   assert.equal(media.kind, "voice");
+  // WeChat voice is SILK, not ogg — the attachment must advertise it honestly so
+  // the downstream decoder writes a correctly-named .silk file.
+  assert.equal(media.attachment.mimeType, "audio/silk");
+  assert.equal(media.attachment.extension, ".silk");
   assert.equal(client.isMediaMessage(msg), true);
 });
 

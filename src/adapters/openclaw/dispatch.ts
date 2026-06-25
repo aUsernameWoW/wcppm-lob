@@ -22,6 +22,8 @@ import {
 } from "openclaw/plugin-sdk/reply-runtime";
 import { resolveAgentRoute } from "openclaw/plugin-sdk/routing";
 
+import { decodeVoiceIfNeeded } from "./silk.js";
+
 const CHANNEL_ID = "wechatpadpro";
 
 export type WcppLogger = {
@@ -61,6 +63,12 @@ export type WcppDispatchContext = {
    * a download. Absent in tests / text-only paths → media is skipped silently.
    */
   fetchMedia?: (id: string) => Promise<{ ok: boolean; localPath?: string; mimeType?: string } | null>;
+  /**
+   * Decode a fetched WeChat voice (SILK) file to a WAV path. Wired in channel.ts
+   * (silk-wasm); absent in tests / when voice handling isn't configured → the
+   * raw SILK is forwarded unchanged. See `decodeVoiceIfNeeded`.
+   */
+  decodeVoice?: (silkPath: string) => Promise<string>;
 };
 
 export type WcppInboundMessage = {
@@ -122,6 +130,17 @@ export async function dispatchInboundToOpenClaw(
         // Forward the MIME so a non-image attachment (e.g. a .docx) isn't
         // mistaken for an image by the media-understanding pipeline.
         mediaType = m.mimeType;
+        // Voice arrives as SILK, which OpenClaw's STT can't read — decode it to
+        // WAV (re-typed audio/wav) so the pipeline transcribes it. Other kinds
+        // pass through; a decode failure degrades to the raw bytes.
+        if (ctx.decodeVoice) {
+          ({ mediaPath, mediaType } = await decodeVoiceIfNeeded(
+            { mediaPath, mediaType },
+            msg.mediaKind,
+            ctx.decodeVoice,
+            ctx.log,
+          ));
+        }
       } else {
         ctx.log.warn(`wechatpadpro: media fetch for ${msg.msgId} returned no path (${msg.mediaKind})`);
       }

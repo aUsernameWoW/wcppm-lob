@@ -21,11 +21,21 @@ export interface BuildFrameOpts {
  * download). For lazy fetch the broadcast frame carries only this metadata —
  * the subscriber pulls the bytes on demand via the bridge `POST /media`
  * endpoint after passing its own gate. Mirrors WcppClient.buildAttachmentCandidate.
- * v1 covers images (MsgType 3); voice/video are stored but not yet fetchable.
+ * Covers image (MsgType 3), voice (34, SILK), video (43), and file (49 type 6).
  */
 function intrinsicMedia(msg: NormalizedMessage): FrameMedia | undefined {
   if (msg.msgType === 3) {
     return { kind: "image", mimeType: "image/jpeg", fileName: `wechat-image-${msg.msgId}.jpg` };
+  }
+  // Voice (MsgType 34) — WeChat voice is SILK, so advertise audio/silk + a .silk
+  // filename. The middleware delivers the raw SILK bytes; decoding/transcription
+  // is the downstream consumer's job (no SILK decoder in this OpenClaw-free core).
+  if (msg.msgType === 34) {
+    return { kind: "voice", mimeType: "audio/silk", fileName: `wechat-voice-${msg.msgId}.silk` };
+  }
+  // Video (MsgType 43) — the bytes are pulled lazily via the chunked DownloadVideo.
+  if (msg.msgType === 43) {
+    return { kind: "video", mimeType: "video/mp4", fileName: `wechat-video-${msg.msgId}.mp4` };
   }
   // File attachment: MsgType 49 with appmsg <type>6</type> (the completed,
   // downloadable file). The <type>74</type> "uploading…" placeholder is

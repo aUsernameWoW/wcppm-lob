@@ -15,7 +15,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 
-import { WcppClient, type WcppConfig, extractDownloadBuffer } from "./client.js";
+import { WcppClient, type WcppConfig, extractDownloadBuffer, buildVideoSectionPayload } from "./client.js";
 import type { NormalizedMessage } from "./client.js";
 import type { Logger } from "../shared/logger.js";
 
@@ -60,6 +60,36 @@ test("extractDownloadBuffer: finds bytes at the nested Data.data.buffer (base64)
 test("extractDownloadBuffer: supports a numeric byte array and returns null when absent", () => {
   assert.deepEqual([...extractDownloadBuffer({ Data: { data: { buffer: [104, 105] } } })!], [104, 105]);
   assert.equal(extractDownloadBuffer({ Data: { msgId: 1, ok: true } }), null);
+});
+
+test("extractDownloadBuffer: finds DownloadVoice bytes at Data.Voice (base64)", () => {
+  const want = Buffer.from("a fake SILK voice payload long enough to clear the guard", "utf8");
+  const got = extractDownloadBuffer({ Code: 0, Success: true, Data: { Voice: want.toString("base64") } });
+  assert.ok(got);
+  assert.equal(got!.toString("utf8"), want.toString("utf8"));
+});
+
+test("extractDownloadBuffer: finds DownloadVideo bytes at Data.Video (base64)", () => {
+  const want = Buffer.from("a fake mp4 video chunk payload long enough to clear the guard", "utf8");
+  const got = extractDownloadBuffer({ Code: 0, Success: true, Data: { Video: want.toString("base64") } });
+  assert.ok(got);
+  assert.equal(got!.toString("utf8"), want.toString("utf8"));
+});
+
+test("buildVideoSectionPayload: maps video info to DownloadVideo section params (toWxid/dataLen/sectionStart)", () => {
+  const payload = buildVideoSectionPayload(
+    { fromUserName: "wxid_peer", msgId: 999, fileLength: 2048576 },
+    65536,
+    65536,
+  );
+  assert.deepEqual(payload, {
+    toWxid: "wxid_peer",
+    dataLen: 2048576,
+    msgId: 999,
+    sectionStart: 65536,
+    sectionLen: 65536,
+    compressType: 0,
+  });
 });
 
 // --- helpers ---------------------------------------------------------------
