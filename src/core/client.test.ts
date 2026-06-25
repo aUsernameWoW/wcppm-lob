@@ -372,6 +372,51 @@ test("webhook: a stale (timestamp-skew) doorbell is dropped quietly — accepted
   }
 });
 
+// ── webhook self-wxid learning (0416 foreign-Wxid hazard) ──────────────────
+
+test("ingestWebhookEnvelope: learns self-wxid from inner toUser, not a foreign envelope Wxid", () => {
+  // WCPPM 0416 stamps SOME pushes (voice/media) with a foreign device UUID in
+  // Wxid. Learning that as our self-wxid poisons self-message detection + the
+  // ready frame; the reliable account id is the inner inbound message's toUser.
+  const client = new WcppClient({ host: "", port: 0 }, makeLogger());
+  const now = Math.floor(Date.now() / 1000);
+  client.ingestWebhookEnvelope({
+    MessageType: "sync_message",
+    Timestamp: now,
+    Wxid: "ee87d0cd-8432-4bdf-8440-5653fdb45519",
+    IsSelf: false,
+    Signature: "",
+    Data: {
+      messages: [
+        {
+          createTime: now,
+          fromUser: "gxnnycz",
+          toUser: "wxid_rg95pmno4jo422",
+          isSelf: false,
+          msgId: 1,
+          newMsgId: 1,
+          msgType: 1,
+          text: "hi",
+        },
+      ],
+    },
+  } as any);
+  assert.equal(client.wxid, "wxid_rg95pmno4jo422");
+});
+
+test("ingestWebhookEnvelope: does not learn a foreign Wxid from an empty doorbell", () => {
+  const client = new WcppClient({ host: "", port: 0 }, makeLogger());
+  client.ingestWebhookEnvelope({
+    MessageType: "sync_message",
+    Timestamp: Math.floor(Date.now() / 1000),
+    Wxid: "ee87d0cd-8432-4bdf-8440-5653fdb45519",
+    IsSelf: false,
+    Signature: "",
+    Data: { messages: [] },
+  } as any);
+  assert.equal(client.wxid, null);
+});
+
 // ── inbound file attachments (MsgType 49, appmsg type 6) ───────────────────
 
 // The downloadable, completed file (appmsg <type>6</type>) — abridged from the

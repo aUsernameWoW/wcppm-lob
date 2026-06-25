@@ -40,6 +40,35 @@ function envelope(wxid: string, ts = FRESH_TS): WebhookEnvelope {
   });
 }
 
+/** A minimal inbound webhook message addressed to `toUser`. */
+function msg(toUser: string, isSelf = false): WebhookEnvelope["Data"]["messages"] extends (infer M)[] | undefined ? M : never {
+  return {
+    createTime: FRESH_TS,
+    fromUser: "wxid_peer",
+    toUser,
+    isSelf,
+    msgId: 1,
+    newMsgId: 1,
+    msgType: 34,
+  } as never;
+}
+
+/** An envelope whose top-level Wxid is a foreign device id but whose inner
+ *  messages identify the owning account by `toUser` (the 0416 voice-push case). */
+function envelopeWithMessages(
+  wxid: string,
+  messages: ReturnType<typeof msg>[],
+  ts = FRESH_TS,
+): WebhookEnvelope {
+  return sign({
+    MessageType: "sync_message",
+    Timestamp: ts,
+    Wxid: wxid,
+    IsSelf: false,
+    Data: { messages: messages as never },
+  });
+}
+
 /** Capturing sink factory. */
 function makeSinks() {
   const got: Array<{ account: string; wxid: string }> = [];
@@ -101,6 +130,34 @@ test("webhook-listener: an unknown Wxid is acked (200) but not ingested", async 
   await withListener(cfg(), route, async () => {
     const port = (withListener as unknown as { port: number }).port;
     const res = await post(port, envelope("wxid_unknown"));
+    assert.equal(res.status, 200);
+    const json = (await res.json()) as { dropped?: boolean };
+    assert.equal(json.dropped, true);
+    assert.deepEqual(got, []);
+  });
+});
+
+test("webhook-listener: falls back to inner message toUser when envelope.Wxid matches no instance", async () => {
+  const { got, route } = makeSinks();
+  await withListener(cfg(), route, async () => {
+    const port = (withListener as unknown as { port: number }).port;
+    // The 0416 voice-push case: envelope.Wxid is a foreign device UUID, the real
+    // owning account is only identifiable via the inner message's toUser.
+    const env = envelopeWithMessages("ee87d0cd-device-uuid", [msg("wxid_a")]);
+    const res = await post(port, env);
+    assert.equal(res.status, 200);
+    await res.json();
+    assert.deepEqual(got, [{ account: "acctA", wxid: "ee87d0cd-device-uuid" }]);
+  });
+});
+
+test("webhook-listener: ignores a self message's toUser (peer) when falling back", async () => {
+  const { got, route } = makeSinks();
+  await withListener(cfg(), route, async () => {
+    const port = (withListener as unknown as { port: number }).port;
+    // A self-sent message's toUser is the PEER, not our account — must not route by it.
+    const env = envelopeWithMessages("device-uuid", [msg("wxid_a", true)]);
+    const res = await post(port, env);
     assert.equal(res.status, 200);
     const json = (await res.json()) as { dropped?: boolean };
     assert.equal(json.dropped, true);

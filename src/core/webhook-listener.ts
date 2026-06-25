@@ -31,6 +31,29 @@ export interface WebhookSink {
   ingestWebhookEnvelope(envelope: WebhookEnvelope): void;
 }
 
+/**
+ * Candidate identifiers to route a webhook by, in priority order:
+ *   1. the envelope's top-level `Wxid` (the normal case — the account self-wxid,
+ *      kept first so the webhook stays co-tenant with its WS push for dedup);
+ *   2. the inner inbound (`!isSelf`) messages' `toUser` (the receiving account).
+ *
+ * WCPPM 0416 stamps SOME pushes (observed: inline voice/media) with a foreign
+ * device/session UUID in `Wxid` instead of the account wxid; for those the only
+ * reliable owner is the inner `toUser`. Self messages are skipped (their `toUser`
+ * is the peer, not us). De-duplicated, empties dropped.
+ */
+export function webhookRoutingKeys(envelope: WebhookEnvelope): string[] {
+  const keys: string[] = [];
+  const push = (k: string | undefined) => {
+    if (k && !keys.includes(k)) keys.push(k);
+  };
+  push(envelope.Wxid);
+  for (const m of envelope.Data?.messages ?? []) {
+    if (!m.isSelf) push(m.toUser);
+  }
+  return keys;
+}
+
 export interface WebhookListenerDeps {
   config: WebhookListenerConfig;
   log: Logger;
@@ -127,8 +150,13 @@ export function createWebhookListener(deps: WebhookListenerDeps): WebhookListene
         return;
       }
 
-      // Route to the owning instance by self-wxid.
-      const sink = route(envelope.Wxid);
+      // Route to the owning instance: try the envelope Wxid first, then fall back
+      // to the inner messages' toUser (the 0416 voice/media UUID-Wxid case).
+      let sink: WebhookSink | undefined;
+      for (const key of webhookRoutingKeys(envelope)) {
+        sink = route(key);
+        if (sink) break;
+      }
       if (!sink) {
         // Unknown wxid: benign (likely a duplicate of a WS-push message we already
         // have, or an instance not yet wired). Ack so WCPPM stops retrying.

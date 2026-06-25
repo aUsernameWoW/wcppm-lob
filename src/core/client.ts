@@ -1545,14 +1545,9 @@ export class WcppClient {
             return;
           }
 
-          // Learn wxid from envelope
-          if (!this.wxid && envelope.Wxid) {
-            this.wxid = envelope.Wxid;
-            this.log.info(`[webhook] detected wxid=${this.wxid}`);
-          }
-
-          // Process messages through the standard pipeline
-          this.processWebhookMessages(envelope);
+          // Learn wxid from an inbound message's toUser (NOT envelope.Wxid; see
+          // ingestWebhookEnvelope — 0416 stamps a foreign UUID there on some pushes).
+          this.ingestWebhookEnvelope(envelope);
 
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true }));
@@ -1585,9 +1580,16 @@ export class WcppClient {
    * a few seconds later) are deduped by the shared `seenMsgIds` set.
    */
   ingestWebhookEnvelope(envelope: WebhookEnvelope): void {
-    if (!this.wxid && envelope.Wxid) {
-      this.wxid = envelope.Wxid;
-      this.log.info(`[webhook] detected wxid=${this.wxid}`);
+    // Learn the self-wxid from an inbound message's `toUser` (the receiving
+    // account) — NOT from `envelope.Wxid`, which 0416 stamps with a foreign
+    // device/session UUID on some pushes (voice/media). Learning that UUID would
+    // poison self-message detection and the ready frame.
+    if (!this.wxid) {
+      const learned = envelope.Data?.messages?.find((m) => !m.isSelf)?.toUser;
+      if (learned) {
+        this.wxid = learned;
+        this.log.info(`[webhook] detected wxid=${this.wxid}`);
+      }
     }
     this.processWebhookMessages(envelope);
   }
