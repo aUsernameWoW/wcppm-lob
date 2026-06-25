@@ -15,7 +15,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 
-import { WcppClient, type WcppConfig, extractDownloadBuffer, buildVideoSectionPayload } from "./client.js";
+import { WcppClient, type WcppConfig, extractDownloadBuffer, extractDownloadError, buildVideoSectionPayload } from "./client.js";
 import type { NormalizedMessage } from "./client.js";
 import type { Logger } from "../shared/logger.js";
 
@@ -60,6 +60,28 @@ test("extractDownloadBuffer: finds bytes at the nested Data.data.buffer (base64)
 test("extractDownloadBuffer: supports a numeric byte array and returns null when absent", () => {
   assert.deepEqual([...extractDownloadBuffer({ Data: { data: { buffer: [104, 105] } } })!], [104, 105]);
   assert.equal(extractDownloadBuffer({ Data: { msgId: 1, ok: true } }), null);
+});
+
+test("extractDownloadError: surfaces Code+Message on an explicit Success:false envelope", () => {
+  // The exact live shape behind a misdiagnosed "no bytes": /Tools/DownloadVoice
+  // returns HTTP 200 with Success:false when the account's authcode isn't bound.
+  const err = extractDownloadError({
+    Code: -5,
+    Success: false,
+    Message: "授权码尚未绑定Wxid，请先完成登录绑定",
+    Data: null,
+  });
+  assert.ok(err);
+  assert.match(err!, /-5/);
+  assert.match(err!, /授权码尚未绑定Wxid/);
+});
+
+test("extractDownloadError: returns null for a Success:true envelope (transient empty, e.g. CDN not ready)", () => {
+  // A 200-with-empty-payload but Success:true must NOT throw — the image retry
+  // loop depends on getting a null buffer back so it can try again.
+  assert.equal(extractDownloadError({ Code: 0, Success: true, Data: { Image: "" } }), null);
+  assert.equal(extractDownloadError({ Data: { msgId: 1 } }), null);
+  assert.equal(extractDownloadError("not an object"), null);
 });
 
 test("extractDownloadBuffer: finds DownloadVoice bytes at Data.Voice (base64)", () => {
@@ -501,6 +523,59 @@ test("downloadVoice: serves inline ImgBuf SILK bytes without calling DownloadVoi
   assert.ok(res.buffer, "inline voice must yield bytes");
   assert.equal(res.buffer!.toString("utf8"), silk.toString("utf8"));
   assert.equal(res.contentType, "audio/silk");
+});
+
+test("ingestWebhookEnvelope: synthesizes voicemsg XML from a structured voice object so a webhook voice is downloadable", () => {
+  // Production case (2026-06-26, account=default): the webhook delivers a bufid=0
+  // voice as a structured `voice{}` object with NO `rawContent` (<voicemsg> XML)
+  // and NO `voice.base64`. Without synthesizing the XML into Content, extractVoice-
+  // MessageInfo finds no bufid/length → downloadVoice throws "missing required
+  // download fields" and the lazy /media fetch fails (the WS path works because its
+  // Content already carries the <voicemsg> XML).
+  const client = new WcppClient({ host: "", port: 0 }, makeLogger());
+  const got: NormalizedMessage[] = [];
+  client.onMessage = (m) => got.push(m);
+
+  client.ingestWebhookEnvelope({
+    MessageType: "sync_message",
+    Timestamp: Math.floor(Date.now() / 1000),
+    Wxid: "wxid_rg95pmno4jo422",
+    IsSelf: false,
+    Signature: "",
+    Data: {
+      messages: [
+        {
+          createTime: Math.floor(Date.now() / 1000),
+          fromUser: "gxnnycz",
+          toUser: "wxid_rg95pmno4jo422",
+          isSelf: false,
+          msgId: 521586115,
+          newMsgId: Number("902078059143063040"),
+          msgType: 34,
+          voice: {
+            aeskey: "0a22368a852302d77f573860a3e49eeb",
+            bufid: "0",
+            cancelflag: "0",
+            endflag: "1",
+            forwardflag: "0",
+            fromusername: "gxnnycz",
+            length: "45898",
+            voiceformat: 4,
+            voicelength: 28640,
+            voiceurl: "305f020100",
+          },
+        },
+      ],
+    },
+  } as any);
+
+  assert.equal(got.length, 1, "the webhook voice must be emitted");
+  const info = client.extractVoiceMessageInfo(got[0].raw as any);
+  assert.ok(info, "the emitted voice must yield download info");
+  assert.equal(info!.bufid, "0", "bufid must be recovered from the structured voice object");
+  assert.equal(info!.fromUserName, "gxnnycz");
+  assert.equal(info!.length, 28640, "length must be the voicelength DownloadVoice expects");
+  assert.equal(info!.msgId, 521586115, "the small int32 MsgId, not the 64-bit NewMsgId");
 });
 
 test("extractFileMessageInfo: parses a type-6 file appmsg (attachid/totallen/fileext/appid)", () => {

@@ -482,6 +482,26 @@ export type ResolvedMedia =
  */
 const DOWNLOAD_BUFFER_KEYS = new Set(["image", "voice", "video", "buffer", "base64"]);
 
+/**
+ * Surface a MAX error envelope as a human string, or null when the response is
+ * not an explicit failure. The download endpoints answer HTTP 200 even when the
+ * WeChat/login layer rejects (`Success:false`, e.g. `Code:-5 授权码尚未绑定Wxid`
+ * when the authcode isn't bound to a Wxid). Without this the empty buffer falls
+ * through to the generic "no bytes" error and the true cause (login/binding, bad
+ * param, …) is lost — exactly what masked the real reason once already. A
+ * `Success:true`-but-empty response (e.g. a CdnDownloadImage CDN-not-ready beat)
+ * is NOT an error here: it returns null so the image retry loop can try again.
+ */
+export function extractDownloadError(json: unknown): string | null {
+  if (json === null || typeof json !== "object") return null;
+  const obj = json as { Success?: unknown; Code?: unknown; Message?: unknown };
+  if (obj.Success !== false) return null;
+  const code = typeof obj.Code === "number" ? obj.Code : null;
+  const message = typeof obj.Message === "string" ? obj.Message.trim() : "";
+  const parts = [code != null ? `Code ${code}` : null, message || null].filter(Boolean);
+  return `WCPP server error: ${parts.join(" — ") || "Success:false (no detail)"}`;
+}
+
 export function extractDownloadBuffer(json: unknown): Buffer | null {
   const seen = new Set<object>();
   const walk = (node: unknown): Buffer | null => {
@@ -521,6 +541,42 @@ export function extractInlineVoiceBuffer(message: unknown): Buffer | null {
   if (typeof b64 !== "string" || b64.length < 32 || !/^[A-Za-z0-9+/=\r\n]+$/.test(b64)) return null;
   const bytes = Buffer.from(b64.replace(/\s+/g, ""), "base64");
   return bytes.length > 0 ? bytes : null;
+}
+
+/**
+ * Build a `<voicemsg>` Content XML from a webhook's structured `voice{}` object.
+ * A webhook can deliver a voice as a field map (bufid/length/voicelength/aeskey/
+ * voiceurl/…) with NO `rawContent` XML and NO `voice.base64` — but downloadVoice
+ * gets its params from `extractVoiceMessageInfo`, which parses the XML out of
+ * `Content`. Without this the download fields (bufid/length) are lost and the lazy
+ * /media fetch throws "missing required download fields" (the WS path is fine
+ * because its push Content already carries the voicemsg XML). Mirrors a real 0416
+ * voicemsg. Returns null when the object lacks the essentials (bufid + a length),
+ * so the caller falls back to rawContent/text cleanly.
+ */
+export function buildWebhookVoiceXml(voice: Record<string, unknown> | undefined): string | null {
+  if (!voice || typeof voice !== "object") return null;
+  if (voice.bufid == null || (voice.voicelength == null && voice.length == null)) return null;
+  const attrs: string[] = [];
+  const push = (key: string, val: unknown) => {
+    if (val == null) return;
+    const s = String(val).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+    attrs.push(`${key}="${s}"`);
+  };
+  // Order mirrors a real 0416 WS voicemsg push.
+  push("endflag", voice.endflag);
+  push("cancelflag", voice.cancelflag);
+  push("forwardflag", voice.forwardflag);
+  push("voiceformat", voice.voiceformat);
+  push("voicelength", voice.voicelength);
+  push("length", voice.length);
+  push("bufid", voice.bufid);
+  push("aeskey", voice.aeskey);
+  push("voiceurl", voice.voiceurl);
+  push("voicemd5", voice.voicemd5);
+  push("clientmsgid", voice.clientmsgid);
+  push("fromusername", voice.fromusername);
+  return `<msg><voicemsg ${attrs.join(" ")} /></msg>`;
 }
 
 /**
@@ -1629,8 +1685,10 @@ export class WcppClient {
           MsgType: msg.msgType,
           FromUserName: { string: msg.fromUser },
           ToUserName: { string: msg.toUser },
-          // Prefer rawContent (full XML for non-text types) over text
-          Content: { string: msg.rawContent || msg.text || "" },
+          // Prefer rawContent (full XML for non-text types); else synthesize the
+          // voicemsg XML from a structured `voice{}` object (some webhooks send the
+          // voice as fields, not XML — without this the download fields are lost).
+          Content: { string: msg.rawContent || buildWebhookVoiceXml(msg.voice) || msg.text || "" },
           CreateTime: msg.createTime,
           PushContent: msg.pushContent || "",
           MsgSource: "",  // Not available in webhook format
@@ -2122,6 +2180,12 @@ export class WcppClient {
       const data = (await res.json()) as unknown;
       responseJson = data;
       buffer = extractDownloadBuffer(data);
+      // No bytes AND the server explicitly signalled failure → surface the real
+      // reason (login/binding, bad param, …) instead of the generic "no bytes".
+      if (!buffer) {
+        const serverError = extractDownloadError(data);
+        if (serverError) throw new Error(`/api${endpoint}: ${serverError}`);
+      }
     } else {
       buffer = Buffer.from(await res.arrayBuffer());
     }
