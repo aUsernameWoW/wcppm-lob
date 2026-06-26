@@ -209,6 +209,36 @@ test("connect() is the single owner of webhook bring-up: webhook listens after c
   }
 });
 
+test("connect(): wsEnabled:false skips the WS push and only re-registers the webhook (Remove-then-Set, in order)", async () => {
+  const calls: string[] = [];
+  const client = new WcppClient(
+    { host: "h", port: 0, authcode: "x", wsEnabled: false, webhookRegister: true, webhookUrl: "https://pub/webhook" },
+    makeLogger(),
+  );
+  // Stub the network-touching methods so connect() exercises only its gating.
+  (client as any).connectMaxWebSocket = () => calls.push("ws");
+  (client as any).removeWebhook = async () => { calls.push("remove"); };
+  (client as any).registerWebhook = async () => { calls.push("set"); return true; };
+
+  client.connect();
+  await delay(20); // let the removeWebhook().then(registerWebhook) chain settle
+
+  assert.deepEqual(calls, ["remove", "set"], "WS disabled → no ws; webhookRegister → Remove then Set");
+});
+
+test("connect(): default wsEnabled connects the WS and webhookRegister:false touches no /Webhook/* call", async () => {
+  const calls: string[] = [];
+  const client = new WcppClient({ host: "h", port: 0, authcode: "x" }, makeLogger());
+  (client as any).connectMaxWebSocket = () => calls.push("ws");
+  (client as any).removeWebhook = async () => { calls.push("remove"); };
+  (client as any).registerWebhook = async () => { calls.push("set"); return true; };
+
+  client.connect();
+  await delay(20);
+
+  assert.deepEqual(calls, ["ws"], "default → WS only, no webhook registration");
+});
+
 test("WS push: a real 0416 syncData frame (Data.syncData IS SyncResponse.Data) is ingested", () => {
   // Captured off the live middleware socket (fd 24). The 0416 server wraps the
   // SyncResponse *Data* payload directly under Data.syncData — AddMsgs sits at

@@ -36,6 +36,25 @@ export interface RawInstanceConfig {
   wxid?: string;
   proxy?: string;
   wsUrl?: string;
+  /**
+   * Set false to disable the WS push longlink for this account — e.g. when the
+   * middleware and WCPPM are on different LANs and the WS is unreliable. Inbound
+   * then arrives via webhook only (pair with webhookRegister / an operator-set
+   * webhook). Default true.
+   */
+  wsEnabled?: boolean;
+  /**
+   * When true, on startup the middleware re-registers THIS account's WCPPM
+   * webhook (Remove-then-Set) and removes it on shutdown. Decoupled from the
+   * shared local listener — it only tells WCPPM where to push. Requires
+   * webhookUrl. Default false.
+   */
+  webhookRegister?: boolean;
+  /**
+   * The PUBLIC URL WCPPM should push to for this account (this middleware's
+   * reverse-proxied webhook-listener URL). Required when webhookRegister is true.
+   */
+  webhookUrl?: string;
   readOnly?: boolean;
   allowMsgTypes?: number[];
   passRevokemsg?: boolean;
@@ -189,19 +208,30 @@ export function resolveOutboundPacerConfig(
 /**
  * Resolve one raw instance entry into an InstanceConfig. `index` is only used for
  * error messages. `globalHeartbeat` is the top-level heartbeat block that this
- * instance's own `heartbeat` overrides field-by-field. The webhook* fields are
- * intentionally NOT threaded here: the shared listener owns the webhook port, so
- * each instance keeps webhookEnabled off.
+ * instance's own `heartbeat` overrides field-by-field.
+ *
+ * The shared LOCAL listener owns the webhook port, so each instance keeps
+ * `webhookEnabled` off. But an instance MAY ask us to (re)register its webhook
+ * with WCPPM (`webhookRegister` → Remove-then-Set at `webhookUrl`); that is
+ * decoupled from the local listener. `sharedWebhookSecret` is the top-level
+ * `webhookSecret` — threaded in so the secret we register with WCPPM matches the
+ * one the shared listener verifies against.
  */
 function resolveInstance(
   raw: RawInstanceConfig,
   index: number,
   globalHeartbeat: Partial<HeartbeatConfig> | undefined,
   globalPacer: RawOutboundPacerConfig | undefined,
+  sharedWebhookSecret: string | undefined,
 ): InstanceConfig {
   const account = (raw.account || "").trim();
   if (!account) {
     throw new Error(`config: instances[${index}] is missing an "account" label (the stable id used across the bridge)`);
+  }
+  if (raw.webhookRegister && !raw.webhookUrl) {
+    throw new Error(
+      `config: instances[${index}] (account "${account}") has webhookRegister:true but no webhookUrl (the public URL WCPPM should push to for this account)`,
+    );
   }
   const wcpp: WcppConfig = {
     host: raw.host ?? "",
@@ -210,8 +240,15 @@ function resolveInstance(
     wxid: raw.wxid,
     proxy: raw.proxy,
     wsUrl: raw.wsUrl,
-    // Shared webhook listener owns the port — never start a per-instance one.
+    // false → don't open the WS push longlink (inbound via webhook only).
+    wsEnabled: raw.wsEnabled ?? true,
+    // Shared webhook listener owns the local port — never start a per-instance one.
     webhookEnabled: false,
+    // (Re)register THIS account's webhook with WCPPM on connect/disconnect.
+    webhookRegister: raw.webhookRegister ?? false,
+    webhookUrl: raw.webhookUrl,
+    // Sign the registration with the shared listener's secret so signatures verify.
+    webhookSecret: sharedWebhookSecret,
     readOnly: raw.readOnly,
     allowMsgTypes: raw.allowMsgTypes,
     passRevokemsg: raw.passRevokemsg,
@@ -235,7 +272,9 @@ export function resolveConfig(raw: RawConfig): MiddlewareConfig {
   const rawInstances: RawInstanceConfig[] =
     raw.instances && raw.instances.length > 0 ? raw.instances : [{ ...raw, account: raw.account || "default" }];
 
-  const instances = rawInstances.map((ri, i) => resolveInstance(ri, i, raw.heartbeat, raw.outboundPacer));
+  const instances = rawInstances.map((ri, i) =>
+    resolveInstance(ri, i, raw.heartbeat, raw.outboundPacer, raw.webhookSecret),
+  );
 
   const seen = new Set<string>();
   for (const inst of instances) {

@@ -63,6 +63,18 @@ export interface WcppConfig {
   replyWithMention?: boolean;
   /** Override WebSocket URL (default: ws://{host}:8089/ws/sync?authcode=…). */
   wsUrl?: string;
+  /**
+   * Set false to skip opening the WS push longlink (inbound then arrives via
+   * webhook only — e.g. middleware and WCPPM on different LANs). Default: when
+   * host is set, connect the WS. Only `=== false` disables it.
+   */
+  wsEnabled?: boolean;
+  /**
+   * When true, connect() re-registers this account's WCPPM webhook
+   * (Remove-then-Set at webhookUrl) and disconnect() removes it. Independent of
+   * webhookEnabled (the local listener). Requires webhookUrl + host.
+   */
+  webhookRegister?: boolean;
   /** Also run a local webhook HTTP listener (additional inbound channel on top of WS). */
   webhookEnabled?: boolean;
   webhookHost?: string;
@@ -1791,31 +1803,44 @@ export class WcppClient {
   // ──────────────────────────────────────────────
 
   /**
-   * Bring up inbound transports:
-   *   - host set              → WebSocket push (base inbound + required for outbound)
-   *   - webhookEnabled        → also start local webhook listener
-   *   - host + webhookEnabled → auto-register the webhook with WCPPM via /Webhook/Set
-   *   - no host + webhookEnabled → passive webhook-only mode; outbound will throw
+   * Bring up inbound transports. Three independent knobs:
+   *   - host + wsEnabled!==false → WebSocket push (base inbound + required for outbound)
+   *   - webhookEnabled           → start the local webhook listener (a per-instance
+   *                                deployment; in multi-instance the shared listener
+   *                                in main.ts owns the port, so this stays off)
+   *   - host + webhookRegister    → re-register THIS account's webhook with WCPPM
+   *                                (Remove-then-Set at webhookUrl); independent of
+   *                                the listener — it only tells WCPPM where to push
+   *
+   * wsEnabled:false with no webhook is a no-inbound config; main.ts warns about it.
    */
   connect(): void {
     if (this.config.host) {
-      this.connectMaxWebSocket();
+      if (this.config.wsEnabled !== false) {
+        this.connectMaxWebSocket();
+      } else {
+        this.log.info("[ws] disabled by config (wsEnabled:false) — inbound via webhook only for this account");
+      }
     }
     if (this.config.webhookEnabled) {
       this.startWebhookServer();
-      if (this.config.host && this.config.webhookUrl) {
-        this.registerWebhook();
-      } else if (this.config.host) {
-        this.log.info("[webhook] webhookEnabled but no webhookUrl set; skipping /Webhook/Set (operator-managed)");
+    }
+    if (this.config.host && this.config.webhookRegister) {
+      if (this.config.webhookUrl) {
+        // Remove-then-Set: a clean, idempotent re-register on every startup
+        // (clears any stale config before pointing WCPPM at our URL).
+        this.removeWebhook()
+          .then(() => this.registerWebhook())
+          .catch((e) => this.log.error("[webhook] re-register failed", e));
       } else {
-        this.log.info("[webhook] passive webhook-only mode; /Webhook/Set is operator-managed (the push longlink comes up automatically at login — do NOT call /Login/Newinit)");
+        this.log.error("[webhook] webhookRegister set but no webhookUrl — cannot register");
       }
     }
   }
 
   disconnect(): void {
     this.disconnectMaxWebSocket();
-    if (this.config.host && this.config.webhookEnabled) {
+    if (this.config.host && this.config.webhookRegister) {
       this.removeWebhook();
     }
     this.stopWebhookServer();

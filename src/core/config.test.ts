@@ -94,6 +94,46 @@ test("resolveConfig: per-instance webhook listeners are NOT started (shared list
   assert.notEqual(cfg.instances[0].wcpp.webhookEnabled, true);
 });
 
+test("resolveConfig: wsEnabled defaults true and can be disabled per instance", () => {
+  const cfg = resolveConfig({
+    bridgeToken: "t",
+    instances: [
+      { account: "a", host: "h", authcode: "A" },
+      { account: "b", host: "h", authcode: "B", wsEnabled: false },
+    ],
+  });
+  assert.equal(cfg.instances[0].wcpp.wsEnabled, true);
+  assert.equal(cfg.instances[1].wcpp.wsEnabled, false);
+});
+
+test("resolveConfig: webhookRegister threads url + inherits the shared webhookSecret; defaults off", () => {
+  const cfg = resolveConfig({
+    bridgeToken: "t",
+    webhookSecret: "shared-secret",
+    instances: [
+      { account: "a", host: "h", authcode: "A" },
+      { account: "b", host: "h", authcode: "B", webhookRegister: true, webhookUrl: "https://pub/webhook" },
+    ],
+  });
+  // default off, no url
+  assert.equal(cfg.instances[0].wcpp.webhookRegister, false);
+  // opted in: url threaded, secret inherited from the shared top-level webhookSecret
+  assert.equal(cfg.instances[1].wcpp.webhookRegister, true);
+  assert.equal(cfg.instances[1].wcpp.webhookUrl, "https://pub/webhook");
+  assert.equal(cfg.instances[1].wcpp.webhookSecret, "shared-secret");
+});
+
+test("resolveConfig: webhookRegister:true without webhookUrl is rejected", () => {
+  assert.throws(
+    () =>
+      resolveConfig({
+        bridgeToken: "t",
+        instances: [{ account: "a", host: "h", authcode: "A", webhookRegister: true }],
+      }),
+    /webhookRegister.*webhookUrl/i,
+  );
+});
+
 test("resolveConfig: each instance inherits the global heartbeat config when it has no override", () => {
   const cfg = resolveConfig({
     bridgeToken: "t",

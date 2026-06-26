@@ -139,13 +139,28 @@ async function main(): Promise<void> {
     });
     // One-line per-instance config snapshot at startup so misconfig is obvious
     // on boot (mode is otherwise only discoverable per-event).
+    const wsOn = inst.wcpp.wsEnabled !== false;
+    const webhookReg = Boolean(inst.wcpp.webhookRegister);
     log.info(
       `[cfg] host=${inst.wcpp.host ?? "(webhook-only)"}:${inst.wcpp.port}` +
+        ` ws=${wsOn ? "on" : "off"} webhookReg=${webhookReg ? "on" : "off"}` +
         ` hb=${inst.heartbeat.enabled ? "on" : "off"}` +
         ` pacer=${inst.outboundPacer.enabled ? "on" : "off"}` +
         ` maxAge=${inst.wcpp.maxMessageAge ?? 180}s readOnly=${Boolean(inst.wcpp.readOnly)}`,
     );
     if (inst.wcpp.readOnly) log.warn("[cfg] read-only mode — outbound sends are disabled");
+    // Inbound-path sanity warnings (warn-only — the operator may wire WCPPM's
+    // webhook out-of-band, and pushes land via the shared listener regardless).
+    if (!wsOn && !webhookReg) {
+      log.warn(
+        "[cfg] websocket disabled and not auto-registering a webhook — inbound depends on an operator-configured webhook pointed at the shared listener",
+      );
+    }
+    if (webhookReg && !cfg.webhook.enabled) {
+      log.warn(
+        "[cfg] webhookRegister is on but the shared webhook listener is disabled (webhookEnabled:false) — WCPPM pushes will have nowhere to land",
+      );
+    }
   }
 
   /** Select the instance for an account. With a single instance, an omitted account resolves to it. */
